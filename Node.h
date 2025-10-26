@@ -18,8 +18,6 @@ struct Node {
     bool collide_when_anchored;
     bool collide_with_walls;
     float friction;
-    float anchor_damping_remaining;
-    float anchor_damping_total;
     bool sim_ignore;
 };
 

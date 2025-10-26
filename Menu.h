@@ -56,8 +56,9 @@ void menurow_add_interaction(MenuRow *row, VariableInteraction *interaction);
 VariableInteraction* variableinteraction_create(void *variable, const char *name, double min, double max, VariableType type, InteractionCallback on_change, void *callback_data);
 // Input handling for menus
 // mouse_button: button state SDL_PRESSED/SDL_RELEASED
-void menu_handle_mouse_button(Menu *menu, int button, int state, int mx, int my);
-void menu_handle_mouse_motion(Menu *menu, int mx, int my);
+// These return 1 if the menu consumed/handled the event, 0 otherwise.
+int menu_handle_mouse_button(Menu *menu, int button, int state, int mx, int my);
+int menu_handle_mouse_motion(Menu *menu, int mx, int my);
 void menu_render(Menu *menu, int window_w, int window_h);
 // Font handling (global for Menu module)
 // Returns 0 on success, -1 on failure

@@ -52,12 +52,14 @@ static int point_in_rect(int px, int py, int rx, int ry, int rw, int rh) {
 }
 
 // Compute layout and handle mouse interactions
-void menu_handle_mouse_button(Menu *menu, int button, int state, int mx, int my) {
-    if (!menu) return;
+// Returns 1 if the event was handled (consumed) by this menu, 0 otherwise.
+int menu_handle_mouse_button(Menu *menu, int button, int state, int mx, int my) {
+    if (!menu) return 0;
     int title_h = 24;
     size_t rows = menu->rows->size;
-    if (rows == 0) return;
+    if (rows == 0) return 0;
     int avail_h = menu->height - title_h;
+
     for (size_t r = 0; r < rows; ++r) {
         MenuRow *row = (MenuRow*)menu->rows->items[r];
         size_t cols = row->interactions->size;
@@ -65,24 +67,37 @@ void menu_handle_mouse_button(Menu *menu, int button, int state, int mx, int my)
         int row_h = avail_h / (int)rows;
         int ry = menu->y + title_h + (int)r * row_h;
         int slot_w = menu->width / (int)cols;
+
         for (size_t c = 0; c < cols; ++c) {
             VariableInteraction *vi = (VariableInteraction*)row->interactions->items[c];
             int rx = menu->x + (int)c * slot_w;
+            int pad = 8;
+
             if (vi->type == VAR_BOOL) {
                 int square_size = 16;
-                int sx = rx + 8;
-                int sy = ry + (row_h - square_size)/2;
-                if (state == SDL_PRESSED && point_in_rect(mx,my,sx,sy,square_size,square_size)) {
+                int label_w = 0, label_h = 0;
+                if (menu_measure_text(vi->name, &label_w, &label_h) != 0) label_w = 0;
+                int gap = 6;
+                int sx = rx + pad + label_w + gap;
+                int sy = ry + (row_h - square_size) / 2;
+
+                if (state == SDL_PRESSED && point_in_rect(mx, my, sx, sy, square_size, square_size)) {
                     int *val = (int*)vi->variable;
                     *val = !(*val);
                     if (vi->on_change) vi->on_change(vi, vi->callback_data);
+                    return 1;
                 }
             } else if (vi->type == VAR_SLIDER) {
-                int bar_x = rx + 8;
-                int bar_w = slot_w - 16;
-                int bar_y = ry + row_h/2 - 6;
+                int label_w = 0, label_h = 0;
+                if (menu_measure_text(vi->name, &label_w, &label_h) != 0) label_w = 0;
+                int gap = 8;
+                int bar_x = rx + pad + label_w + gap;
+                int bar_w = slot_w - (pad + label_w + gap + pad);
+                if (bar_w < 32) bar_w = 32;
+                int bar_y = ry + row_h / 2 - 6;
                 int bar_h = 12;
-                if (state == SDL_PRESSED && point_in_rect(mx,my,bar_x,bar_y,bar_w,bar_h)) {
+
+                if (state == SDL_PRESSED && point_in_rect(mx, my, bar_x, bar_y, bar_w, bar_h)) {
                     double t = (double)(mx - bar_x) / (double)bar_w;
                     if (t < 0) t = 0; if (t > 1) t = 1;
                     double val = vi->min + t * (vi->max - vi->min);
@@ -90,46 +105,19 @@ void menu_handle_mouse_button(Menu *menu, int button, int state, int mx, int my)
                     if (vi->on_change) vi->on_change(vi, vi->callback_data);
                     menu->active_interaction = vi;
                     menu->dragging = 1;
+                    return 1;
                 }
             }
         }
     }
+
     if (state == SDL_RELEASED) {
+        int was_dragging = menu->dragging;
         menu->dragging = 0;
         menu->active_interaction = NULL;
+        return was_dragging ? 1 : 0;
     }
-}
-
-void menu_handle_mouse_motion(Menu *menu, int mx, int my) {
-    if (!menu) return;
-    if (!menu->dragging || !menu->active_interaction) return;
-    VariableInteraction *vi = menu->active_interaction;
-    // find its slot to compute bar position
-    int title_h = 24;
-    size_t rows = menu->rows->size;
-    if (rows == 0) return;
-    int avail_h = menu->height - title_h;
-    for (size_t r = 0; r < rows; ++r) {
-        MenuRow *row = (MenuRow*)menu->rows->items[r];
-        size_t cols = row->interactions->size;
-        if (cols == 0) continue;
-        int row_h = avail_h / (int)rows;
-        int ry = menu->y + title_h + (int)r * row_h;
-        int slot_w = menu->width / (int)cols;
-        for (size_t c = 0; c < cols; ++c) {
-            VariableInteraction *v2 = (VariableInteraction*)row->interactions->items[c];
-            if (v2 != vi) continue;
-            int rx = menu->x + (int)c * slot_w;
-            int bar_x = rx + 8;
-            int bar_w = slot_w - 16;
-            double t = (double)(mx - bar_x) / (double)bar_w;
-            if (t < 0) t = 0; if (t > 1) t = 1;
-            double val = vi->min + t * (vi->max - vi->min);
-            *(double*)vi->variable = val;
-            if (vi->on_change) vi->on_change(vi, vi->callback_data);
-            return;
-        }
-    }
+    return 0;
 }
 
 // --- Font / text rendering ---
@@ -263,6 +251,44 @@ static void draw_rect_border(int x, int y, int w, int h, Color c) {
     glVertex2i(x, y + h);
     glEnd();
 }
+int menu_handle_mouse_motion(Menu *menu, int mx, int my) {
+    if (!menu) return 0;
+    if (!menu->dragging || !menu->active_interaction) return 0;
+    // find active interaction location
+    int title_h = 24;
+    size_t rows = menu->rows->size;
+    if (rows == 0) return 0;
+    int avail_h = menu->height - title_h;
+
+    for (size_t r = 0; r < rows; ++r) {
+        MenuRow *row = (MenuRow*)menu->rows->items[r];
+        size_t cols = row->interactions->size;
+        if (cols == 0) continue;
+        int row_h = avail_h / (int)rows;
+        int ry = menu->y + title_h + (int)r * row_h;
+        int slot_w = menu->width / (int)cols;
+
+        for (size_t c = 0; c < cols; ++c) {
+            VariableInteraction *vi = (VariableInteraction*)row->interactions->items[c];
+            if (vi != menu->active_interaction) continue;
+            int rx = menu->x + (int)c * slot_w;
+            int label_w = 0, label_h = 0;
+            if (menu_measure_text(vi->name, &label_w, &label_h) != 0) label_w = 0;
+            int pad = 8, gap = 8;
+            int bar_x = rx + pad + label_w + gap;
+            int bar_w = slot_w - (pad + label_w + gap + pad);
+            if (bar_w < 32) bar_w = 32;
+            // clamp and compute t
+            double t = (double)(mx - bar_x) / (double)bar_w;
+            if (t < 0) t = 0; if (t > 1) t = 1;
+            double val = vi->min + t * (vi->max - vi->min);
+            *(double*)vi->variable = val;
+            if (vi->on_change) vi->on_change(vi, vi->callback_data);
+            return 1;
+        }
+    }
+    return 0;
+}
 
 void menu_render(Menu *menu, int window_w, int window_h) {
     if (!menu) return;
@@ -305,11 +331,15 @@ void menu_render(Menu *menu, int window_w, int window_h) {
         for (size_t c = 0; c < cols; ++c) {
             VariableInteraction *vi = (VariableInteraction*)row->interactions->items[c];
             int rx = menu->x + (int)c * slot_w;
-            // draw label area (we don't render text here, just a placeholder)
-            // draw interaction control
+            int pad = 8; int gap = 8;
+            // draw interaction control with label on the left
+            int label_w = 0, label_h = 0;
+            if (menu_measure_text(vi->name, &label_w, &label_h) != 0) label_w = 0;
+            int label_x = rx + pad;
+            int label_y = ry + (row_h - 12) / 2;
             if (vi->type == VAR_BOOL) {
                 int square_size = 16;
-                int sx = rx + 8;
+                int sx = rx + pad + label_w + gap;
                 int sy = ry + (row_h - square_size)/2;
                 Color fill = { (uint8_t)(menu->textColor.r), (uint8_t)(menu->textColor.g), (uint8_t)(menu->textColor.b), 255 };
                 if (*(int*)vi->variable) {
@@ -317,9 +347,12 @@ void menu_render(Menu *menu, int window_w, int window_h) {
                 } else {
                     draw_rect_border(sx, sy, square_size, square_size, fill);
                 }
+                // draw label to the left of the checkbox
+                draw_text(menu, vi->name, label_x, label_y);
             } else if (vi->type == VAR_SLIDER) {
-                int bar_x = rx + 8;
-                int bar_w = slot_w - 16;
+                int bar_x = rx + pad + label_w + gap;
+                int bar_w = slot_w - (pad + label_w + gap + pad);
+                if (bar_w < 32) bar_w = 32;
                 int bar_y = ry + row_h/2 - 6;
                 int bar_h = 12;
                 Color barBg = {200,200,200,255};
@@ -334,9 +367,7 @@ void menu_render(Menu *menu, int window_w, int window_h) {
                 int thumb_x = bar_x + (int)(t * (bar_w - thumb_w));
                 int thumb_y = bar_y - 2;
                 draw_filled_rect(thumb_x, thumb_y, thumb_w, bar_h + 4, barFg);
-                // draw the label to the right of the control
-                int label_x = rx + 8 + 24; // control + padding
-                int label_y = ry + (row_h - 12) / 2;
+                // draw the label to the left of the control
                 draw_text(menu, vi->name, label_x, label_y);
             }
         }

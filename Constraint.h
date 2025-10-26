@@ -27,10 +27,12 @@ struct Constraint {
     void (*dc_node)(Constraint *self, Node **nodes, size_t n_nodes, float *out_row);
     // optional sparse representation: fill DynArray of pairs (node_idx, vec[2])
     void (*dc_sparse)(Constraint *self, Node **nodes, size_t n_nodes, DynArray *out);
-    // optional: append entries directly into a CSparse triplet (cs_spalloc triplet)
-    // signature: (self, T, row) where T is a cs* in triplet form and row is the
-    // constraint row index (0..m-1). If you don't use CSparse, set to NULL.
-    void (*dc_triplet)(Constraint *self, struct cs *T, int row);
+    // optional: append entries directly into a sparse triplet structure.
+    // The concrete triplet type varies (CSparse triplet or CHOLMOD triplet).
+    // Use a generic void* here; implementations should cast to the expected
+    // triplet type internally. If you don't use sparse triplet emission, set
+    // this to NULL.
+    void (*dc_triplet)(Constraint *self, void *T, int row);
     void (*draw)(Constraint *self);
 };
 

@@ -104,8 +104,9 @@ static void anchor_dc_sparse(Constraint *self, Node **nodes, size_t n_nodes, Dyn
     Pair *p = malloc(sizeof(Pair)); p->idx = a->base_impl.node_idx; p->v[0] = nx; p->v[1] = ny; dynarray_append(out, p);
 }
 
-static void anchor_dc_triplet(Constraint *self, cs *T, int row) {
+static void anchor_dc_triplet(Constraint *self, void *T, int row) {
     AnchorImpl *a = (AnchorImpl*)self;
+    cs *ct = (cs*)T;
     Node *node = a->base_impl.base.node;
     if (!node) return;
     float dx = a->anchor_pos[0] - node->pos[0];
@@ -120,8 +121,8 @@ static void anchor_dc_triplet(Constraint *self, cs *T, int row) {
     if (idx >= 0) {
         int c0 = idx;
         int c1 = idx + 1;
-        cs_entry(T, row, c0, nx);
-        cs_entry(T, row, c1, ny);
+        cs_entry(ct, row, c0, nx);
+        cs_entry(ct, row, c1, ny);
     }
 }
 
@@ -165,9 +166,10 @@ Constraint* anchorconstraint_create(Node *node, float x, float y) {
 
 // Emit entries for this distance constraint directly into a CSparse triplet.
 // row is the constraint row index. T must be created with cs_spalloc(m, n2, nzmax, 1, 1).
-static void dist_dc_triplet(Constraint *self, cs *T, int row) {
+static void dist_dc_triplet(Constraint *self, void *T, int row) {
     DistConstraintImpl *d = (DistConstraintImpl*)self;
-    
+    cs *ct = (cs*)T;
+
     float dx = d->other->pos[0] - d->base.node->pos[0];
     float dy = d->other->pos[1] - d->base.node->pos[1];
     float norm = sqrtf(dx*dx + dy*dy);
@@ -177,14 +179,14 @@ static void dist_dc_triplet(Constraint *self, cs *T, int row) {
     if (d->node_idx >= 0) {
         c0 = 2 * d->node_idx + 0;
         c1 = 2 * d->node_idx + 1;
-        cs_entry(T, row, c0, nx);
-        cs_entry(T, row, c1, ny);
+        cs_entry(ct, row, c0, nx);
+        cs_entry(ct, row, c1, ny);
     }
     if (d->other_idx >= 0 && !d->other->anchored) {
         c0 = 2 * d->other_idx + 0;
         c1 = 2 * d->other_idx + 1;
-        cs_entry(T, row, c0, -nx);
-        cs_entry(T, row, c1, -ny);
+        cs_entry(ct, row, c0, -nx);
+        cs_entry(ct, row, c1, -ny);
     }
 }
 

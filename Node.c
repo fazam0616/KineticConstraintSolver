@@ -17,8 +17,6 @@ Node* node_create(int idx, float mass, float x, float y) {
     n->collide_with_walls = true;
     n->friction = 0.5f;
     n->radius = 6.0f;
-    n->anchor_damping_remaining = 0.0f;
-    n->anchor_damping_total = 0.0f;
     n->sim_ignore = false;
     return n;
 }
