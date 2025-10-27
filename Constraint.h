@@ -54,4 +54,8 @@ typedef struct WallSegment {
 WallSegment* wallsegment_create(Node *A, Node *B, float restitution, float friction);
 void wallsegment_free(WallSegment *w);
 
+// Refresh internal cached node indices inside constraint implementations.
+// Call this after node indices change (for example after deleting nodes).
+void constraint_refresh_indices(DynArray *constraints);
+
 #endif // CONSTRAINT_H

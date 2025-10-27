@@ -32,7 +32,7 @@ static float dist_err(Constraint *self) {
     float dx = d->base.node->pos[0] - d->other->pos[0];
     float dy = d->base.node->pos[1] - d->other->pos[1];
     float dist = sqrtf(dx*dx + dy*dy);
-    return dist - d->distance;
+    return dist - d->base.rest_length;
 }
 
 static void dist_dc_node(Constraint *self, Node **nodes, size_t n_nodes, float *out_row) {
@@ -43,18 +43,19 @@ static void dist_dc_node(Constraint *self, Node **nodes, size_t n_nodes, float *
     float norm = sqrtf(dx*dx + dy*dy);
     float nx = 0.0f, ny = 0.0f;
     if (norm > 1e-9f) { nx = dx / norm; ny = dy / norm; }
-    if (d->node_idx >= 0) {
-        out_row[2 * d->node_idx + 0] = nx;
-        out_row[2 * d->node_idx + 1] = ny;
+    int ni = d->base.node ? d->base.node->idx : -1;
+    int oi = d->other ? d->other->idx : -1;
+    if (ni >= 0) {
+        out_row[2 * ni + 0] = nx;
+        out_row[2 * ni + 1] = ny;
     }
-    if (d->other_idx >= 0 && !d->other->anchored) {
-        out_row[2 * d->other_idx + 0] = -nx;
-        out_row[2 * d->other_idx + 1] = -ny;
+    if (oi >= 0 && !d->other->anchored) {
+        out_row[2 * oi + 0] = -nx;
+        out_row[2 * oi + 1] = -ny;
     }
 }
 
 static void dist_dc_sparse(Constraint *self, Node **nodes, size_t n_nodes, DynArray *out) {
-    // out holds pointers to pairs int,int? We'll store as malloc'd struct {int idx; float v[2];}
     DistConstraintImpl *d = (DistConstraintImpl*)self;
     float dx = d->other->pos[0] - d->base.node->pos[0];
     float dy = d->other->pos[1] - d->base.node->pos[1];
@@ -62,9 +63,13 @@ static void dist_dc_sparse(Constraint *self, Node **nodes, size_t n_nodes, DynAr
     float nx = 0.0f, ny = 0.0f;
     if (norm > 1e-9f) { nx = dx / norm; ny = dy / norm; }
     typedef struct { int idx; float v[2]; } Pair;
-    Pair *p1 = malloc(sizeof(Pair)); p1->idx = d->node_idx; p1->v[0] = -nx; p1->v[1] = -ny; dynarray_append(out, p1);
-    if (d->other_idx >= 0 && !d->other->anchored) {
-        Pair *p2 = malloc(sizeof(Pair)); p2->idx = d->other_idx; p2->v[0] = nx; p2->v[1] = ny; dynarray_append(out, p2);
+    int ni = d->base.node ? d->base.node->idx : -1;
+    int oi = d->other ? d->other->idx : -1;
+    if (ni >= 0) {
+        Pair *p1 = malloc(sizeof(Pair)); p1->idx = ni; p1->v[0] = -nx; p1->v[1] = -ny; dynarray_append(out, p1);
+    }
+    if (oi >= 0 && !d->other->anchored) {
+        Pair *p2 = malloc(sizeof(Pair)); p2->idx = oi; p2->v[0] = nx; p2->v[1] = ny; dynarray_append(out, p2);
     }
 }
 
@@ -101,7 +106,10 @@ static void anchor_dc_sparse(Constraint *self, Node **nodes, size_t n_nodes, Dyn
     float nx = 0.0f, ny = 0.0f;
     if (norm > 1e-9f) { nx = dx / norm; ny = dy / norm; }
     typedef struct { int idx; float v[2]; } Pair;
-    Pair *p = malloc(sizeof(Pair)); p->idx = a->base_impl.node_idx; p->v[0] = nx; p->v[1] = ny; dynarray_append(out, p);
+    int idx = node ? node->idx : -1;
+    if (idx >= 0) {
+        Pair *p = malloc(sizeof(Pair)); p->idx = idx; p->v[0] = nx; p->v[1] = ny; dynarray_append(out, p);
+    }
 }
 
 static void anchor_dc_triplet(Constraint *self, void *T, int row) {
@@ -117,7 +125,7 @@ static void anchor_dc_triplet(Constraint *self, void *T, int row) {
         float inv_n = 1.0f / norm;
         nx = (double)(dx * inv_n); ny = (double)(dy * inv_n);
     }
-    int idx = 2 * a->base_impl.node_idx;
+    int idx = node ? (2 * node->idx) : -1;
     if (idx >= 0) {
         int c0 = idx;
         int c1 = idx + 1;
@@ -175,16 +183,17 @@ static void dist_dc_triplet(Constraint *self, void *T, int row) {
     float norm = sqrtf(dx*dx + dy*dy);
     double nx = 0.0, ny = 0.0;
     if (norm > 1e-9f) { nx = (double)(dx / norm); ny = (double)(dy / norm); }
-    int c0, c1;
-    if (d->node_idx >= 0) {
-        c0 = 2 * d->node_idx + 0;
-        c1 = 2 * d->node_idx + 1;
+    int ni = d->base.node ? d->base.node->idx : -1;
+    int oi = d->other ? d->other->idx : -1;
+    if (ni >= 0) {
+        int c0 = 2 * ni + 0;
+        int c1 = 2 * ni + 1;
         cs_entry(ct, row, c0, nx);
         cs_entry(ct, row, c1, ny);
     }
-    if (d->other_idx >= 0 && !d->other->anchored) {
-        c0 = 2 * d->other_idx + 0;
-        c1 = 2 * d->other_idx + 1;
+    if (oi >= 0 && !d->other->anchored) {
+        int c0 = 2 * oi + 0;
+        int c1 = 2 * oi + 1;
         cs_entry(ct, row, c0, -nx);
         cs_entry(ct, row, c1, -ny);
     }
@@ -242,16 +251,16 @@ static float spring_err(Constraint *self) {
 
 static void spring_draw(Constraint *self) {
     DistConstraintImpl *d = (DistConstraintImpl*)self;
-    SpringImpl *sp = (SpringImpl*)self;
     // color based on energy stored in spring: white = no strain,
     // compression -> red, stretch -> blue. Strength scaled by spring energy.
+    SpringImpl *sp = (SpringImpl*)self;
     float dx = d->base.node->pos[0] - d->other->pos[0];
     float dy = d->base.node->pos[1] - d->other->pos[1];
     float dist = sqrtf(dx*dx + dy*dy);
-    float rest = (d->distance > 0.0f) ? d->distance : 1.0f;
+    float rest = (d->base.rest_length > 0.0f) ? d->base.rest_length : 1.0f;
     float ext = dist - rest; // positive = stretch, negative = compression
     // energy = 0.5 * k * ext^2
-    float k = sp->k;
+    float k = sp->base_impl.base.stiffness;
     float energy = 0.5f * k * ext * ext;
     // map energy -> intensity in [0,1] (soft saturation so large energies don't clamp abruptly)
     float intensity = 0.5f * energy / (energy + 1.0f);
@@ -308,4 +317,31 @@ WallSegment* wallsegment_create(Node *A, Node *B, float restitution, float frict
 void wallsegment_free(WallSegment *w) { free(w); }
 
 // Note: callers must free pairs appended by dc_sparse.
+
+// Refresh internal cached node indices inside constraint implementations.
+// This updates the node_idx/other_idx fields stored in internal structs so
+// that triplet emitters which referenced those indices remain consistent
+// after nodes were reindexed (for example after deletions).
+void constraint_refresh_indices(DynArray *constraints) {
+    if (!constraints) return;
+    for (size_t ci = 0; ci < dynarray_size(constraints); ++ci) {
+        Constraint *c = (Constraint*)dynarray_get(constraints, ci);
+        if (!c) continue;
+        if (c->type == CT_DIST || c->type == CT_SPRING || c->type == CT_ANCHOR) {
+            DistConstraintImpl *d = (DistConstraintImpl*)c;
+            d->node_idx = d->base.node ? d->base.node->idx : -1;
+            d->other_idx = d->other ? d->other->idx : -1;
+            if (c->type == CT_DIST) {
+                d->distance = d->base.rest_length;
+            } else if (c->type == CT_SPRING) {
+                SpringImpl *sp = (SpringImpl*)c;
+                sp->base_impl.distance = sp->base_impl.base.rest_length;
+                sp->k = sp->base_impl.base.stiffness;
+            } else if (c->type == CT_ANCHOR) {
+                AnchorImpl *a = (AnchorImpl*)c;
+                a->base_impl.node_idx = a->base_impl.base.node ? a->base_impl.base.node->idx : -1;
+            }
+        }
+    }
+}
 

@@ -88,8 +88,19 @@ int menu_handle_mouse_button(Menu *menu, int button, int state, int mx, int my) 
                     return 1;
                 }
             } else if (vi->type == VAR_SLIDER) {
+                /* Compose a transient label that includes the slider's current value formatted to 2 decimals.
+                   This avoids any heap allocation per-frame and ensures measurement/drawing match. */
+                char labelbuf[64];
+                double cur = *(double*)vi->variable;
+                if (vi->max > vi->min) {
+                    /* clamp display value into range for nicer formatting */
+                    if (cur < vi->min) cur = vi->min;
+                    if (cur > vi->max) cur = vi->max;
+                }
+                snprintf(labelbuf, sizeof(labelbuf), "%s: %.2f", vi->name, cur);
+
                 int label_w = 0, label_h = 0;
-                if (menu_measure_text(vi->name, &label_w, &label_h) != 0) label_w = 0;
+                if (menu_measure_text(labelbuf, &label_w, &label_h) != 0) label_w = 0;
                 int gap = 8;
                 int bar_x = rx + pad + label_w + gap;
                 int bar_w = slot_w - (pad + label_w + gap + pad);
@@ -273,8 +284,19 @@ int menu_handle_mouse_motion(Menu *menu, int mx, int my) {
             if (vi != menu->active_interaction) continue;
             int rx = menu->x + (int)c * slot_w;
             int label_w = 0, label_h = 0;
-            if (menu_measure_text(vi->name, &label_w, &label_h) != 0) label_w = 0;
             int pad = 8, gap = 8;
+            char labelbuf[64];
+            const char *labelptr = vi->name;
+            if (vi->type == VAR_SLIDER) {
+                double cur = *(double*)vi->variable;
+                if (vi->max > vi->min) {
+                    if (cur < vi->min) cur = vi->min;
+                    if (cur > vi->max) cur = vi->max;
+                }
+                snprintf(labelbuf, sizeof(labelbuf), "%s: %.2f", vi->name, cur);
+                labelptr = labelbuf;
+            }
+            if (menu_measure_text(labelptr, &label_w, &label_h) != 0) label_w = 0;
             int bar_x = rx + pad + label_w + gap;
             int bar_w = slot_w - (pad + label_w + gap + pad);
             if (bar_w < 32) bar_w = 32;
@@ -334,7 +356,18 @@ void menu_render(Menu *menu, int window_w, int window_h) {
             int pad = 8; int gap = 8;
             // draw interaction control with label on the left
             int label_w = 0, label_h = 0;
-            if (menu_measure_text(vi->name, &label_w, &label_h) != 0) label_w = 0;
+            char labelbuf[64];
+            const char *labelptr = vi->name;
+            if (vi->type == VAR_SLIDER) {
+                double cur = *(double*)vi->variable;
+                if (vi->max > vi->min) {
+                    if (cur < vi->min) cur = vi->min;
+                    if (cur > vi->max) cur = vi->max;
+                }
+                snprintf(labelbuf, sizeof(labelbuf), "%s: %.2f", vi->name, cur);
+                labelptr = labelbuf;
+            }
+            if (menu_measure_text(labelptr, &label_w, &label_h) != 0) label_w = 0;
             int label_x = rx + pad;
             int label_y = ry + (row_h - 12) / 2;
             if (vi->type == VAR_BOOL) {
@@ -348,7 +381,7 @@ void menu_render(Menu *menu, int window_w, int window_h) {
                     draw_rect_border(sx, sy, square_size, square_size, fill);
                 }
                 // draw label to the left of the checkbox
-                draw_text(menu, vi->name, label_x, label_y);
+                draw_text(menu, labelptr, label_x, label_y);
             } else if (vi->type == VAR_SLIDER) {
                 int bar_x = rx + pad + label_w + gap;
                 int bar_w = slot_w - (pad + label_w + gap + pad);
@@ -368,7 +401,7 @@ void menu_render(Menu *menu, int window_w, int window_h) {
                 int thumb_y = bar_y - 2;
                 draw_filled_rect(thumb_x, thumb_y, thumb_w, bar_h + 4, barFg);
                 // draw the label to the left of the control
-                draw_text(menu, vi->name, label_x, label_y);
+                draw_text(menu, labelptr, label_x, label_y);
             }
         }
     }

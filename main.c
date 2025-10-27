@@ -32,6 +32,7 @@ typedef struct {
     int *tool_spring;
     int *tool_wall;
     int *current_tool;
+    int *sel_filter;    // pointer to current selection filter in main
     // +Node tool spawn parameters (allocated when Edit menu row is created)
     double *node_mass;
     double *node_friction;
@@ -41,6 +42,8 @@ typedef struct {
     Simulator *sim;
     DynArray *selection;
     int *drag_enabled; // pointer to drag enable flag (allocated by menu)
+    double *drag_strength; // pointer to configurable drag force gain
+    double *drag_damping;  // pointer to configurable drag damping (B)
 } EditData;
 
 // helper: remove and free a menu from the menus list if present
@@ -65,6 +68,12 @@ static void sel_cb_toggle_anchor(VariableInteraction *vi, void *user_data);
 static void sel_cb_scale_mass(VariableInteraction *vi, void *user_data);
 static void sel_cb_move_or_rotate(VariableInteraction *vi, void *user_data);
 static void sel_cb_drag_toggle(VariableInteraction *vi, void *user_data);
+// additional selection callbacks (defined later)
+static void sel_cb_set_node_friction(VariableInteraction *vi, void *user_data);
+static void sel_cb_delete_nodes(VariableInteraction *vi, void *user_data);
+static void sel_cb_set_constraint_distance(VariableInteraction *vi, void *user_data);
+static void sel_cb_set_spring_prop(VariableInteraction *vi, void *user_data);
+static void sel_cb_set_wall_prop(VariableInteraction *vi, void *user_data);
 
 // Create the edit palette menu (if not already created). Caller must ensure ed != NULL
 static void create_edit_menu_if_needed(EditData *ed) {
@@ -105,6 +114,28 @@ static void destroy_edit_menu_if_present(EditData *ed) {
     *(ed->edit_menu) = NULL;
 }
 
+// Selection kinds (file-scope so helpers can reference)
+enum SelKind { SEL_NONE = 0, SEL_NODE = 1, SEL_CONSTRAINT = 2, SEL_WALL = 3 };
+
+// Helper used for click candidate lists
+typedef struct {
+    int type; // SEL_NODE, SEL_CONSTRAINT, SEL_WALL
+    void *obj;
+} ClickCandidate;
+
+// Callback data for mass-scale slider: remember last slider value so we apply
+// relative scaling (factor / last) on each change instead of repeatedly
+// multiplying from absolute slider value. This avoids immediate reset/snapping
+// and exponential application while dragging.
+typedef struct {
+    EditData *ed;
+    double last;
+} MassScaleCB;
+
+// forward-declare helpers used below
+static float point_segment_distance2(float px, float py, float ax, float ay, float bx, float by);
+static void sel_cb_delete_selection(VariableInteraction *vi, void *user_data);
+
 static void create_select_menu_if_needed(EditData *ed) {
     if (!ed || !ed->menus) return;
     if (*(ed->select_menu) != NULL) return;
@@ -112,54 +143,115 @@ static void create_select_menu_if_needed(EditData *ed) {
     int x = 10;
     int y = (*(ed->win_h) > h + 20) ? (*(ed->win_h) - h - 10) : 400;
     Menu *m = menu_create(x, y, w, h, 120, "Selection", (Color){255,255,255,255}, (Color){40,40,70,255});
+    int filter = ed->sel_filter ? *(ed->sel_filter) : SEL_NODE;
+    if (filter == SEL_NODE) {
+        // Row: Select Size
+        MenuRow *r1 = menurow_create();
+        double *sel_size = malloc(sizeof(double)); *sel_size = 10.0;
+        VariableInteraction *v_sel_size = variableinteraction_create(sel_size, "Select Size", 1.0, 200.0, VAR_SLIDER, NULL, NULL);
+        menurow_add_interaction(r1, v_sel_size);
+        menu_add_row(m, r1);
 
-    // Row: Select Size
-    MenuRow *r1 = menurow_create();
-    double *sel_size = malloc(sizeof(double)); *sel_size = 10.0;
-    VariableInteraction *v_sel_size = variableinteraction_create(sel_size, "Select Size", 1.0, 200.0, VAR_SLIDER, NULL, NULL);
-    menurow_add_interaction(r1, v_sel_size);
-    menu_add_row(m, r1);
+        // Row: Anchor toggle
+        MenuRow *r_anchor = menurow_create();
+        int *sel_anchor = malloc(sizeof(int)); *sel_anchor = 0;
+        if (ed && ed->selection && dynarray_size(ed->selection) == 1) {
+            Node *only = (Node*)dynarray_get(ed->selection, 0);
+            if (only) *sel_anchor = only->anchored ? 1 : 0;
+        }
+        VariableInteraction *v_anchor = variableinteraction_create(sel_anchor, "Toggle Anchor", 0, 1, VAR_BOOL, sel_cb_toggle_anchor, ed);
+        menurow_add_interaction(r_anchor, v_anchor);
+        menu_add_row(m, r_anchor);
 
-    // Row: Anchor toggle
-    MenuRow *r_anchor = menurow_create();
-    int *sel_anchor = malloc(sizeof(int));
-    // Default anchor toggle to reflect single-node selection state when possible
-    *sel_anchor = 0;
-    if (ed && ed->selection && dynarray_size(ed->selection) == 1) {
-        Node *only = (Node*)dynarray_get(ed->selection, 0);
-        if (only) *sel_anchor = only->anchored ? 1 : 0;
-    }
-    VariableInteraction *v_anchor = variableinteraction_create(sel_anchor, "Toggle Anchor", 0, 1, VAR_BOOL, sel_cb_toggle_anchor, ed);
-    menurow_add_interaction(r_anchor, v_anchor);
-    menu_add_row(m, r_anchor);
+        // Row: Friction
+        MenuRow *r_fric = menurow_create();
+        double *fric = malloc(sizeof(double)); *fric = 0.5;
+        if (ed && ed->selection && dynarray_size(ed->selection) == 1) {
+            Node *only = (Node*)dynarray_get(ed->selection, 0);
+            if (only) *fric = only->friction;
+        }
+        VariableInteraction *v_fric = variableinteraction_create(fric, "Friction", 0.0, 1.0, VAR_SLIDER, sel_cb_set_node_friction, ed);
+        menurow_add_interaction(r_fric, v_fric);
+        menu_add_row(m, r_fric);
 
-    // Row: Mass scale
+    // Row: Mass scale (relative slider)
     MenuRow *r_mass = menurow_create();
     double *mass_scale = malloc(sizeof(double)); *mass_scale = 1.0;
-    VariableInteraction *v_mass = variableinteraction_create(mass_scale, "Scale Mass", 0.1, 10.0, VAR_SLIDER, sel_cb_scale_mass, ed);
+    MassScaleCB *mscb = malloc(sizeof(MassScaleCB)); mscb->ed = ed; mscb->last = 1.0;
+    VariableInteraction *v_mass = variableinteraction_create(mass_scale, "Scale Mass", 0.1, 10.0, VAR_SLIDER, sel_cb_scale_mass, mscb);
     menurow_add_interaction(r_mass, v_mass);
     menu_add_row(m, r_mass);
 
-    // Row: Move X / Move Y / Rotate
-    MenuRow *r_move = menurow_create();
-    double *move_x = malloc(sizeof(double)); *move_x = 0.0;
-    double *move_y = malloc(sizeof(double)); *move_y = 0.0;
-    double *rotate = malloc(sizeof(double)); *rotate = 0.0;
-    VariableInteraction *v_move_x = variableinteraction_create(move_x, "Move X", -500.0, 500.0, VAR_SLIDER, sel_cb_move_or_rotate, ed);
-    VariableInteraction *v_move_y = variableinteraction_create(move_y, "Move Y", -500.0, 500.0, VAR_SLIDER, sel_cb_move_or_rotate, ed);
-    VariableInteraction *v_rotate = variableinteraction_create(rotate, "Rotate (deg)", -180.0, 180.0, VAR_SLIDER, sel_cb_move_or_rotate, ed);
-    menurow_add_interaction(r_move, v_move_x); menurow_add_interaction(r_move, v_move_y); menurow_add_interaction(r_move, v_rotate);
-    menu_add_row(m, r_move);
-
     // Row: Drag toggle
-    MenuRow *r_drag = menurow_create();
-    int *drag_enable = malloc(sizeof(int)); *drag_enable = 0;
-    VariableInteraction *v_drag = variableinteraction_create(drag_enable, "Drag", 0, 1, VAR_BOOL, sel_cb_drag_toggle, ed);
-    menurow_add_interaction(r_drag, v_drag);
-    menu_add_row(m, r_drag);
+        MenuRow *r_drag = menurow_create();
+        int *drag_enable = malloc(sizeof(int)); *drag_enable = 0;
+        VariableInteraction *v_drag = variableinteraction_create(drag_enable, "Drag", 0, 1, VAR_BOOL, sel_cb_drag_toggle, ed);
+        menurow_add_interaction(r_drag, v_drag);
+        menu_add_row(m, r_drag);
 
-    // store pointers in EditData so callbacks can access
+        // Row: Delete node
+        MenuRow *r_deln = menurow_create();
+        int *deln = malloc(sizeof(int)); *deln = 0;
+        VariableInteraction *v_deln = variableinteraction_create(deln, "Delete Node", 0, 1, VAR_BOOL, sel_cb_delete_nodes, ed);
+        menurow_add_interaction(r_deln, v_deln);
+        menu_add_row(m, r_deln);
+
+    // store pointers in EditData so callbacks and main loop can access
     if (ed) { ed->selection = ed->selection ? ed->selection : NULL; ed->drag_enabled = drag_enable; }
+    } else if (filter == SEL_CONSTRAINT) {
+        // For constraints show delete control and property sliders for single selection
+        MenuRow *r_del = menurow_create();
+        int *del = malloc(sizeof(int)); *del = 0;
+        VariableInteraction *v_del = variableinteraction_create(del, "Delete", 0, 1, VAR_BOOL, sel_cb_delete_selection, ed);
+        menurow_add_interaction(r_del, v_del);
+        menu_add_row(m, r_del);
+
+        if (ed && ed->selection && dynarray_size(ed->selection) == 1) {
+            Constraint *c = (Constraint*)dynarray_get(ed->selection, 0);
+            if (c && c->type == CT_DIST) {
+                MenuRow *r_dist = menurow_create();
+                double *distv = malloc(sizeof(double)); *distv = c->rest_length;
+                VariableInteraction *v_distv = variableinteraction_create(distv, "Distance", 0.0, 200.0, VAR_SLIDER, sel_cb_set_constraint_distance, ed);
+                menurow_add_interaction(r_dist, v_distv);
+                menu_add_row(m, r_dist);
+            } else if (c && c->type == CT_SPRING) {
+                MenuRow *r_st = menurow_create();
+                double *stiff = malloc(sizeof(double)); *stiff = c->stiffness;
+                VariableInteraction *v_st = variableinteraction_create(stiff, "Stiffness", 0.0, 800.0, VAR_SLIDER, sel_cb_set_spring_prop, ed);
+                menurow_add_interaction(r_st, v_st);
+                menu_add_row(m, r_st);
+                MenuRow *r_rest = menurow_create();
+                double *restv = malloc(sizeof(double)); *restv = c->rest_length;
+                VariableInteraction *v_restv = variableinteraction_create(restv, "Rest Length", 0.0, 200.0, VAR_SLIDER, sel_cb_set_spring_prop, ed);
+                menurow_add_interaction(r_rest, v_restv);
+                menu_add_row(m, r_rest);
+            }
+        }
+    } else if (filter == SEL_WALL) {
+        MenuRow *r_delw = menurow_create();
+        int *delw = malloc(sizeof(int)); *delw = 0;
+        VariableInteraction *v_delw = variableinteraction_create(delw, "Delete Wall", 0, 1, VAR_BOOL, sel_cb_delete_selection, ed);
+        menurow_add_interaction(r_delw, v_delw);
+        menu_add_row(m, r_delw);
+
+        if (ed && ed->selection && dynarray_size(ed->selection) == 1) {
+            WallSegment *w = (WallSegment*)dynarray_get(ed->selection, 0);
+            if (w) {
+                MenuRow *r_wf = menurow_create();
+                double *wf = malloc(sizeof(double)); *wf = w->friction;
+                VariableInteraction *v_wf = variableinteraction_create(wf, "Friction", 0.0, 1.0, VAR_SLIDER, sel_cb_set_wall_prop, ed);
+                menurow_add_interaction(r_wf, v_wf);
+                menu_add_row(m, r_wf);
+                MenuRow *r_wr = menurow_create();
+                double *wr = malloc(sizeof(double)); *wr = w->restitution;
+                VariableInteraction *v_wr = variableinteraction_create(wr, "Restitution", 0.0, 1.0, VAR_SLIDER, sel_cb_set_wall_prop, ed);
+                menurow_add_interaction(r_wr, v_wr);
+                menu_add_row(m, r_wr);
+            }
+        }
+    }
+
+    // append the selection menu to registry and expose it to caller
     dynarray_append(ed->menus, m);
     *(ed->select_menu) = m;
 }
@@ -203,7 +295,7 @@ static void update_edit_row2_for_tool(EditData *ed) {
         ed->node_anchored = malloc(sizeof(int)); *ed->node_anchored = 0;
         ed->node_collide_with_walls = malloc(sizeof(int)); *ed->node_collide_with_walls = 1;
 
-        VariableInteraction *vi_mass = variableinteraction_create(ed->node_mass, "Mass", 0.01, 1000.0, VAR_SLIDER, NULL, NULL);
+        VariableInteraction *vi_mass = variableinteraction_create(ed->node_mass, "Mass", 0.01, 200.0, VAR_SLIDER, NULL, NULL);
         VariableInteraction *vi_friction = variableinteraction_create(ed->node_friction, "Friction", 0.0, 1.0, VAR_SLIDER, NULL, NULL);
         VariableInteraction *vi_anchor = variableinteraction_create(ed->node_anchored, "Anchored", 0, 1, VAR_BOOL, NULL, NULL);
         VariableInteraction *vi_collide = variableinteraction_create(ed->node_collide_with_walls, "Collide Walls", 0, 1, VAR_BOOL, NULL, NULL);
@@ -328,6 +420,22 @@ static void key_press_run(InputHandler *handler, const SDL_Event *event) {
     printf("Key %d pressed\n", (int)handler->key);
 }
 
+// helper: squared distance from point P to segment AB
+static float point_segment_distance2(float px, float py, float ax, float ay, float bx, float by) {
+    float vx = bx - ax, vy = by - ay;
+    float wx = px - ax, wy = py - ay;
+    float c1 = vx * wx + vy * wy;
+    if (c1 <= 0.0f) return wx*wx + wy*wy;
+    float c2 = vx*vx + vy*vy;
+    if (c2 <= c1) {
+        float dx = px - bx, dy = py - by; return dx*dx + dy*dy;
+    }
+    float t = c1 / c2;
+    float projx = ax + t * vx, projy = ay + t * vy;
+    float dx = px - projx, dy = py - projy;
+    return dx*dx + dy*dy;
+}
+
 // Callback data struct
 typedef struct { Menu *menu; int field; } MenuCallbackData;
 enum {F_X, F_Y, F_W, F_H, F_COLOR};
@@ -366,7 +474,7 @@ static void sim_on_step_change(VariableInteraction *vi, void *user_data);
 // Selection callbacks
 static void sel_cb_toggle_anchor(VariableInteraction *vi, void *user_data) {
     EditData *ed = (EditData*)user_data;
-    if (!ed || !ed->selection) return;
+    if (!ed || !ed->selection || !ed->sim) return;
     int v = *(int*)vi->variable;
     // if setting anchor on selected nodes, create AnchorConstraint for each unanchored node
     if (v) {
@@ -404,17 +512,22 @@ static void sel_cb_toggle_anchor(VariableInteraction *vi, void *user_data) {
 }
 
 static void sel_cb_scale_mass(VariableInteraction *vi, void *user_data) {
-    EditData *ed = (EditData*)user_data;
-    if (!ed || !ed->selection) return;
-    double factor = *(double*)vi->variable;
-    if (factor == 0.0) return;
+    MassScaleCB *ms = (MassScaleCB*)user_data;
+    if (!ms || !ms->ed || !ms->ed->selection) return;
+    EditData *ed = ms->ed;
+    double cur = *(double*)vi->variable;
+    if (cur <= 0.0) return;
+    // compute relative change since last value
+    double rel = 1.0;
+    if (ms->last > 0.0) rel = cur / ms->last;
+    if (rel == 1.0) return; // no-op
     for (size_t i = 0; i < dynarray_size(ed->selection); ++i) {
         Node *n = (Node*)dynarray_get(ed->selection, i);
         if (!n) continue;
-        n->mass *= (float)factor;
+        n->mass *= (float)rel;
     }
-    // reset slider to 1.0 so future adjustments are relative
-    *(double*)vi->variable = 1.0;
+    // remember last applied value
+    ms->last = cur;
 }
 
 static void sel_cb_move_or_rotate(VariableInteraction *vi, void *user_data) {
@@ -471,6 +584,78 @@ static void sel_cb_drag_toggle(VariableInteraction *vi, void *user_data) {
     EditData *ed = (EditData*)user_data;
     if (!ed) return;
     // drag_enabled pointer already set in ed by create_select_menu_if_needed
+}
+
+// Delete selected constraints or walls depending on current sel_filter
+static void sel_cb_delete_selection(VariableInteraction *vi, void *user_data) {
+    (void)vi;
+    EditData *ed = (EditData*)user_data;
+    if (!ed || !ed->selection || !ed->sim) return;
+    int f = ed->sel_filter ? *(ed->sel_filter) : SEL_NONE;
+    if (f == SEL_CONSTRAINT) {
+        // iterate selected constraints and remove them from simulator
+        for (size_t si = 0; si < dynarray_size(ed->selection); ++si) {
+            Constraint *c = (Constraint*)dynarray_get(ed->selection, si);
+            if (!c) continue;
+            // remember linked nodes and type before freeing
+            DynArray *cons = ed->sim->constraints;
+            Node *n0 = c->node;
+            Node *n1 = c->other;
+            int ctype = c->type;
+            // remove from simulator->constraints (search backwards for stability)
+            for (ssize_t ci = (ssize_t)dynarray_size(cons) - 1; ci >= 0; --ci) {
+                if ((Constraint*)dynarray_get(cons, (size_t)ci) == c) {
+                    for (size_t j = (size_t)ci; j + 1 < cons->size; ++j) cons->items[j] = cons->items[j+1];
+                    cons->size -= 1;
+                    break;
+                }
+            }
+            // remove from any node->constraints lists (use saved node pointers)
+            if (n0 && n0->constraints) {
+                DynArray *nc = n0->constraints;
+                for (size_t j = 0; j < nc->size; ++j) {
+                    if ((Constraint*)dynarray_get(nc, j) == c) {
+                        for (size_t k = j; k + 1 < nc->size; ++k) nc->items[k] = nc->items[k+1];
+                        nc->size -= 1; break;
+                    }
+                }
+            }
+            if (n1 && n1->constraints) {
+                DynArray *nc = n1->constraints;
+                for (size_t j = 0; j < nc->size; ++j) {
+                    if ((Constraint*)dynarray_get(nc, j) == c) {
+                        for (size_t k = j; k + 1 < nc->size; ++k) nc->items[k] = nc->items[k+1];
+                        nc->size -= 1; break;
+                    }
+                }
+            }
+            // if this was an anchor constraint, clear anchored flag on its node
+            if (ctype == CT_ANCHOR && n0) n0->anchored = false;
+            // finally free constraint memory
+            free(c);
+        }
+        // clear selection
+        ed->selection->size = 0;
+        // refresh menu
+        destroy_select_menu_if_present(ed);
+        create_select_menu_if_needed(ed);
+    } else if (f == SEL_WALL) {
+        for (size_t si = 0; si < dynarray_size(ed->selection); ++si) {
+            WallSegment *w = (WallSegment*)dynarray_get(ed->selection, si);
+            if (!w) continue;
+            DynArray *ws = ed->sim->walls;
+            for (ssize_t wi = (ssize_t)dynarray_size(ws) - 1; wi >= 0; --wi) {
+                if ((WallSegment*)dynarray_get(ws, (size_t)wi) == w) {
+                    wallsegment_free(w);
+                    for (size_t j = (size_t)wi; j + 1 < ws->size; ++j) ws->items[j] = ws->items[j+1];
+                    ws->size -= 1; break;
+                }
+            }
+        }
+        ed->selection->size = 0;
+        destroy_select_menu_if_present(ed);
+        create_select_menu_if_needed(ed);
+    }
 }
 
 
@@ -609,6 +794,12 @@ int main(int argc, char *argv[]) {
     MenuRow *r_pause = menurow_create();
     menurow_add_interaction(r_pause, vi_pause);
     menu_add_row(ctrl, r_pause);
+    // Row: Steps per second slider (controls sim->dt = 1.0 / sps)
+    double sps = 1.0 / sim->dt;
+    MenuRow *r_sps = menurow_create();
+    VariableInteraction *vi_sps = variableinteraction_create(&sps, "Steps/s", 15.0, 500.0, VAR_SLIDER, sim_on_step_change, sim);
+    menurow_add_interaction(r_sps, vi_sps);
+    menu_add_row(ctrl, r_sps);
     // Edit toggle will open/close the edit palette menu
     int edit_open = 0;
     VariableInteraction *vi_edit = variableinteraction_create(&edit_open, "Edit", 0, 1, VAR_BOOL, on_edit_toggle, NULL);
@@ -624,7 +815,7 @@ int main(int argc, char *argv[]) {
     int tool_select = 0, tool_node = 0, tool_dist = 0, tool_spring = 0, tool_wall = 0;
     // Selection state
     DynArray *selection = dynarray_create(8); // holds Node* / Constraint* / WallSegment*
-    enum { SEL_NONE=0, SEL_NODE=1, SEL_CONSTRAINT=2, SEL_WALL=3 } sel_filter = SEL_NODE;
+    int sel_filter = SEL_NONE;
     int selection_dragging = 0; // dragging selected objects
     int rect_select_active = 0; // right-button rectangle select active
     int rect_x0 = 0, rect_y0 = 0, rect_x1 = 0, rect_y1 = 0;
@@ -634,11 +825,14 @@ int main(int argc, char *argv[]) {
     // last pick position (world coords) used for rendering the pick cursor
     float pick_wx = 0.0f, pick_wy = 0.0f;
     int pick_active = 0;
+    int mouse_left_down = 0;
     EditData edata;
     edata.menus = menus; edata.edit_menu = &edit_menu; edata.select_menu = &select_menu; edata.win_w = &win_w; edata.win_h = &win_h;
     edata.tool_select = &tool_select; edata.tool_node = &tool_node; edata.tool_dist = &tool_dist; edata.tool_spring = &tool_spring; edata.tool_wall = &tool_wall; edata.current_tool = &current_tool;
     edata.sim = sim; edata.selection = selection; edata.drag_enabled = NULL;
+    edata.sel_filter = &sel_filter;
     edata.node_mass = NULL; edata.node_friction = NULL; edata.node_anchored = NULL; edata.node_collide_with_walls = NULL;
+    edata.drag_strength = NULL; edata.drag_damping = NULL;
     // attach user_data for vi_edit now that edata is set
     vi_edit->callback_data = &edata;
 
@@ -646,6 +840,9 @@ int main(int argc, char *argv[]) {
 
     // pending node for pair-based tool actions (dist/spring/wall)
     Node *pending_tool_node = NULL;
+    // last click candidates for cycling with arrow keys
+    DynArray *last_candidates = NULL; // ClickCandidate*
+    int last_candidate_index = 0;
 
     // Optional: run octagon mesh generation test
     if (run_mesh_test) {
@@ -763,6 +960,8 @@ int main(int argc, char *argv[]) {
             if (event.type == SDL_MOUSEBUTTONDOWN || event.type == SDL_MOUSEBUTTONUP) {
                 int state = (event.type == SDL_MOUSEBUTTONDOWN) ? SDL_PRESSED : SDL_RELEASED;
                 int mx = event.button.x, my = event.button.y, button = event.button.button;
+                if (state == SDL_PRESSED && button == SDL_BUTTON_LEFT) mouse_left_down = 1;
+                else if (state == SDL_RELEASED && button == SDL_BUTTON_LEFT) mouse_left_down = 0;
                 int menu_handled = 0;
                 // iterate menus in reverse order (higher z-index drawn last -> receive events first)
                 for (int mi = (int)menus->size - 1; mi >= 0; --mi) {
@@ -806,67 +1005,100 @@ int main(int argc, char *argv[]) {
                         const float pick_px = 8.0f;
                         const float pick_world = pick_px / cam_scale; // convert pixel radius to world units
 
+                        // LEFT click: build candidate list at pick point and choose first
                         if (event.type == SDL_MOUSEBUTTONDOWN && button == SDL_BUTTON_LEFT) {
-                            // find nearest node within pick radius
-                            Node *found = NULL;
-                            size_t n_nodes = dynarray_size(sim->nodes);
-                            for (size_t ii = 0; ii < n_nodes; ++ii) {
-                                Node *nn = (Node*)dynarray_get(sim->nodes, ii);
-                                if (!nn) continue;
-                                float dx = wx - nn->pos[0]; float dy = wy - nn->pos[1];
-                                float d2 = dx*dx + dy*dy;
-                                float r = nn->radius + pick_world;
-                                if (d2 <= r*r) { found = nn; break; }
+                            if (last_candidates) { dynarray_free(last_candidates, free); last_candidates = NULL; }
+                            last_candidates = dynarray_create(8);
+                            int allow_nodes = 0, allow_constraints = 0, allow_walls = 0;
+                            size_t sel_sz = dynarray_size(selection);
+                            if (sel_sz == 0) {
+                                allow_nodes = allow_constraints = allow_walls = 1;
+                            } else {
+                                if (sel_filter == SEL_NODE) allow_nodes = 1;
+                                else if (sel_filter == SEL_CONSTRAINT) allow_constraints = 1;
+                                else if (sel_filter == SEL_WALL) allow_walls = 1;
+                                else { allow_nodes = allow_constraints = allow_walls = 1; }
                             }
-                            if (found) {
-                                // toggle selection of this node; enforces node-only selection
-                                sel_filter = SEL_NODE;
-                                // check if already selected
-                                int already = 0;
-                                for (size_t si = 0; si < dynarray_size(selection); ++si) {
-                                    if ((Node*)dynarray_get(selection, si) == found) { already = 1;
-                                        for (size_t sj = si; sj + 1 < dynarray_size(selection); ++sj) selection->items[sj] = selection->items[sj+1];
-                                        selection->size -= 1;
-                                        break;
+
+                            if (allow_nodes) {
+                                for (size_t ii = 0; ii < dynarray_size(sim->nodes); ++ii) {
+                                    Node *nn = (Node*)dynarray_get(sim->nodes, ii);
+                                    if (!nn) continue;
+                                    float dx = wx - nn->pos[0]; float dy = wy - nn->pos[1];
+                                    float d2 = dx*dx + dy*dy;
+                                    float r = nn->radius + pick_world;
+                                    if (d2 <= r*r) {
+                                        ClickCandidate *cc = malloc(sizeof(ClickCandidate)); cc->type = SEL_NODE; cc->obj = nn; dynarray_append(last_candidates, cc);
                                     }
                                 }
-                                if (!already) dynarray_append(selection, found);
-                                // start dragging immediately if drag mode is enabled and the found node is selected
-                                if (edata.drag_enabled && edata.drag_enabled[0]) {
-                                    // Start dragging regardless of whether the node was already
-                                    // selected; store the current mouse position in world
-                                    // coordinates so subsequent motion uses consistent units.
-                                    selection_dragging = 1;
-                                    sel_last_wx = wx; sel_last_wy = wy;
+                            }
+                            if (allow_constraints && sim->constraints) {
+                                for (size_t ii = 0; ii < dynarray_size(sim->constraints); ++ii) {
+                                    Constraint *c = (Constraint*)dynarray_get(sim->constraints, ii);
+                                    if (!c) continue;
+                                    if (c->type == CT_DIST || c->type == CT_SPRING) {
+                                        if (!c->node || !c->other) continue;
+                                        float d2 = point_segment_distance2(wx, wy, c->node->pos[0], c->node->pos[1], c->other->pos[0], c->other->pos[1]);
+                                        if (d2 <= pick_world * pick_world) {
+                                            ClickCandidate *cc = malloc(sizeof(ClickCandidate)); cc->type = SEL_CONSTRAINT; cc->obj = c; dynarray_append(last_candidates, cc);
+                                        }
+                                    }
                                 }
                             }
-                        } else if (event.type == SDL_MOUSEBUTTONDOWN && button == SDL_BUTTON_RIGHT) {
-                            // start rectangle selection
+                            if (allow_walls && sim->walls) {
+                                for (size_t ii = 0; ii < dynarray_size(sim->walls); ++ii) {
+                                    WallSegment *w = (WallSegment*)dynarray_get(sim->walls, ii);
+                                    if (!w || !w->A || !w->B) continue;
+                                    float d2 = point_segment_distance2(wx, wy, w->A->pos[0], w->A->pos[1], w->B->pos[0], w->B->pos[1]);
+                                    if (d2 <= pick_world * pick_world) {
+                                        ClickCandidate *cc = malloc(sizeof(ClickCandidate)); cc->type = SEL_WALL; cc->obj = w; dynarray_append(last_candidates, cc);
+                                    }
+                                }
+                            }
+
+                            if (dynarray_size(last_candidates) == 0) {
+                                // nothing under cursor; clear selection
+                                selection->size = 0;
+                            } else {
+                                // pick first candidate and set selection/filter
+                                last_candidate_index = 0;
+                                ClickCandidate *cc = (ClickCandidate*)dynarray_get(last_candidates, 0);
+                                selection->size = 0;
+                                if (cc->type == SEL_NODE) { sel_filter = SEL_NODE; dynarray_append(selection, cc->obj); }
+                                else if (cc->type == SEL_CONSTRAINT) { sel_filter = SEL_CONSTRAINT; dynarray_append(selection, cc->obj); }
+                                else if (cc->type == SEL_WALL) { sel_filter = SEL_WALL; dynarray_append(selection, cc->obj); }
+                                // start dragging if enabled and a node was selected
+                                if (sel_filter == SEL_NODE && edata.drag_enabled && edata.drag_enabled[0]) { selection_dragging = 1; sel_last_wx = wx; sel_last_wy = wy; }
+                                // refresh selection menu rows for this type
+                                destroy_select_menu_if_present(&edata);
+                                create_select_menu_if_needed(&edata);
+                            }
+                        }
+
+                        // RIGHT mouse: rectangle select start/finish handled below (button up/down)
+                        if (event.type == SDL_MOUSEBUTTONDOWN && button == SDL_BUTTON_RIGHT) {
                             rect_select_active = 1; rect_x0 = mx; rect_y0 = my; rect_x1 = mx; rect_y1 = my;
-                            // also mark pick at start of rect (use same screen->world formula used above)
                             pick_wx = ((float)mx + cam_x) / cam_scale;
                             pick_wy = ((float)(win_h - my) + cam_y) / cam_scale;
                             pick_active = 1;
                         } else if (event.type == SDL_MOUSEBUTTONUP && button == SDL_BUTTON_LEFT) {
                             // stop any in-progress selection dragging
                             selection_dragging = 0;
-                    // keep pick visible on release
-                    pick_active = 1;
+                            pick_active = 1;
+                            mouse_left_down = 0;
                         } else if (event.type == SDL_MOUSEBUTTONUP && button == SDL_BUTTON_RIGHT) {
                             if (rect_select_active) {
                                 rect_select_active = 0;
-                                // compute world-space rectangle
                                 int rx0 = rect_x0 < rect_x1 ? rect_x0 : rect_x1;
                                 int ry0 = rect_y0 < rect_y1 ? rect_y0 : rect_y1;
                                 int rx1 = rect_x0 > rect_x1 ? rect_x0 : rect_x1;
                                 int ry1 = rect_y0 > rect_y1 ? rect_y0 : rect_y1;
-                                float wx0 = ((float)rx0 + cam_x) / cam_scale ;
+                                float wx0 = ((float)rx0 + cam_x) / cam_scale;
                                 float wy1 = ((float)(win_h - ry0) + cam_y) / cam_scale;
                                 float wx1 = ((float)rx1 + cam_x) / cam_scale;
                                 float wy0 = ((float)(win_h - ry1) + cam_y) / cam_scale;
                                 // choose filter by finding first object inside rect: nodes -> constraints -> walls
                                 int found_type = SEL_NONE;
-                                // nodes
                                 size_t n_nodes = dynarray_size(sim->nodes);
                                 for (size_t ii = 0; ii < n_nodes; ++ii) {
                                     Node *nn = (Node*)dynarray_get(sim->nodes, ii);
@@ -875,9 +1107,7 @@ int main(int argc, char *argv[]) {
                                 }
                                 if (found_type == SEL_NONE) found_type = SEL_NODE; // default
                                 sel_filter = found_type;
-                                // now select all of that type inside rect (for now only nodes)
                                 if (sel_filter == SEL_NODE) {
-                                    // clear existing selection
                                     selection->size = 0;
                                     for (size_t ii = 0; ii < dynarray_size(sim->nodes); ++ii) {
                                         Node *nn = (Node*)dynarray_get(sim->nodes, ii);
@@ -885,10 +1115,11 @@ int main(int argc, char *argv[]) {
                                         if (nn->pos[0] >= wx0 && nn->pos[0] <= wx1 && nn->pos[1] >= wy0 && nn->pos[1] <= wy1) dynarray_append(selection, nn);
                                     }
                                 }
-                                // finished rectangle selection; no dragging
                                 selection_dragging = 0;
-                                // keep pick visible at release
                                 pick_active = 1;
+                                // refresh selection menu
+                                destroy_select_menu_if_present(&edata);
+                                create_select_menu_if_needed(&edata);
                             }
                         }
                     }
@@ -926,7 +1157,7 @@ int main(int argc, char *argv[]) {
                                         Constraint *c = springconstraint_create(pending_tool_node, found, 10.0f, rest);
                                         if (c) simulator_add_constraint(sim, c);
                                     } else if (current_tool == TOOL_ADD_WALL) {
-                                        WallSegment *w = wallsegment_create(pending_tool_node, found, 1.0f, 0.0f);
+                                        WallSegment *w = wallsegment_create(pending_tool_node, found, 1.0f, 10.0f);
                                         if (w) simulator_add_wall(sim, w);
                                     }
                                     // clear pending after creation
@@ -956,23 +1187,37 @@ int main(int argc, char *argv[]) {
                     pick_wy = ((float)(win_h - my) + cam_y) / cam_scale;
                     pick_active = 1;
                 }
-                // handle dragging of selected nodes. Compute current mouse world
-                // coordinates and apply the world-space delta relative to the
-                // last stored world coords. This is robust if cam_scale or
-                // camera pan change during the drag.
-                if (!menu_handled && selection_dragging && edata.drag_enabled && edata.drag_enabled[0]) {
-                    // convert current pixel to world using same formula as picking
-                    float cur_wx = ((float)mx + cam_x) / cam_scale;
-                    float cur_wy = ((float)(win_h - my) + cam_y) / cam_scale;
-                    float dx = cur_wx - sel_last_wx;
-                    float dy = cur_wy - sel_last_wy;
-                    if (dx != 0.0f || dy != 0.0f) {
+                // handle dragging of selected nodes: positional drag handled here during mouse motion.
+                // Force-drag (when enabled) is applied continuously in the per-frame update below.
+                if (!menu_handled && selection_dragging) {
+                    if (!(edata.drag_enabled && edata.drag_enabled[0])) {
+                        float cur_wx = ((float)mx + cam_x) / cam_scale;
+                        float cur_wy = ((float)(win_h - my) + cam_y) / cam_scale;
+                        
+                        // PID coefficients - tune these to control drag behavior
+                        float kp = 2.0f;  // proportional gain (position error)
+                        float kd = 0.8f;  // derivative gain (velocity damping)
+                        
                         for (size_t si = 0; si < dynarray_size(selection); ++si) {
                             Node *n = (Node*)dynarray_get(selection, si);
                             if (!n) continue;
-                            n->pos[0] += dx; n->pos[1] += dy;
+                            
+                            // Calculate position error (distance to target)
+                            float error_x = cur_wx - n->pos[0];
+                            float error_y = cur_wy - n->pos[1];
+                            
+                            // Calculate velocity error (how fast we're moving toward target)
+                            float vel_error_x = error_x - n->vel[0];
+                            float vel_error_y = error_y - n->vel[1];
+                            
+                            // PID force: P term pulls toward target, D term damps velocity
+                            float force_x = kp * error_x + kd * vel_error_x;
+                            float force_y = kp * error_y + kd * vel_error_y;
+                            
+                            // Apply force (assuming your physics integrator uses forces)
+                            n->vel[0] += force_x * sim->dt;
+                            n->vel[1] += force_y * sim->dt;
                         }
-                        sel_last_wx = cur_wx; sel_last_wy = cur_wy;
                     }
                 }
             }
@@ -980,6 +1225,25 @@ int main(int argc, char *argv[]) {
             // Camera controls: space + drag to pan; mouse wheel to zoom
             if (event.type == SDL_KEYDOWN) {
                 if (event.key.keysym.sym == SDLK_SPACE) space_down = 1;
+                // Selection candidate cycling using left/right arrows
+                else if ((event.key.keysym.sym == SDLK_LEFT || event.key.keysym.sym == SDLK_RIGHT) && current_tool == TOOL_SELECT && last_candidates && dynarray_size(last_candidates) > 0) {
+                    int dir = (event.key.keysym.sym == SDLK_RIGHT) ? 1 : -1;
+                    int count = (int)dynarray_size(last_candidates);
+                    int ni = (last_candidate_index + dir) % count;
+                    if (ni < 0) ni += count;
+                    last_candidate_index = ni;
+                    // select the new candidate
+                    ClickCandidate *cc = (ClickCandidate*)dynarray_get(last_candidates, (size_t)last_candidate_index);
+                    if (cc) {
+                        selection->size = 0;
+                        if (cc->type == SEL_NODE) { sel_filter = SEL_NODE; dynarray_append(selection, cc->obj); }
+                        else if (cc->type == SEL_CONSTRAINT) { sel_filter = SEL_CONSTRAINT; dynarray_append(selection, cc->obj); }
+                        else if (cc->type == SEL_WALL) { sel_filter = SEL_WALL; dynarray_append(selection, cc->obj); }
+                        // refresh selection menu rows
+                        destroy_select_menu_if_present(&edata);
+                        create_select_menu_if_needed(&edata);
+                    }
+                }
             } else if (event.type == SDL_KEYUP) {
                 if (event.key.keysym.sym == SDLK_SPACE) space_down = 0;
             } else if (event.type == SDL_MOUSEWHEEL) {
@@ -1027,7 +1291,10 @@ int main(int argc, char *argv[]) {
         glPushMatrix();
         glLoadIdentity();
 
-        if (!paused) simulator_step(sim);
+        if (!paused) {
+            
+            simulator_step(sim);
+        }
         // Draw simulator with a Y-flip so world +Y (up) maps to screen Y downwards
         glPushMatrix();
         glTranslatef(0.0f, (float)win_h, 0.0f);
@@ -1168,5 +1435,137 @@ static void sim_on_step_change(VariableInteraction *vi, void *user_data) {
     Simulator *s = (Simulator*)user_data;
     if (!s) return;
     double v = *(double*)vi->variable;
-    if (v > 0.0) s->dt = (float)v;
+    // Variable represents steps-per-second (SPS). Convert to timestep dt = 1.0 / SPS
+    if (v > 0.0) s->dt = 1.0f / (float)v;
+}
+
+// Delete selected nodes and all incident constraints/walls
+static void sel_cb_delete_nodes(VariableInteraction *vi, void *user_data) {
+    (void)vi;
+    EditData *ed = (EditData*)user_data;
+    if (!ed || !ed->selection || !ed->sim) return;
+    Simulator *sim = ed->sim;
+    size_t sel_n = dynarray_size(ed->selection);
+    if (sel_n == 0) return;
+    // collect nodes to delete
+    Node **to_del = (Node**)malloc(sizeof(Node*) * sel_n);
+    size_t td = 0;
+    for (size_t i = 0; i < sel_n; ++i) {
+        Node *n = (Node*)dynarray_get(ed->selection, i);
+        if (n) to_del[td++] = n;
+    }
+
+    // For each node, remove incident constraints and walls
+    for (size_t d = 0; d < td; ++d) {
+        Node *n = to_del[d];
+        if (!n) continue;
+        // remove constraints referencing this node
+        DynArray *cons = sim->constraints;
+        for (ssize_t ci = (ssize_t)dynarray_size(cons) - 1; ci >= 0; --ci) {
+            Constraint *c = (Constraint*)dynarray_get(cons, (size_t)ci);
+            if (!c) continue;
+            if (c->node == n || c->other == n) {
+                // remove from other endpoint's node->constraints
+                Node *other = (c->node == n) ? c->other : c->node;
+                if (other && other->constraints) {
+                    DynArray *nc = other->constraints;
+                    for (size_t j = 0; j < nc->size; ++j) {
+                        if ((Constraint*)dynarray_get(nc, j) == c) {
+                            for (size_t k = j; k + 1 < nc->size; ++k) nc->items[k] = nc->items[k+1];
+                            nc->size -= 1; break;
+                        }
+                    }
+                }
+                // remove from simulator constraints array
+                for (size_t j = (size_t)ci; j + 1 < cons->size; ++j) cons->items[j] = cons->items[j+1];
+                cons->size -= 1;
+                free(c);
+            }
+        }
+        // remove walls referencing this node
+        DynArray *ws = sim->walls;
+        for (ssize_t wi = (ssize_t)dynarray_size(ws) - 1; wi >= 0; --wi) {
+            WallSegment *w = (WallSegment*)dynarray_get(ws, (size_t)wi);
+            if (!w) continue;
+            if (w->A == n || w->B == n) {
+                wallsegment_free(w);
+                for (size_t j = (size_t)wi; j + 1 < ws->size; ++j) ws->items[j] = ws->items[j+1];
+                ws->size -= 1;
+            }
+        }
+        // remove node from sim->nodes and free
+        DynArray *na = sim->nodes;
+        for (size_t ni = 0; ni < na->size; ++ni) {
+            if ((Node*)dynarray_get(na, ni) == n) {
+                node_free(n);
+                for (size_t j = ni; j + 1 < na->size; ++j) na->items[j] = na->items[j+1];
+                na->size -= 1;
+                break;
+            }
+        }
+    }
+
+    // reindex remaining nodes
+    for (size_t i = 0; i < dynarray_size(sim->nodes); ++i) {
+        Node *n = (Node*)dynarray_get(sim->nodes, i);
+        if (n) n->idx = (int)i;
+    }
+
+    free(to_del);
+    // clear selection and refresh menu
+    ed->selection->size = 0;
+    destroy_select_menu_if_present(ed);
+    create_select_menu_if_needed(ed);
+}
+
+static void sel_cb_set_node_friction(VariableInteraction *vi, void *user_data) {
+    EditData *ed = (EditData*)user_data;
+    if (!ed || !ed->selection) return;
+    double v = *(double*)vi->variable;
+    for (size_t i = 0; i < dynarray_size(ed->selection); ++i) {
+        Node *n = (Node*)dynarray_get(ed->selection, i);
+        if (!n) continue;
+        n->friction = (float)v;
+    }
+}
+
+static void sel_cb_set_constraint_distance(VariableInteraction *vi, void *user_data) {
+    EditData *ed = (EditData*)user_data;
+    if (!ed || !ed->selection) return;
+    double v = *(double*)vi->variable;
+    for (size_t i = 0; i < dynarray_size(ed->selection); ++i) {
+        Constraint *c = (Constraint*)dynarray_get(ed->selection, i);
+        if (!c) continue;
+        c->rest_length = (float)v;
+    }
+}
+
+static void sel_cb_set_spring_prop(VariableInteraction *vi, void *user_data) {
+    EditData *ed = (EditData*)user_data;
+    if (!ed || !ed->selection) return;
+    const char *name = vi->name;
+    double v = *(double*)vi->variable;
+    for (size_t i = 0; i < dynarray_size(ed->selection); ++i) {
+        Constraint *c = (Constraint*)dynarray_get(ed->selection, i);
+        if (!c) continue;
+        if (c->type != CT_SPRING) continue;
+        if (strcmp(name, "Stiffness") == 0) {
+            c->stiffness = (float)v;
+        } else if (strcmp(name, "Rest Length") == 0) {
+            c->rest_length = (float)v;
+        }
+    }
+}
+
+static void sel_cb_set_wall_prop(VariableInteraction *vi, void *user_data) {
+    EditData *ed = (EditData*)user_data;
+    if (!ed || !ed->selection) return;
+    const char *name = vi->name;
+    double v = *(double*)vi->variable;
+    for (size_t i = 0; i < dynarray_size(ed->selection); ++i) {
+        WallSegment *w = (WallSegment*)dynarray_get(ed->selection, i);
+        if (!w) continue;
+        if (strcmp(name, "Friction") == 0) w->friction = (float)v;
+        else if (strcmp(name, "Restitution") == 0) w->restitution = (float)v;
+    }
 }
