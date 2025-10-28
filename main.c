@@ -44,6 +44,11 @@ typedef struct {
     int *drag_enabled; // pointer to drag enable flag (allocated by menu)
     double *drag_strength; // pointer to configurable drag force gain
     double *drag_damping;  // pointer to configurable drag damping (B)
+    // SPRING/WALL tool preferences (persistent)
+    double *spring_stiffness;
+    int *wall_add_dist;
+    double *wall_friction;
+    double *wall_restitution;
 } EditData;
 
 // helper: remove and free a menu from the menus list if present
@@ -174,17 +179,24 @@ static void create_select_menu_if_needed(EditData *ed) {
         menurow_add_interaction(r_fric, v_fric);
         menu_add_row(m, r_fric);
 
-    // Row: Mass scale (relative slider)
-    MenuRow *r_mass = menurow_create();
-    double *mass_scale = malloc(sizeof(double)); *mass_scale = 1.0;
-    MassScaleCB *mscb = malloc(sizeof(MassScaleCB)); mscb->ed = ed; mscb->last = 1.0;
-    VariableInteraction *v_mass = variableinteraction_create(mass_scale, "Scale Mass", 0.1, 10.0, VAR_SLIDER, sel_cb_scale_mass, mscb);
-    menurow_add_interaction(r_mass, v_mass);
-    menu_add_row(m, r_mass);
+        // Row: Mass scale (relative slider)
+        MenuRow *r_mass = menurow_create();
+        double *mass_scale = malloc(sizeof(double)); *mass_scale = 1.0;
+        MassScaleCB *mscb = malloc(sizeof(MassScaleCB)); mscb->ed = ed; mscb->last = 1.0;
+        VariableInteraction *v_mass = variableinteraction_create(mass_scale, "Scale Mass", 0.1, 10.0, VAR_SLIDER, sel_cb_scale_mass, mscb);
+        menurow_add_interaction(r_mass, v_mass);
+        menu_add_row(m, r_mass);
 
-    // Row: Drag toggle
+        // Row: Drag toggle
         MenuRow *r_drag = menurow_create();
-        int *drag_enable = malloc(sizeof(int)); *drag_enable = 0;
+        int *drag_enable = NULL;
+        // Reuse existing toggle state if present in EditData so recreating the
+        // selection menu doesn't reset the user's choice.
+        if (ed && ed->drag_enabled) {
+            drag_enable = ed->drag_enabled;
+        } else {
+            drag_enable = malloc(sizeof(int)); *drag_enable = 0;
+        }
         VariableInteraction *v_drag = variableinteraction_create(drag_enable, "Drag", 0, 1, VAR_BOOL, sel_cb_drag_toggle, ed);
         menurow_add_interaction(r_drag, v_drag);
         menu_add_row(m, r_drag);
@@ -305,15 +317,41 @@ static void update_edit_row2_for_tool(EditData *ed) {
         menurow_add_interaction(nr, vi_collide);
         menu_add_row(m, nr);
     } else {
-        double dval = 0.0;
-        const char *label = "(no tool)";
-        if (*(ed->current_tool) == TOOL_SELECT) label = "Select Mode";
-        else if (*(ed->current_tool) == TOOL_ADD_DIST) label = "Dist Options";
-        else if (*(ed->current_tool) == TOOL_ADD_SPRING) label = "Spring Options";
-        else if (*(ed->current_tool) == TOOL_ADD_WALL) label = "Wall Options";
-        VariableInteraction *vi = variableinteraction_create(&dval, label, 0.0, 1.0, VAR_SLIDER, NULL, NULL);
-        menurow_add_interaction(nr, vi);
-        menu_add_row(m, nr);
+        if (*(ed->current_tool) == TOOL_SELECT) {
+            double dval = 0.0; VariableInteraction *vi = variableinteraction_create(&dval, "Select Mode", 0.0, 1.0, VAR_SLIDER, NULL, NULL);
+            menurow_add_interaction(nr, vi);
+            menu_add_row(m, nr);
+        } else if (*(ed->current_tool) == TOOL_ADD_DIST) {
+            double dval = 0.0; VariableInteraction *vi = variableinteraction_create(&dval, "Dist Options", 0.0, 1.0, VAR_SLIDER, NULL, NULL);
+            menurow_add_interaction(nr, vi);
+            menu_add_row(m, nr);
+        } else if (*(ed->current_tool) == TOOL_ADD_SPRING) {
+            // Spring options: preset stiffness
+            if (!ed->spring_stiffness) { ed->spring_stiffness = malloc(sizeof(double)); *ed->spring_stiffness = 10.0; }
+            VariableInteraction *vi_st = variableinteraction_create(ed->spring_stiffness, "Stiffness", 0.0, 800.0, VAR_SLIDER, NULL, NULL);
+            menurow_add_interaction(nr, vi_st);
+            menu_add_row(m, nr);
+        } else if (*(ed->current_tool) == TOOL_ADD_WALL) {
+            // Wall options: toggle to also add a distance constraint, plus friction/restitution presets
+            if (!ed->wall_add_dist) { ed->wall_add_dist = malloc(sizeof(int)); *ed->wall_add_dist = 0; }
+            if (!ed->wall_friction) { ed->wall_friction = malloc(sizeof(double)); *ed->wall_friction = 1.0; }
+            if (!ed->wall_restitution) { ed->wall_restitution = malloc(sizeof(double)); *ed->wall_restitution = 0.0; }
+            VariableInteraction *vi_dist_toggle = variableinteraction_create(ed->wall_add_dist, "+Dist", 0, 1, VAR_BOOL, NULL, NULL);
+            menurow_add_interaction(nr, vi_dist_toggle);
+            menu_add_row(m, nr);
+            // friction/rest sliders on a new row
+            MenuRow *nr2 = menurow_create();
+            VariableInteraction *vi_wf = variableinteraction_create(ed->wall_friction, "Friction", 0.0, 1.0, VAR_SLIDER, NULL, NULL);
+            VariableInteraction *vi_wr = variableinteraction_create(ed->wall_restitution, "Restitution", 0.0, 1.0, VAR_SLIDER, NULL, NULL);
+            menurow_add_interaction(nr2, vi_wf);
+            menurow_add_interaction(nr2, vi_wr);
+            menu_add_row(m, nr2);
+        } else {
+            double dval = 0.0;
+            VariableInteraction *vi = variableinteraction_create(&dval, "(no tool)", 0.0, 1.0, VAR_SLIDER, NULL, NULL);
+            menurow_add_interaction(nr, vi);
+            menu_add_row(m, nr);
+        }
     }
 }
 
@@ -781,6 +819,9 @@ int main(int argc, char *argv[]) {
          sim->dt via callback. */
      double step_size = sim->dt;
      int paused = 0;
+    // Grid rendering controls (toggle + cell size slider)
+    int show_grid = 1;
+    double grid_cell_size = 10.0; /* default matches Simulator.c cell size; slider range below */
 
     Menu *ctrl = menu_create(10, 10, 220, 110, 100, "Controls", (Color){255,255,255,255}, (Color){40,40,60,255});
     // // Row: Drag toggle
@@ -800,6 +841,16 @@ int main(int argc, char *argv[]) {
     VariableInteraction *vi_sps = variableinteraction_create(&sps, "Steps/s", 15.0, 500.0, VAR_SLIDER, sim_on_step_change, sim);
     menurow_add_interaction(r_sps, vi_sps);
     menu_add_row(ctrl, r_sps);
+    // Row: Grid toggle
+    MenuRow *r_grid = menurow_create();
+    VariableInteraction *vi_grid = variableinteraction_create(&show_grid, "Show Grid", 0, 1, VAR_BOOL, NULL, NULL);
+    menurow_add_interaction(r_grid, vi_grid);
+    menu_add_row(ctrl, r_grid);
+    // Row: Cell size slider (0.5 .. 75)
+    MenuRow *r_cell = menurow_create();
+    VariableInteraction *vi_cell = variableinteraction_create(&grid_cell_size, "Cell Size", 0.5, 75.0, VAR_SLIDER, NULL, NULL);
+    menurow_add_interaction(r_cell, vi_cell);
+    menu_add_row(ctrl, r_cell);
     // Edit toggle will open/close the edit palette menu
     int edit_open = 0;
     VariableInteraction *vi_edit = variableinteraction_create(&edit_open, "Edit", 0, 1, VAR_BOOL, on_edit_toggle, NULL);
@@ -826,13 +877,23 @@ int main(int argc, char *argv[]) {
     float pick_wx = 0.0f, pick_wy = 0.0f;
     int pick_active = 0;
     int mouse_left_down = 0;
+    int mouse_left_down_on_ui = 0; // true if left-button down started on a menu/UI control
     EditData edata;
     edata.menus = menus; edata.edit_menu = &edit_menu; edata.select_menu = &select_menu; edata.win_w = &win_w; edata.win_h = &win_h;
     edata.tool_select = &tool_select; edata.tool_node = &tool_node; edata.tool_dist = &tool_dist; edata.tool_spring = &tool_spring; edata.tool_wall = &tool_wall; edata.current_tool = &current_tool;
     edata.sim = sim; edata.selection = selection; edata.drag_enabled = NULL;
     edata.sel_filter = &sel_filter;
     edata.node_mass = NULL; edata.node_friction = NULL; edata.node_anchored = NULL; edata.node_collide_with_walls = NULL;
-    edata.drag_strength = NULL; edata.drag_damping = NULL;
+    // allocate persistent storage for drag controls so menu recreation does not
+    // reset or point to freed memory. These will be used by the selection menu.
+    edata.drag_enabled = malloc(sizeof(int)); *edata.drag_enabled = 0;
+    edata.drag_strength = malloc(sizeof(double)); *edata.drag_strength = 200.0;
+    edata.drag_damping = malloc(sizeof(double)); *edata.drag_damping = 8.0;
+    // allocate persistent storage for spring/wall tool preferences
+    edata.spring_stiffness = malloc(sizeof(double)); *edata.spring_stiffness = 10.0;
+    edata.wall_add_dist = malloc(sizeof(int)); *edata.wall_add_dist = 0;
+    edata.wall_friction = malloc(sizeof(double)); *edata.wall_friction = 1.0;
+    edata.wall_restitution = malloc(sizeof(double)); *edata.wall_restitution = 0.0;
     // attach user_data for vi_edit now that edata is set
     vi_edit->callback_data = &edata;
 
@@ -940,6 +1001,100 @@ int main(int argc, char *argv[]) {
     // Sleeve inner walls along box top/bottom
     WallSegment *w1 = wallsegment_create(nodes_arr[0], nodes_arr[1], 1.0f, 0.0f); simulator_add_wall(sim, w1);
     WallSegment *w2 = wallsegment_create(nodes_arr[2], nodes_arr[3], 1.0f, 0.0f); simulator_add_wall(sim, w2);
+    // Create a dense grid of free nodes below the bottom panel and attach
+    // the two bottom anchors to the grid with springs. Grid nodes are
+    // small-radius, and only horizontal/vertical neighbor connections are
+    // created (distance constraints + walls). No diagonals.
+    {
+        const int GRID_COLS = 12;   // pretty dense horizontally
+        const int GRID_ROWS = 6;    // several rows
+        Node *grid[GRID_ROWS][GRID_COLS];
+        const float spacing = 7.0f; // spacing between grid nodes (world units)
+        // center the grid between the two bottom anchors (nodes_arr[6], nodes_arr[7])
+        float anchor_x0 = nodes_arr[6]->pos[0];
+        float anchor_x1 = nodes_arr[7]->pos[0];
+        float grid_center_x = 0.5f * (anchor_x0 + anchor_x1);
+        float grid_start_x = grid_center_x - ((GRID_COLS - 1) * spacing) * 0.5f;
+        // place the grid below the bottom anchor line
+        float grid_start_y = nodes_arr[6]->pos[1] - 28.0f;
+
+        // create nodes
+        for (int r = 0; r < GRID_ROWS; ++r) {
+            for (int c = 0; c < GRID_COLS; ++c) {
+                float x = grid_start_x + c * spacing;
+                float y = grid_start_y - r * spacing;
+                Node *n = node_create(-1, 1.0f, x, y);
+                if (!n) continue;
+                // reduce visual radius so grid looks dense and tidy
+                n->radius = 1.0f;
+                // some default friction for interactions with walls
+                n->friction = 0.5f;
+                simulator_add_node(sim, n);
+                grid[r][c] = n;
+            }
+        }
+
+        // connect neighbors with horizontal and vertical distance constraints + walls
+        for (int r = 0; r < GRID_ROWS; ++r) {
+            for (int c = 0; c < GRID_COLS; ++c) {
+                Node *n = grid[r][c];
+                if (!n) continue;
+                // horizontal neighbor
+                if (c + 1 < GRID_COLS) {
+                    Node *hn = grid[r][c + 1];
+                    if (hn) {
+                        // distance constraint (rest = current distance)
+                        float dx = n->pos[0] - hn->pos[0];
+                        float dy = n->pos[1] - hn->pos[1];
+                        float rest = sqrtf(dx*dx + dy*dy);
+                        Constraint *dc = distconstraint_create(n, hn, rest);
+                        if (dc) simulator_add_constraint(sim, dc);
+                        // also add a wall segment between neighbors so collisions behave
+                        WallSegment *ws = wallsegment_create(n, hn, 1.0f, 0.0f);
+                        if (ws) simulator_add_wall(sim, ws);
+                    }
+                }
+                // vertical neighbor
+                if (r + 1 < GRID_ROWS) {
+                    Node *vn = grid[r + 1][c];
+                    if (vn) {
+                        float dx = n->pos[0] - vn->pos[0];
+                        float dy = n->pos[1] - vn->pos[1];
+                        float rest = sqrtf(dx*dx + dy*dy);
+                        Constraint *dc = distconstraint_create(n, vn, rest);
+                        if (dc) simulator_add_constraint(sim, dc);
+                        WallSegment *ws = wallsegment_create(n, vn, 1.0f, 0.0f);
+                        if (ws) simulator_add_wall(sim, ws);
+                    }
+                }
+            }
+        }
+
+        // attach the two bottom anchors to the top row of the grid with springs
+        // (one spring from each anchor to the nearest grid edge). Use a moderate
+        // stiffness so the grid is influenced but still free.
+        float spring_stiff = 5000.0f;
+        if (GRID_COLS > 0 && GRID_ROWS > 0) {
+            Node *left_top = grid[0][0];
+            Node *right_top = grid[0][GRID_COLS - 1];
+            if (left_top) {
+                float dx = left_top->pos[0] - nodes_arr[6]->pos[0];
+                float dy = left_top->pos[1] - nodes_arr[6]->pos[1];
+                float rest = sqrtf(dx*dx + dy*dy);
+                Constraint *s = springconstraint_create(nodes_arr[6], left_top, spring_stiff, rest);
+                if (s) simulator_add_constraint(sim, s);
+            }
+            if (right_top) {
+                float dx = right_top->pos[0] - nodes_arr[7]->pos[0];
+                float dy = right_top->pos[1] - nodes_arr[7]->pos[1];
+                float rest = sqrtf(dx*dx + dy*dy);
+                Constraint *s = springconstraint_create(nodes_arr[7], right_top, spring_stiff, rest);
+                if (s) simulator_add_constraint(sim, s);
+            }
+        }
+    }
+    printf("Generated initial scenario with %zu nodes, %zu constraints, %zu walls\n",
+        dynarray_size(sim->nodes), dynarray_size(sim->constraints), dynarray_size(sim->walls));
 
     printf("Entering main loop. Close window to exit.\n");
     while (running) {
@@ -968,6 +1123,17 @@ int main(int argc, char *argv[]) {
                     Menu *m = (Menu*)menus->items[mi];
                     if (!m) continue;
                     if (menu_handle_mouse_button(m, button, state, mx, my)) { menu_handled = 1; break; }
+                }
+
+                // Track whether the left-button event began on the UI. If so, mark
+                // mouse_left_down_on_ui so per-frame drag forces are suppressed while
+                // the user is interacting with menus/sliders.
+                if (button == SDL_BUTTON_LEFT) {
+                    if (state == SDL_PRESSED) {
+                        mouse_left_down_on_ui = menu_handled ? 1 : 0;
+                    } else if (state == SDL_RELEASED) {
+                        mouse_left_down_on_ui = 0;
+                    }
                 }
 
                 // If not handled by UI menus, handle current tool actions (select, add-node, etc.)
@@ -1057,8 +1223,19 @@ int main(int argc, char *argv[]) {
                             }
 
                             if (dynarray_size(last_candidates) == 0) {
-                                // nothing under cursor; clear selection
-                                selection->size = 0;
+                                // nothing under cursor; normally clear selection. However,
+                                // if Drag is enabled we keep the current selection so the
+                                // user can click anywhere to pull the previously-selected
+                                // nodes. Update pick position instead.
+                                if (!(edata.drag_enabled && edata.drag_enabled[0])) {
+                                    selection->size = 0;
+                                    // refresh selection menu
+                                    destroy_select_menu_if_present(&edata);
+                                    create_select_menu_if_needed(&edata);
+                                } else {
+                                    // keep selection; update pick so drag has a target
+                                    pick_wx = wx; pick_wy = wy; pick_active = 1;
+                                }
                             } else {
                                 // pick first candidate and set selection/filter
                                 last_candidate_index = 0;
@@ -1067,8 +1244,9 @@ int main(int argc, char *argv[]) {
                                 if (cc->type == SEL_NODE) { sel_filter = SEL_NODE; dynarray_append(selection, cc->obj); }
                                 else if (cc->type == SEL_CONSTRAINT) { sel_filter = SEL_CONSTRAINT; dynarray_append(selection, cc->obj); }
                                 else if (cc->type == SEL_WALL) { sel_filter = SEL_WALL; dynarray_append(selection, cc->obj); }
-                                // start dragging if enabled and a node was selected
-                                if (sel_filter == SEL_NODE && edata.drag_enabled && edata.drag_enabled[0]) { selection_dragging = 1; sel_last_wx = wx; sel_last_wy = wy; }
+                                // Note: dragging is controlled by the Selection menu toggle. Do not
+                                // auto-enter a special "selection_dragging" mode here — force-drag
+                                // will be applied whenever the user is clicking and the toggle is enabled.
                                 // refresh selection menu rows for this type
                                 destroy_select_menu_if_present(&edata);
                                 create_select_menu_if_needed(&edata);
@@ -1082,10 +1260,9 @@ int main(int argc, char *argv[]) {
                             pick_wy = ((float)(win_h - my) + cam_y) / cam_scale;
                             pick_active = 1;
                         } else if (event.type == SDL_MOUSEBUTTONUP && button == SDL_BUTTON_LEFT) {
-                            // stop any in-progress selection dragging
-                            selection_dragging = 0;
+                            // leave dragging toggle state unchanged; mouse_left_down is cleared
+                            // by the top-level handler above. Keep pick active for rendering.
                             pick_active = 1;
-                            mouse_left_down = 0;
                         } else if (event.type == SDL_MOUSEBUTTONUP && button == SDL_BUTTON_RIGHT) {
                             if (rect_select_active) {
                                 rect_select_active = 0;
@@ -1115,7 +1292,8 @@ int main(int argc, char *argv[]) {
                                         if (nn->pos[0] >= wx0 && nn->pos[0] <= wx1 && nn->pos[1] >= wy0 && nn->pos[1] <= wy1) dynarray_append(selection, nn);
                                     }
                                 }
-                                selection_dragging = 0;
+                                // do not clear the drag toggle here; leave it to the user to toggle
+                                // drag mode in the Selection menu
                                 pick_active = 1;
                                 // refresh selection menu
                                 destroy_select_menu_if_present(&edata);
@@ -1150,15 +1328,23 @@ int main(int argc, char *argv[]) {
                                         Constraint *c = distconstraint_create(pending_tool_node, found, -1);
                                         if (c) simulator_add_constraint(sim, c);
                                     } else if (current_tool == TOOL_ADD_SPRING) {
-                                        // default stiffness and rest length = current distance
+                                        // rest length = current distance; stiffness from edit prefs
                                         float dx = pending_tool_node->pos[0] - found->pos[0];
                                         float dy = pending_tool_node->pos[1] - found->pos[1];
                                         float rest = sqrtf(dx*dx + dy*dy);
-                                        Constraint *c = springconstraint_create(pending_tool_node, found, 10.0f, rest);
+                                        float stiff = edata.spring_stiffness ? (float)(*(edata.spring_stiffness)) : 10.0f;
+                                        Constraint *c = springconstraint_create(pending_tool_node, found, stiff, rest);
                                         if (c) simulator_add_constraint(sim, c);
                                     } else if (current_tool == TOOL_ADD_WALL) {
-                                        WallSegment *w = wallsegment_create(pending_tool_node, found, 1.0f, 10.0f);
+                                        float wf = edata.wall_friction ? (float)(*(edata.wall_friction)) : 1.0f;
+                                        float wr = edata.wall_restitution ? (float)(*(edata.wall_restitution)) : 0.0f;
+                                        WallSegment *w = wallsegment_create(pending_tool_node, found, wf, wr);
                                         if (w) simulator_add_wall(sim, w);
+                                        // if +Dist toggle is set, also add a distance constraint between the nodes
+                                        if (edata.wall_add_dist && edata.wall_add_dist[0]) {
+                                            Constraint *dc = distconstraint_create(pending_tool_node, found, -1);
+                                            if (dc) simulator_add_constraint(sim, dc);
+                                        }
                                     }
                                     // clear pending after creation
                                     pending_tool_node = NULL;
@@ -1187,39 +1373,7 @@ int main(int argc, char *argv[]) {
                     pick_wy = ((float)(win_h - my) + cam_y) / cam_scale;
                     pick_active = 1;
                 }
-                // handle dragging of selected nodes: positional drag handled here during mouse motion.
-                // Force-drag (when enabled) is applied continuously in the per-frame update below.
-                if (!menu_handled && selection_dragging) {
-                    if (!(edata.drag_enabled && edata.drag_enabled[0])) {
-                        float cur_wx = ((float)mx + cam_x) / cam_scale;
-                        float cur_wy = ((float)(win_h - my) + cam_y) / cam_scale;
-                        
-                        // PID coefficients - tune these to control drag behavior
-                        float kp = 2.0f;  // proportional gain (position error)
-                        float kd = 0.8f;  // derivative gain (velocity damping)
-                        
-                        for (size_t si = 0; si < dynarray_size(selection); ++si) {
-                            Node *n = (Node*)dynarray_get(selection, si);
-                            if (!n) continue;
-                            
-                            // Calculate position error (distance to target)
-                            float error_x = cur_wx - n->pos[0];
-                            float error_y = cur_wy - n->pos[1];
-                            
-                            // Calculate velocity error (how fast we're moving toward target)
-                            float vel_error_x = error_x - n->vel[0];
-                            float vel_error_y = error_y - n->vel[1];
-                            
-                            // PID force: P term pulls toward target, D term damps velocity
-                            float force_x = kp * error_x + kd * vel_error_x;
-                            float force_y = kp * error_y + kd * vel_error_y;
-                            
-                            // Apply force (assuming your physics integrator uses forces)
-                            n->vel[0] += force_x * sim->dt;
-                            n->vel[1] += force_y * sim->dt;
-                        }
-                    }
-                }
+                // Force-drag is applied continuously in the per-frame update (see below).
             }
 
             // Camera controls: space + drag to pan; mouse wheel to zoom
@@ -1291,8 +1445,60 @@ int main(int argc, char *argv[]) {
         glPushMatrix();
         glLoadIdentity();
 
+        // Apply force-drag: when the user is holding the left mouse button and the
+        // Selection menu's Drag toggle is enabled, apply a proportional force to
+        // each selected node toward the current pick position. This does not
+        // require the click to have started on the node and remains active until
+        // the user disables the toggle.
+    float K_p = edata.drag_strength ? (float)(*(edata.drag_strength)) : 3.0f;  // proportional (stiffness)
+    float K_d = 12.0f;  // derivative (damping) - tune this ratio as needed
+    
+    const float MAX_FORCE = 1e3f;
+    if (mouse_left_down && !mouse_left_down_on_ui && edata.drag_enabled && edata.drag_enabled[0] && edata.drag_strength && sel_filter == SEL_NODE && dynarray_size(selection) > 0) {
+            float K = (float)(*(edata.drag_strength));
+            for (size_t si = 0; si < dynarray_size(selection); ++si) {
+                Node *n = (Node*)dynarray_get(selection, si);
+                if (!n) continue;
+                // Error vector: direction and distance to target
+                float rx = pick_wx - n->pos[0];
+                float ry = pick_wy - n->pos[1];
+                float dist2 = rx*rx + ry*ry;
+                if (dist2 < 1e-8f) continue;
+                
+                float dist = sqrtf(dist2);
+                float ux = rx / dist;
+                float uy = ry / dist;
+                
+                // Proportional term: spring-like force based on distance
+                float force_p = K_p * dist;
+                // Derivative term: damping based on velocity toward target
+                // Project velocity onto the direction toward target
+                float vel_dot_u = n->vel[0] * ux + n->vel[1] * uy;
+                float force_d = K_d * vel_dot_u;  // opposes motion toward/away from target
+                
+                // Combined force magnitude
+                float force_mag = force_p - force_d;  // subtract damping to resist motion
+                
+                // Clamp to max force
+                if (force_mag > MAX_FORCE) force_mag = MAX_FORCE;
+                if (force_mag < -MAX_FORCE) force_mag = -MAX_FORCE;
+                
+                // Apply force in target direction
+                float fx = force_mag * ux;
+                float fy = force_mag * uy;
+                
+                float mass = fmaxf(n->mass, 1e-6f);
+                float dvx = (fx) * sim->dt;
+                float dvy = (fy ) * sim->dt;
+
+                n->vel[0] *= 0.99f;
+                n->vel[1] *= 0.99f;
+
+                n->vel[0] += dvx;
+                n->vel[1] += dvy;
+            }
+        }
         if (!paused) {
-            
             simulator_step(sim);
         }
         // Draw simulator with a Y-flip so world +Y (up) maps to screen Y downwards
@@ -1302,6 +1508,76 @@ int main(int argc, char *argv[]) {
         // apply camera pan & zoom (in world coordinates)
         glTranslatef(-cam_x, -cam_y, 0.0f);
         glScalef(cam_scale, cam_scale, 1.0f);
+
+        // Draw spatial-hash grid lines (same cell size used by collision detection)
+        if (show_grid) {
+            float cell_size = (float)grid_cell_size; // user-controlled via Controls menu
+            // compute visible world bounds (consistent with screen->world used earlier)
+            float left_world = cam_x / cam_scale;
+            float right_world = ((float)win_w + cam_x) / cam_scale;
+            float bottom_world = cam_y / cam_scale;
+            float top_world = ((float)win_h + cam_y) / cam_scale;
+
+            int ix0 = (int)floorf(left_world / cell_size) - 1;
+            int ix1 = (int)floorf(right_world / cell_size) + 1;
+            int iy0 = (int)floorf(bottom_world / cell_size) - 1;
+            int iy1 = (int)floorf(top_world / cell_size) + 1;
+
+            // faint grid lines
+            glColor3f(0.85f, 0.85f, 0.9f);
+            glLineWidth(1.0f);
+            glBegin(GL_LINES);
+            for (int ix = ix0; ix <= ix1; ++ix) {
+                float x = (float)ix * cell_size;
+                glVertex2f(x, bottom_world - cell_size);
+                glVertex2f(x, top_world + cell_size);
+            }
+            for (int iy = iy0; iy <= iy1; ++iy) {
+                float y = (float)iy * cell_size;
+                glVertex2f(left_world - cell_size, y);
+                glVertex2f(right_world + cell_size, y);
+            }
+            glEnd();
+
+            // Highlight cells each wall is scanning for collisions in light magenta
+            // We approximate the same cell coverage algorithm used in the simulator by
+            // marking all grid cells whose indices intersect the wall bounding box.
+            glEnable(GL_BLEND);
+            glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+            glColor4f(1.0f, 0.0f, 1.0f, 0.18f);
+            for (size_t wi = 0; wi < dynarray_size(sim->walls); ++wi) {
+                WallSegment *w = (WallSegment*)dynarray_get(sim->walls, wi);
+                if (!w || !w->A || !w->B) continue;
+                float ax = w->A->pos[0], ay = w->A->pos[1];
+                float bx = w->B->pos[0], by = w->B->pos[1];
+                float minx = fminf(ax,bx), miny = fminf(ay,by);
+                float maxx = fmaxf(ax,bx), maxy = fmaxf(ay,by);
+                int wix0 = (int)floorf(minx / cell_size);
+                int wiy0 = (int)floorf(miny / cell_size);
+                int wix1 = (int)floorf(maxx / cell_size);
+                int wiy1 = (int)floorf(maxy / cell_size);
+                // clamp to visible region for efficiency
+                if (wix1 < ix0 || wix0 > ix1 || wiy1 < iy0 || wiy0 > iy1) continue;
+                if (wix0 < ix0) wix0 = ix0; if (wiy0 < iy0) wiy0 = iy0;
+                if (wix1 > ix1) wix1 = ix1; if (wiy1 > iy1) wiy1 = iy1;
+                for (int ix = wix0; ix <= wix1; ++ix) {
+                    for (int iy = wiy0; iy <= wiy1; ++iy) {
+                        float x0 = (float)ix * cell_size;
+                        float y0 = (float)iy * cell_size;
+                        float x1 = x0 + cell_size;
+                        float y1 = y0 + cell_size;
+                        glBegin(GL_QUADS);
+                        glVertex2f(x0, y0);
+                        glVertex2f(x1, y0);
+                        glVertex2f(x1, y1);
+                        glVertex2f(x0, y1);
+                        glEnd();
+                    }
+                }
+            }
+            glDisable(GL_BLEND);
+        }
+
         simulator_draw(sim);
         // draw selection highlights (in world coordinates)
         if (dynarray_size(selection) > 0) {
