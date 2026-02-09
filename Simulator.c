@@ -5,6 +5,7 @@
 #include <stdint.h>
 #include <math.h>
 #include <GL/gl.h>
+#include <GL/glut.h>
 
 #include <cs.h>
 
@@ -95,6 +96,150 @@ static int cg_solve_sparse(int n, cs *A, double *b, double *x, int max_iter, dou
 
     free(r); free(p); free(Ap);
     return 0;
+}
+
+// Compute total kinetic energy: sum(0.5 * m * v^2)
+static double compute_kinetic_energy(Simulator *s) {
+    if (!s) return 0.0;
+    double ke = 0.0;
+    size_t n = dynarray_size(s->nodes);
+    for (size_t i = 0; i < n; ++i) {
+        Node *node = (Node*)dynarray_get(s->nodes, i);
+        if (!node || node->sim_ignore) continue;
+        double vx = (double)node->vel[0];
+        double vy = (double)node->vel[1];
+        double v2 = vx*vx + vy*vy;
+        ke += 0.5 * (double)node->mass * v2;
+    }
+    return ke;
+}
+
+// Compute gravitational potential energy: sum(m * g * h) relative to reference height
+static double compute_gravitational_potential(Simulator *s, double ref_height) {
+    if (!s) return 0.0;
+    double gpe = 0.0;
+    double g_mag = sqrt((double)s->gravity[0] * (double)s->gravity[0] + 
+                        (double)s->gravity[1] * (double)s->gravity[1]);
+    size_t n = dynarray_size(s->nodes);
+    for (size_t i = 0; i < n; ++i) {
+        Node *node = (Node*)dynarray_get(s->nodes, i);
+        if (!node || node->sim_ignore || !node->isGravity) continue;
+        double h = (double)node->pos[1] - ref_height;
+        gpe += (double)node->mass * g_mag * h;
+    }
+    return gpe;
+}
+
+// Compute spring potential energy: sum(0.5 * k * (x - rest)^2) for spring constraints only
+static double compute_spring_potential(Simulator *s) {
+    if (!s) return 0.0;
+    double spe = 0.0;
+    size_t n = dynarray_size(s->constraints);
+    for (size_t i = 0; i < n; ++i) {
+        Constraint *c = (Constraint*)dynarray_get(s->constraints, i);
+        if (!c || c->type != CT_SPRING) continue;
+        Node *a = c->node;
+        Node *b = c->other;
+        if (!a || !b) continue;
+        double dx = (double)(a->pos[0] - b->pos[0]);
+        double dy = (double)(a->pos[1] - b->pos[1]);
+        double dist = sqrt(dx*dx + dy*dy);
+        double stretch = dist - (double)c->rest_length;
+        spe += 0.5 * (double)c->stiffness * stretch * stretch;
+    }
+    return spe;
+}
+
+// Compute reference height (minimum Y coordinate of all nodes)
+static double compute_reference_height(Simulator *s) {
+    if (!s) return 0.0;
+    size_t n = dynarray_size(s->nodes);
+    if (n == 0) return 0.0;
+    double min_y = 1e300;
+    for (size_t i = 0; i < n; ++i) {
+        Node *node = (Node*)dynarray_get(s->nodes, i);
+        if (!node || node->sim_ignore) continue;
+        if ((double)node->pos[1] < min_y) min_y = (double)node->pos[1];
+    }
+    return (min_y < 1e299) ? min_y : 0.0;
+}
+
+// Compute energy of a single node (kinetic + gravitational potential)
+static double compute_node_energy(Node *node, Simulator *s) {
+    if (!node || !s || node->sim_ignore) return 0.0;
+    double energy = 0.0;
+    
+    // Kinetic energy: 0.5 * m * v²
+    double vx = (double)node->vel[0];
+    double vy = (double)node->vel[1];
+    double v2 = vx*vx + vy*vy;
+    energy += 0.5 * (double)node->mass * v2;
+    
+    // Gravitational potential energy: m * g * (h - reference_height)
+    if (node->isGravity && s->energy_tracker.initialized) {
+        double g_mag = sqrt((double)s->gravity[0] * (double)s->gravity[0] + 
+                            (double)s->gravity[1] * (double)s->gravity[1]);
+        double h = (double)node->pos[1] - s->energy_tracker.reference_height;
+        energy += (double)node->mass * g_mag * h;
+    }
+    
+    return energy;
+}
+
+// Compute energy of a single constraint (spring potential only)
+static double compute_constraint_energy(Constraint *c) {
+    if (!c || c->type != CT_SPRING) return 0.0;
+    Node *a = c->node;
+    Node *b = c->other;
+    if (!a || !b) return 0.0;
+    double dx = (double)(a->pos[0] - b->pos[0]);
+    double dy = (double)(a->pos[1] - b->pos[1]);
+    double dist = sqrt(dx*dx + dy*dy);
+    double stretch = dist - (double)c->rest_length;
+    return 0.5 * (double)c->stiffness * stretch * stretch;
+}
+
+// Update energy tracker: compute current energies and update max/error
+static void energy_tracker_update(Simulator *s) {
+    if (!s) return;
+    EnergyTracker *et = &s->energy_tracker;
+    
+    // Initialize on first call (set reference height once and never change it)
+    if (!et->initialized) {
+        et->reference_height = compute_reference_height(s);
+        et->initialized = 1;
+    }
+    
+    // Compute current energies (using fixed reference height)
+    et->current_kinetic = compute_kinetic_energy(s);
+    et->current_gravitational = compute_gravitational_potential(s, et->reference_height);
+    et->current_spring = compute_spring_potential(s);
+    
+    double current_total = et->current_kinetic + et->current_gravitational + et->current_spring;
+    
+    // Set initial/max energy on first call
+    if (et->initial_energy == 0.0 && et->max_energy_offset == 0.0) {
+        et->initial_energy = current_total;
+        et->max_energy_offset = 0.0;
+        et->user_energy_accumulated = 0.0;
+        et->error_percentage = 0.0;
+    }
+    
+    // Compute max energy from initial + offset
+    double max_energy = et->initial_energy + et->max_energy_offset;
+    
+    // Update max energy offset if current exceeds max
+    if (current_total > max_energy) {
+        et->max_energy_offset = current_total - et->initial_energy;
+    }
+    
+    // Compute error percentage
+    double expected_energy = et->initial_energy + et->user_energy_accumulated;
+    if (fabs(et->initial_energy) > 1e-9) {
+        et->error_percentage = 100.0 * (current_total - expected_energy) / fabs(et->initial_energy);
+    } else {
+        et->error_percentage = 0.0;
+    }
 }
 
 // Build sparse A = J * diag(invm) * J^T using CSparse. Returns a dense double* (m x m)
@@ -192,6 +337,10 @@ Simulator* simulator_create(float dt) {
     s->solver_iters = 100;
     s->damping = 0.01f;
     s->velocity_blend = 0.5f; // blend factor between old velocity and position-derived velocity
+    // Initialize energy tracker
+    memset(&s->energy_tracker, 0, sizeof(EnergyTracker));
+    s->energy_tracker.reference_height = 0.0;
+    s->energy_tracker.initialized = 0;
     return s;
 }
 
@@ -222,11 +371,49 @@ void simulator_add_node(Simulator *s, Node *n) {
     if (!s || !n) return;
     n->idx = (int)dynarray_size(s->nodes);
     dynarray_append(s->nodes, n);
+    
+    // Track energy contribution of new node (if energy tracker is initialized)
+    // Only adjust initial_energy for structural changes, not user_energy_accumulated
+    if (s->energy_tracker.initialized && !n->sim_ignore) {
+        double added_energy = compute_node_energy(n, s);
+        s->energy_tracker.initial_energy += added_energy;
+    }
+}
+
+// Remove a node and track its energy
+void simulator_remove_node(Simulator *s, Node *n) {
+    if (!s || !n) return;
+    
+    // Track energy removal (if energy tracker is initialized)
+    // Only adjust initial_energy for structural changes, not user_energy_accumulated
+    if (s->energy_tracker.initialized && !n->sim_ignore) {
+        double removed_energy = compute_node_energy(n, s);
+        s->energy_tracker.initial_energy -= removed_energy;
+    }
 }
 
 void simulator_add_constraint(Simulator *s, Constraint *c) {
     if (!s || !c) return;
     dynarray_append(s->constraints, c);
+    
+    // Track energy contribution of new constraint (if energy tracker is initialized)
+    // Only adjust initial_energy for structural changes, not user_energy_accumulated
+    if (s->energy_tracker.initialized && c->type == CT_SPRING) {
+        double added_energy = compute_constraint_energy(c);
+        s->energy_tracker.initial_energy += added_energy;
+    }
+}
+
+// Remove a constraint and track its energy
+void simulator_remove_constraint(Simulator *s, Constraint *c) {
+    if (!s || !c) return;
+    
+    // Track energy removal (if energy tracker is initialized)
+    // Only adjust initial_energy for structural changes, not user_energy_accumulated
+    if (s->energy_tracker.initialized && c->type == CT_SPRING) {
+        double removed_energy = compute_constraint_energy(c);
+        s->energy_tracker.initial_energy -= removed_energy;
+    }
 }
 
 void simulator_add_wall(Simulator *s, WallSegment *w) {
@@ -643,7 +830,7 @@ void simulator_step(Simulator *s) {
             int found = 0;
             for (int p = A_sparse->p[col]; p < A_sparse->p[col+1]; ++p) {
                 int row = A_sparse->i[p];
-                if (row == col) { A_sparse->x[p] += 1e-10; found = 1; break; }
+                if (row == col) { A_sparse->x[p] += 1e-6; found = 1; break; }
             }
             (void)found; /* if diagonal not present, skip */
         }
@@ -748,7 +935,121 @@ void simulator_step(Simulator *s) {
     if (l) free(l);
     if (corr_f) free(corr_f);
 
+    // Update energy tracker after simulation step
+    energy_tracker_update(s);
 }
+
+// Helper function to render text using GLUT bitmap fonts
+static void render_text(float x, float y, const char *text, void *font) {
+    glRasterPos2f(x, y);
+    for (const char *c = text; *c != '\0'; c++) {
+        glutBitmapCharacter(font, *c);
+    }
+}
+
+// Draw energy bar on the right side of the viewport
+// This should be called in screen-space coordinates (after setting up 2D projection)
+void simulator_draw_energy_bar(Simulator *s, int viewport_width, int viewport_height) {
+    if (!s || !s->energy_tracker.initialized) return;
+    
+    EnergyTracker *et = &s->energy_tracker;
+    
+    // Bar dimensions (in screen pixels)
+    const float bar_width = 80.0f;
+    const float bar_margin = 20.0f;
+    const float bar_x = (float)viewport_width - bar_width - bar_margin;
+    const float bar_bottom = 100.0f;  // leave space at bottom
+    const float bar_top = (float)viewport_height - 150.0f;  // leave space at top for text
+    const float bar_height = bar_top - bar_bottom;
+    
+    if (bar_height <= 0.0f) return;  // viewport too small
+    
+    // Compute total current energy
+    double current_total = et->current_kinetic + et->current_gravitational + et->current_spring;
+    double potential_total = et->current_gravitational + et->current_spring;
+    
+    // Compute max energy from initial + offset
+    double max_energy = et->initial_energy + et->max_energy_offset;
+    
+    // Compute bar fill ratios (both scaled to max_energy)
+    float energy_ratio = 0.0f;
+    float potential_ratio = 0.0f;
+    
+    if (max_energy > 1e-9) {
+        energy_ratio = (float)(current_total / max_energy);
+        if (energy_ratio < 0.0f) energy_ratio = 0.0f;
+        if (energy_ratio > 1.0f) energy_ratio = 1.0f;
+        
+        potential_ratio = (float)(potential_total / max_energy);
+        if (potential_ratio < 0.0f) potential_ratio = 0.0f;
+        if (potential_ratio > 1.0f) potential_ratio = 1.0f;
+    }
+    
+    float energy_bar_height = energy_ratio * bar_height;
+    float potential_bar_height = potential_ratio * bar_height;
+    
+    // Enable blending for transparency
+    glEnable(GL_BLEND);
+    glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+    
+    // Draw red filled bar (current total energy) - fill upward from bottom in screen coords
+    glColor4f(0.9f, 0.1f, 0.1f, 0.9f);
+    glBegin(GL_QUADS);
+    glVertex2f(bar_x, bar_top);
+    glVertex2f(bar_x + bar_width, bar_top);
+    glVertex2f(bar_x + bar_width, bar_top - energy_bar_height);
+    glVertex2f(bar_x, bar_top - energy_bar_height);
+    glEnd();
+    
+    // Draw green sub-bar (potential energy portion overlaid on red)
+    glColor4f(0.1f, 0.9f, 0.1f, 0.9f);
+    glBegin(GL_QUADS);
+    glVertex2f(bar_x, bar_top);
+    glVertex2f(bar_x + bar_width, bar_top);
+    glVertex2f(bar_x + bar_width, bar_top - potential_bar_height);
+    glVertex2f(bar_x, bar_top - potential_bar_height);
+    glEnd();
+    
+    // Draw black outline around the full bar area
+    glColor3f(0.0f, 0.0f, 0.0f);
+    glLineWidth(2.0f);
+    glBegin(GL_LINE_LOOP);
+    glVertex2f(bar_x, bar_bottom);
+    glVertex2f(bar_x + bar_width, bar_bottom);
+    glVertex2f(bar_x + bar_width, bar_top);
+    glVertex2f(bar_x, bar_top);
+    glEnd();
+    glLineWidth(1.0f);
+    
+    glDisable(GL_BLEND);
+    
+    // Render text labels
+    char text_buffer[256];
+    glColor3f(0.0f, 0.0f, 0.0f);
+    void *font = GLUT_BITMAP_HELVETICA_12;
+    
+    // Title above bar
+    float text_x = bar_x;
+    float text_y = bar_top + 20.0f;
+    render_text(text_x, text_y, "Energy", font);
+    
+    // Current / Max energy values (reuse max_energy computed earlier)
+    text_y += 15.0f;
+    snprintf(text_buffer, sizeof(text_buffer), "%.1f / %.1f", current_total, max_energy);
+    render_text(text_x, text_y, text_buffer, font);
+    
+    // Error percentage
+    text_y += 15.0f;
+    snprintf(text_buffer, sizeof(text_buffer), "Error: %.2f%%", et->error_percentage);
+    render_text(text_x, text_y, text_buffer, font);
+    
+    // Legend below bar
+    text_y = bar_bottom - 15.0f;
+    render_text(text_x, text_y, "Red: Total", font);
+    text_y -= 15.0f;
+    render_text(text_x, text_y, "Green: Potential", font);
+}
+
 void simulator_draw(Simulator *s) {
     if (!s) return;
     // draw constraints

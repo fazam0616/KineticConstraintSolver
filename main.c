@@ -1,6 +1,7 @@
 // Clean, corrected main.c
 #include <SDL2/SDL.h>
 #include <SDL2/SDL_opengl.h>
+#include <GL/glut.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <math.h>
@@ -538,6 +539,8 @@ static void sel_cb_toggle_anchor(VariableInteraction *vi, void *user_data) {
                 Constraint *c = (Constraint*)dynarray_get(ed->sim->constraints, (size_t)ci);
                 if (!c) continue;
                 if (c->type == CT_ANCHOR && c->node == n) {
+                    // Track energy removal
+                    simulator_remove_constraint(ed->sim, c);
                     // free constraint and remove from array
                     free(c);
                     // shift left
@@ -640,6 +643,8 @@ static void sel_cb_delete_selection(VariableInteraction *vi, void *user_data) {
             Node *n0 = c->node;
             Node *n1 = c->other;
             int ctype = c->type;
+            // Track energy removal before freeing
+            simulator_remove_constraint(ed->sim, c);
             // remove from simulator->constraints (search backwards for stability)
             for (ssize_t ci = (ssize_t)dynarray_size(cons) - 1; ci >= 0; --ci) {
                 if ((Constraint*)dynarray_get(cons, (size_t)ci) == c) {
@@ -698,6 +703,9 @@ static void sel_cb_delete_selection(VariableInteraction *vi, void *user_data) {
 
 
 int main(int argc, char *argv[]) {
+    // Initialize GLUT for text rendering (before using glutBitmapCharacter)
+    glutInit(&argc, argv);
+    
     // parse runtime options
     int override_solver_iters = 0;
     int run_mesh_test = 0;
@@ -707,12 +715,18 @@ int main(int argc, char *argv[]) {
         // support format --N=123
         if (strncmp(arg, "--N=", 4) == 0) {
             int v = atoi(arg + 4);
-            if (v > 0) override_solver_iters = v;
+            if (v > 0) {
+                override_solver_iters = v;
+                printf("Overriding solver iterations to %d\n", override_solver_iters);
+            }
         } else if (strcmp(arg, "--test-octagon") == 0) {
             run_mesh_test = 1;
         } else if (strncmp(arg, "--mesh_k=", 9) == 0) {
             int v = atoi(arg + 9);
-            if (v > 0) mesh_k = v;
+            if (v > 0) {
+                mesh_k = v;
+                printf("Setting mesh test k to %d\n", mesh_k);
+            }
         }
     }
     if (SDL_Init(SDL_INIT_VIDEO) < 0) {
@@ -755,41 +769,6 @@ int main(int argc, char *argv[]) {
         // try fallback in case path differs
         menu_set_font("/usr/share/fonts/truetype/freefont/FreeSans.ttf", 14);
     }
-
-    // // Variables to drive sliders (double) and toggle (int)
-    // double var_x = test->x;
-    // double var_y = test->y;
-    // double var_w = test->width;
-    // double var_h = test->height;
-    // int var_color = 0;
-
-    
-
-
-    // // Create rows and interactions
-    // MenuRow *row1 = menurow_create();
-    // MenuCallbackData *d_x = malloc(sizeof(MenuCallbackData)); d_x->menu = test; d_x->field = F_X;
-    // MenuCallbackData *d_y = malloc(sizeof(MenuCallbackData)); d_y->menu = test; d_y->field = F_Y;
-    // VariableInteraction *vi_x = variableinteraction_create(&var_x, "X", 0, 700, VAR_SLIDER, on_slider_change, d_x);
-    // VariableInteraction *vi_y = variableinteraction_create(&var_y, "Y", 0, 500, VAR_SLIDER, on_slider_change, d_y);
-    // menurow_add_interaction(row1, vi_x);
-    // menurow_add_interaction(row1, vi_y);
-    // menu_add_row(test, row1);
-
-    // MenuRow *row2 = menurow_create();
-    // MenuCallbackData *d_w = malloc(sizeof(MenuCallbackData)); d_w->menu = test; d_w->field = F_W;
-    // MenuCallbackData *d_h = malloc(sizeof(MenuCallbackData)); d_h->menu = test; d_h->field = F_H;
-    // VariableInteraction *vi_w = variableinteraction_create(&var_w, "W", 50, 1000, VAR_SLIDER, on_slider_change, d_w);
-    // VariableInteraction *vi_h = variableinteraction_create(&var_h, "H", 20, 800, VAR_SLIDER, on_slider_change, d_h);
-    // menurow_add_interaction(row2, vi_w);
-    // menurow_add_interaction(row2, vi_h);
-    // menu_add_row(test, row2);
-
-    // MenuRow *row3 = menurow_create();
-    // MenuCallbackData *d_col = malloc(sizeof(MenuCallbackData)); d_col->menu = test; d_col->field = F_COLOR;
-    // VariableInteraction *vi_col = variableinteraction_create(&var_color, "ToggleColor", 0, 1, VAR_BOOL, on_bool_change, d_col);
-    // menurow_add_interaction(row3, vi_col);
-    // menu_add_row(test, row3);
 
     int running = 1;
     SDL_Event event;
@@ -1006,8 +985,8 @@ int main(int argc, char *argv[]) {
     // small-radius, and only horizontal/vertical neighbor connections are
     // created (distance constraints + walls). No diagonals.
     {
-        const int GRID_COLS = 12;   // pretty dense horizontally
-        const int GRID_ROWS = 6;    // several rows
+        const int GRID_COLS = 0;   // pretty dense horizontally
+        const int GRID_ROWS = 0;    // several rows
         Node *grid[GRID_ROWS][GRID_COLS];
         const float spacing = 7.0f; // spacing between grid nodes (world units)
         // center the grid between the two bottom anchors (nodes_arr[6], nodes_arr[7])
@@ -1050,8 +1029,8 @@ int main(int argc, char *argv[]) {
                         Constraint *dc = distconstraint_create(n, hn, rest);
                         if (dc) simulator_add_constraint(sim, dc);
                         // also add a wall segment between neighbors so collisions behave
-                        WallSegment *ws = wallsegment_create(n, hn, 1.0f, 0.0f);
-                        if (ws) simulator_add_wall(sim, ws);
+                        // WallSegment *ws = wallsegment_create(n, hn, 1.0f, 0.0f);
+                        // if (ws) simulator_add_wall(sim, ws);
                     }
                 }
                 // vertical neighbor
@@ -1063,8 +1042,8 @@ int main(int argc, char *argv[]) {
                         float rest = sqrtf(dx*dx + dy*dy);
                         Constraint *dc = distconstraint_create(n, vn, rest);
                         if (dc) simulator_add_constraint(sim, dc);
-                        WallSegment *ws = wallsegment_create(n, vn, 1.0f, 0.0f);
-                        if (ws) simulator_add_wall(sim, ws);
+                        // WallSegment *ws = wallsegment_create(n, vn, 1.0f, 0.0f);
+                        // if (ws) simulator_add_wall(sim, ws);
                     }
                 }
             }
@@ -1073,7 +1052,7 @@ int main(int argc, char *argv[]) {
         // attach the two bottom anchors to the top row of the grid with springs
         // (one spring from each anchor to the nearest grid edge). Use a moderate
         // stiffness so the grid is influenced but still free.
-        float spring_stiff = 5000.0f;
+        float spring_stiff = 1000.0f;
         if (GRID_COLS > 0 && GRID_ROWS > 0) {
             Node *left_top = grid[0][0];
             Node *right_top = grid[0][GRID_COLS - 1];
@@ -1450,15 +1429,19 @@ int main(int argc, char *argv[]) {
         // each selected node toward the current pick position. This does not
         // require the click to have started on the node and remains active until
         // the user disables the toggle.
-    float K_p = edata.drag_strength ? (float)(*(edata.drag_strength)) : 3.0f;  // proportional (stiffness)
-    float K_d = 12.0f;  // derivative (damping) - tune this ratio as needed
-    
-    const float MAX_FORCE = 1e3f;
-    if (mouse_left_down && !mouse_left_down_on_ui && edata.drag_enabled && edata.drag_enabled[0] && edata.drag_strength && sel_filter == SEL_NODE && dynarray_size(selection) > 0) {
+        float K_p = edata.drag_strength ? (float)(*(edata.drag_strength)) : 3.0f;  // proportional (stiffness)
+        float K_d = 12.0f;  // derivative (damping) - tune this ratio as needed
+        
+        const float MAX_FORCE = 1e3f;
+        if (mouse_left_down && !mouse_left_down_on_ui && edata.drag_enabled && edata.drag_enabled[0] && edata.drag_strength && sel_filter == SEL_NODE && dynarray_size(selection) > 0) {
             float K = (float)(*(edata.drag_strength));
             for (size_t si = 0; si < dynarray_size(selection); ++si) {
                 Node *n = (Node*)dynarray_get(selection, si);
                 if (!n) continue;
+                // Store old velocity for energy tracking
+                float old_vx = n->vel[0];
+                float old_vy = n->vel[1];
+                
                 // Error vector: direction and distance to target
                 float rx = pick_wx - n->pos[0];
                 float ry = pick_wy - n->pos[1];
@@ -1496,6 +1479,16 @@ int main(int argc, char *argv[]) {
 
                 n->vel[0] += dvx;
                 n->vel[1] += dvy;
+                
+                // Track energy added/removed by user drag force
+                // Work = Force · displacement over dt
+                // Approximate displacement as velocity * dt (using average velocity)
+                float avg_vx = (old_vx + n->vel[0]) * 0.5f;
+                float avg_vy = (old_vy + n->vel[1]) * 0.5f;
+                float dx = avg_vx * sim->dt;
+                float dy = avg_vy * sim->dt;
+                float work = fx * dx + fy * dy;  // dot product: F · ds
+                sim->energy_tracker.user_energy_accumulated += (double)work;
             }
         }
         if (!paused) {
@@ -1608,6 +1601,22 @@ int main(int argc, char *argv[]) {
         glPopMatrix();
 
         // restore projection/modelview
+        glPopMatrix();
+        glMatrixMode(GL_PROJECTION);
+        glPopMatrix();
+        glMatrixMode(GL_MODELVIEW);
+
+        // Draw energy bar in screen-space coordinates
+        glMatrixMode(GL_PROJECTION);
+        glPushMatrix();
+        glLoadIdentity();
+        glOrtho(0, win_w, win_h, 0, -1, 1);
+        glMatrixMode(GL_MODELVIEW);
+        glPushMatrix();
+        glLoadIdentity();
+        
+        simulator_draw_energy_bar(sim, win_w, win_h);
+        
         glPopMatrix();
         glMatrixMode(GL_PROJECTION);
         glPopMatrix();
@@ -1741,6 +1750,8 @@ static void sel_cb_delete_nodes(VariableInteraction *vi, void *user_data) {
             Constraint *c = (Constraint*)dynarray_get(cons, (size_t)ci);
             if (!c) continue;
             if (c->node == n || c->other == n) {
+                // Track energy removal
+                simulator_remove_constraint(sim, c);
                 // remove from other endpoint's node->constraints
                 Node *other = (c->node == n) ? c->other : c->node;
                 if (other && other->constraints) {
@@ -1773,6 +1784,8 @@ static void sel_cb_delete_nodes(VariableInteraction *vi, void *user_data) {
         DynArray *na = sim->nodes;
         for (size_t ni = 0; ni < na->size; ++ni) {
             if ((Node*)dynarray_get(na, ni) == n) {
+                // Track energy removal
+                simulator_remove_node(sim, n);
                 node_free(n);
                 for (size_t j = ni; j + 1 < na->size; ++j) na->items[j] = na->items[j+1];
                 na->size -= 1;
