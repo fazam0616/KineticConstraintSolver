@@ -27,37 +27,66 @@ void node_free(Node *n) {
     free(n);
 }
 
-static void draw_circle_filled(float cx, float cy, float cz, float r, int segments) {
+static void draw_circle_billboard(float cx, float cy, float cz, float r, 
+                                  float cam_yaw, float cam_pitch, int segments) {
+    // Get camera right and up vectors for billboard
+    float right_x = cosf(cam_yaw);
+    float right_y = 0.0f;
+    float right_z = -sinf(cam_yaw);
+    
+    float up_x = sinf(cam_yaw) * sinf(cam_pitch);
+    float up_y = cosf(cam_pitch);
+    float up_z = cosf(cam_yaw) * sinf(cam_pitch);
+    
     glBegin(GL_TRIANGLE_FAN);
-    glVertex3f(cx, cy, cz);
+    glVertex3f(cx, cy, cz); // center
     for (int i = 0; i <= segments; ++i) {
         float theta = 2.0f * 3.1415926f * (float)i / (float)segments;
-        float x = r * cosf(theta);
-        float y = r * sinf(theta);
-        glVertex3f(cx + x, cy + y, cz);
+        float offset_x = r * (cosf(theta) * right_x + sinf(theta) * up_x);
+        float offset_y = r * (cosf(theta) * right_y + sinf(theta) * up_y);
+        float offset_z = r * (cosf(theta) * right_z + sinf(theta) * up_z);
+        glVertex3f(cx + offset_x, cy + offset_y, cz + offset_z);
     }
     glEnd();
 }
 
-void node_draw(Node *n, float radius) {
+static void draw_circle_outline_billboard(float cx, float cy, float cz, float r, 
+                                         float cam_yaw, float cam_pitch, int segments) {
+    // Get camera right and up vectors for billboard
+    float right_x = cosf(cam_yaw);
+    float right_y = 0.0f;
+    float right_z = -sinf(cam_yaw);
+    
+    float up_x = sinf(cam_yaw) * sinf(cam_pitch);
+    float up_y = cosf(cam_pitch);
+    float up_z = cosf(cam_yaw) * sinf(cam_pitch);
+    
+    glBegin(GL_LINE_LOOP);
+    for (int i = 0; i < segments; ++i) {
+        float theta = 2.0f * 3.1415926f * (float)i / (float)segments;
+        float offset_x = r * (cosf(theta) * right_x + sinf(theta) * up_x);
+        float offset_y = r * (cosf(theta) * right_y + sinf(theta) * up_y);
+        float offset_z = r * (cosf(theta) * right_z + sinf(theta) * up_z);
+        glVertex3f(cx + offset_x, cy + offset_y, cz + offset_z);
+    }
+    glEnd();
+}
+
+void node_draw(Node *n, float radius, float cam_yaw, float cam_pitch) {
     if (!n) return;
     if (n->anchored) {
         // draw small black dot for anchors
         glColor3f(0.0f, 0.0f, 0.0f);
-        draw_circle_filled(n->pos[0], n->pos[1], n->pos[2], radius * 0.6f, 20);
+        draw_circle_billboard(n->pos[0], n->pos[1], n->pos[2], radius * 0.6f, 
+                             cam_yaw, cam_pitch, 20);
     } else {
         // regular node: filled red
         glColor3f(1.0f, 0.0f, 0.0f);
-        draw_circle_filled(n->pos[0], n->pos[1], n->pos[2], radius, 20);
+        draw_circle_billboard(n->pos[0], n->pos[1], n->pos[2], radius, 
+                             cam_yaw, cam_pitch, 20);
     }
     // small outline
     glColor3f(0.0f, 0.0f, 0.0f);
-    glBegin(GL_LINE_LOOP);
-    for (int i = 0; i < 20; ++i) {
-        float theta = 2.0f * 3.1415926f * (float)i / 20.0f;
-        float x = radius * cosf(theta);
-        float y = radius * sinf(theta);
-        glVertex3f(n->pos[0] + x, n->pos[1] + y, n->pos[2]);
-    }
-    glEnd();
+    draw_circle_outline_billboard(n->pos[0], n->pos[1], n->pos[2], radius, 
+                                 cam_yaw, cam_pitch, 20);
 }

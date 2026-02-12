@@ -26,7 +26,13 @@ void simulator_add_node(Simulator *s, Node *n);
 void simulator_add_constraint(Simulator *s, Constraint *c);
 void simulator_add_wall(Simulator *s, TriangleWall *w);
 void simulator_step(Simulator *s);
-void simulator_draw(Simulator *s);
+void simulator_draw(Simulator *s, float cam_yaw, float cam_pitch);
+
+// Find the closest node to a given position within max_distance
+// Returns node index or -1 if none found within range
+// Uses octree for efficient spatial lookup
+int simulator_find_closest_node(Simulator *s, float pos[3], float max_distance);
+
 // Generate a triangular mesh from a polygon defined by a DynArray of Node*
 // - sim: simulator to which new nodes/constraints will be added
 // - poly_nodes: DynArray of Node* defining polygon vertices (in order)

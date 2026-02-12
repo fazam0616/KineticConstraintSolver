@@ -56,7 +56,7 @@ OctreeNode* octree_create(float min_x, float min_y, float min_z,
     
     node->depth = 0;
     node->is_leaf = 1;
-    node->node_indices = dynarray_create(16);
+    node->node_entries = dynarray_create(16);
     node->triangle_indices = dynarray_create(8);
     
     // Initialize children to NULL
@@ -79,7 +79,7 @@ void octree_free(OctreeNode *node) {
     }
     
     // Free dynamic arrays (elements are just ints, no need to free individually)
-    if (node->node_indices) dynarray_free(node->node_indices, NULL);
+    if (node->node_entries) dynarray_free(node->node_entries, free);
     if (node->triangle_indices) dynarray_free(node->triangle_indices, NULL);
     
     free(node);
@@ -116,10 +116,32 @@ static void octree_subdivide(OctreeNode *node) {
         
         child->depth = node->depth + 1;
         child->is_leaf = 1;
-        child->node_indices = dynarray_create(16);
+        child->node_entries = dynarray_create(16);
         child->triangle_indices = dynarray_create(8);
         
         node->children[i] = child;
+    }
+    
+    // Redistribute existing nodes to appropriate children
+    if (node->node_entries) {
+        for (size_t i = 0; i < dynarray_size(node->node_entries); ++i) {
+            NodeEntry *entry = (NodeEntry*)dynarray_get(node->node_entries, i);
+            if (entry) {
+                int octant = octree_get_octant(center, entry->pos);
+                if (node->children[octant]) {
+                    // Create new entry for child
+                    NodeEntry *new_entry = (NodeEntry*)malloc(sizeof(NodeEntry));
+                    new_entry->node_idx = entry->node_idx;
+                    memcpy(new_entry->pos, entry->pos, sizeof(float) * 3);
+                    dynarray_append(node->children[octant]->node_entries, new_entry);
+                }
+            }
+        }
+        // Clear parent's node list since children now own them
+        for (size_t i = 0; i < dynarray_size(node->node_entries); ++i) {
+            free(dynarray_get(node->node_entries, i));
+        }
+        node->node_entries->size = 0;
     }
     
     node->is_leaf = 0;
@@ -136,20 +158,14 @@ void octree_insert_node(OctreeNode *root, int node_idx, float pos[3]) {
     
     // If leaf, add to this node
     if (root->is_leaf) {
-        int *idx_ptr = (int*)malloc(sizeof(int));
-        *idx_ptr = node_idx;
-        dynarray_append(root->node_indices, idx_ptr);
+        NodeEntry *entry = (NodeEntry*)malloc(sizeof(NodeEntry));
+        entry->node_idx = node_idx;
+        memcpy(entry->pos, pos, sizeof(float) * 3);
+        dynarray_append(root->node_entries, entry);
         
         // Subdivide if we have too many nodes and haven't reached max depth
-        if (dynarray_size(root->node_indices) > 8 && root->depth < MAX_OCTREE_DEPTH) {
+        if (dynarray_size(root->node_entries) > 8 && root->depth < MAX_OCTREE_DEPTH) {
             octree_subdivide(root);
-            
-            // Redistribute existing nodes to children
-            for (size_t i = 0; i < dynarray_size(root->node_indices); ++i) {
-                int *stored_idx = (int*)dynarray_get(root->node_indices, i);
-                // We don't have the position anymore, so we can't redistribute
-                // For simplicity, keep them here
-            }
         }
         return;
     }
@@ -263,16 +279,87 @@ DynArray* octree_query_triangles(OctreeNode *root, float pos[3]) {
     return results;
 }
 
+// Query nodes in the leaf cell containing a point
+DynArray* octree_query_nodes(OctreeNode *root, float pos[3]) {
+    DynArray *results = dynarray_create(32);
+    
+    if (!root) return results;
+    
+    OctreeNode *current = root;
+    
+    // Traverse down to the leaf containing this point
+    while (current) {
+        // If leaf, return its node entries
+        if (current->is_leaf) {
+            if (current->node_entries) {
+                for (size_t i = 0; i < dynarray_size(current->node_entries); ++i) {
+                    NodeEntry *entry = (NodeEntry*)dynarray_get(current->node_entries, i);
+                    if (entry) {
+                        int *result_idx = (int*)malloc(sizeof(int));
+                        *result_idx = entry->node_idx;
+                        dynarray_append(results, result_idx);
+                    }
+                }
+            }
+            break;
+        }
+        
+        // Find which child contains the point
+        if (!aabb_contains_point(&current->bounds, pos)) break;
+        
+        float center[3] = {
+            (current->bounds.min[0] + current->bounds.max[0]) * 0.5f,
+            (current->bounds.min[1] + current->bounds.max[1]) * 0.5f,
+            (current->bounds.min[2] + current->bounds.max[2]) * 0.5f
+        };
+        
+        int octant = octree_get_octant(center, pos);
+        current = current->children[octant];
+    }
+    
+    return results;
+}
+
+// Find the closest node to a given position within max_distance
+int octree_find_closest_node(OctreeNode *root, Node **all_nodes, size_t num_nodes,
+                             float pos[3], float max_distance) {
+    DynArray *candidates = octree_query_nodes(root, pos);
+    
+    int closest_idx = -1;
+    float closest_dist_sq = max_distance * max_distance;
+    
+    for (size_t i = 0; i < dynarray_size(candidates); ++i) {
+        int *idx_ptr = (int*)dynarray_get(candidates, i);
+        if (!idx_ptr || *idx_ptr < 0 || (size_t)*idx_ptr >= num_nodes) continue;
+        
+        Node *n = all_nodes[*idx_ptr];
+        if (!n) continue;
+        
+        float dx = n->pos[0] - pos[0];
+        float dy = n->pos[1] - pos[1];
+        float dz = n->pos[2] - pos[2];
+        float dist_sq = dx*dx + dy*dy + dz*dz;
+        
+        if (dist_sq < closest_dist_sq) {
+            closest_dist_sq = dist_sq;
+            closest_idx = *idx_ptr;
+        }
+    }
+    
+    dynarray_free(candidates, free);
+    return closest_idx;
+}
+
 // Clear all indices from octree (for rebuilding)
 void octree_clear(OctreeNode *root) {
     if (!root) return;
     
     // Clear this node's lists
-    if (root->node_indices) {
-        for (size_t i = 0; i < dynarray_size(root->node_indices); ++i) {
-            free(dynarray_get(root->node_indices, i));
+    if (root->node_entries) {
+        for (size_t i = 0; i < dynarray_size(root->node_entries); ++i) {
+            free(dynarray_get(root->node_entries, i));
         }
-        root->node_indices->size = 0;
+        root->node_entries->size = 0;
     }
     
     if (root->triangle_indices) {

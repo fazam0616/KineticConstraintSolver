@@ -23,6 +23,6 @@ struct Node {
 
 Node* node_create(int idx, float mass, float x, float y, float z);
 void node_free(Node *n);
-void node_draw(Node *n, float radius);
+void node_draw(Node *n, float radius, float cam_yaw, float cam_pitch);
 
 #endif // NODE_H

@@ -389,6 +389,10 @@ static void on_tool_change(VariableInteraction *vi, void *user_data) {
     } else {
         // disabled the current tool
         *(ed->current_tool) = TOOL_NONE;
+        // Clear drag when switching away from select tool
+        if (ed->drag_enabled) {
+            *(ed->drag_enabled) = 0;
+        }
     }
     // Update row 2 contents
     update_edit_row2_for_tool(ed);
@@ -696,6 +700,194 @@ static void sel_cb_delete_selection(VariableInteraction *vi, void *user_data) {
     }
 }
 
+// Helper function to get plane normal and offset based on plane type and camera orientation
+static void get_plane_params(int plane_type, float offset, float cam_yaw, float cam_pitch, 
+                             float cam_x, float cam_y, float cam_z,
+                             float *normal_x, float *normal_y, float *normal_z, float *d) {
+    // Plane equation: normal · (P - point_on_plane) = 0, or normal · P = d
+    switch (plane_type) {
+        case 0: // PLANE_WORLD_X: YZ plane at X = offset
+            *normal_x = 1.0f; *normal_y = 0.0f; *normal_z = 0.0f;
+            *d = offset;
+            break;
+        case 1: // PLANE_WORLD_Y: XZ plane at Y = offset
+            *normal_x = 0.0f; *normal_y = 1.0f; *normal_z = 0.0f;
+            *d = offset;
+            break;
+        case 2: // PLANE_WORLD_Z: XY plane at Z = offset
+            *normal_x = 0.0f; *normal_y = 0.0f; *normal_z = 1.0f;
+            *d = offset;
+            break;
+        case 3: // PLANE_CAM_X: perpendicular to camera right vector
+            {
+                float right_x = cosf(cam_yaw);
+                float right_z = -sinf(cam_yaw);
+                *normal_x = right_x; *normal_y = 0.0f; *normal_z = right_z;
+                *d = cam_x * right_x + cam_z * right_z + offset;
+            }
+            break;
+        case 4: // PLANE_CAM_Y: perpendicular to camera up vector (accounting for pitch)
+            {
+                // Camera up is perpendicular to forward in vertical plane
+                float up_x = sinf(cam_yaw) * sinf(cam_pitch);
+                float up_y = cosf(cam_pitch);
+                float up_z = cosf(cam_yaw) * sinf(cam_pitch);
+                *normal_x = up_x; *normal_y = up_y; *normal_z = up_z;
+                *d = cam_x * up_x + cam_y * up_y + cam_z * up_z + offset;
+            }
+            break;
+        case 5: // PLANE_CAM_Z: perpendicular to camera forward vector
+            {
+                float forward_x = -sinf(cam_yaw) * cosf(cam_pitch);
+                float forward_y = -sinf(cam_pitch);
+                float forward_z = -cosf(cam_yaw) * cosf(cam_pitch);
+                *normal_x = forward_x; *normal_y = forward_y; *normal_z = forward_z;
+                *d = cam_x * forward_x + cam_y * forward_y + cam_z * forward_z + offset;
+            }
+            break;
+        default:
+            *normal_x = 0.0f; *normal_y = 1.0f; *normal_z = 0.0f; *d = 0.0f;
+            break;
+    }
+}
+
+// Ray-plane intersection: returns 1 if hit, sets hit_x/y/z
+static int ray_plane_intersect(float ray_ox, float ray_oy, float ray_oz,
+                                float ray_dx, float ray_dy, float ray_dz,
+                                float plane_nx, float plane_ny, float plane_nz, float plane_d,
+                                float *hit_x, float *hit_y, float *hit_z) {
+    float denom = ray_dx * plane_nx + ray_dy * plane_ny + ray_dz * plane_nz;
+    if (fabsf(denom) < 1e-6f) return 0; // ray parallel to plane
+    
+    float t = (plane_d - (ray_ox * plane_nx + ray_oy * plane_ny + ray_oz * plane_nz)) / denom;
+    if (t < 0.0f) return 0; // intersection behind ray origin
+    
+    *hit_x = ray_ox + t * ray_dx;
+    *hit_y = ray_oy + t * ray_dy;
+    *hit_z = ray_oz + t * ray_dz;
+    return 1;
+}
+
+// Render translucent grid on the selection plane
+static void render_plane_grid(int plane_type, float offset, float cam_yaw, float cam_pitch,
+                              float cam_x, float cam_y, float cam_z, float grid_size, float cell_size) {
+    float nx, ny, nz, d;
+    get_plane_params(plane_type, offset, cam_yaw, cam_pitch, cam_x, cam_y, cam_z, &nx, &ny, &nz, &d);
+    
+    // Generate two basis vectors perpendicular to the normal
+    float basis1_x, basis1_y, basis1_z, basis2_x, basis2_y, basis2_z;
+    
+    // Choose an arbitrary vector not parallel to normal
+    float temp_x = 1.0f, temp_y = 0.0f, temp_z = 0.0f;
+    if (fabsf(nx) > 0.9f) { temp_x = 0.0f; temp_y = 1.0f; temp_z = 0.0f; }
+    
+    // basis1 = normal × temp
+    basis1_x = ny * temp_z - nz * temp_y;
+    basis1_y = nz * temp_x - nx * temp_z;
+    basis1_z = nx * temp_y - ny * temp_x;
+    float len1 = sqrtf(basis1_x * basis1_x + basis1_y * basis1_y + basis1_z * basis1_z);
+    basis1_x /= len1; basis1_y /= len1; basis1_z /= len1;
+    
+    // basis2 = normal × basis1
+    basis2_x = ny * basis1_z - nz * basis1_y;
+    basis2_y = nz * basis1_x - nx * basis1_z;
+    basis2_z = nx * basis1_y - ny * basis1_x;
+    
+    // Find a point on the plane
+    float point_x = nx * d, point_y = ny * d, point_z = nz * d;
+    
+    // Draw translucent grid
+    glEnable(GL_BLEND);
+    glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+    glColor4f(0.5f, 0.5f, 0.8f, 0.3f); // translucent blue-gray
+    glBegin(GL_LINES);
+    
+    int num_lines = (int)(grid_size / cell_size);
+    for (int i = -num_lines; i <= num_lines; ++i) {
+        float t = i * cell_size;
+        // Lines parallel to basis1
+        float start_x = point_x + basis2_x * t - basis1_x * grid_size;
+        float start_y = point_y + basis2_y * t - basis1_y * grid_size;
+        float start_z = point_z + basis2_z * t - basis1_z * grid_size;
+        float end_x = point_x + basis2_x * t + basis1_x * grid_size;
+        float end_y = point_y + basis2_y * t + basis1_y * grid_size;
+        float end_z = point_z + basis2_z * t + basis1_z * grid_size;
+        glVertex3f(start_x, start_y, start_z);
+        glVertex3f(end_x, end_y, end_z);
+        
+        // Lines parallel to basis2
+        start_x = point_x + basis1_x * t - basis2_x * grid_size;
+        start_y = point_y + basis1_y * t - basis2_y * grid_size;
+        start_z = point_z + basis1_z * t - basis2_z * grid_size;
+        end_x = point_x + basis1_x * t + basis2_x * grid_size;
+        end_y = point_y + basis1_y * t + basis2_y * grid_size;
+        end_z = point_z + basis1_z * t + basis2_z * grid_size;
+        glVertex3f(start_x, start_y, start_z);
+        glVertex3f(end_x, end_y, end_z);
+    }
+    glEnd();
+    glDisable(GL_BLEND);
+}
+
+// Calculate distance from point to plane
+static float point_plane_distance(float px, float py, float pz, 
+                                   float nx, float ny, float nz, float d) {
+    return fabsf(nx * px + ny * py + nz * pz - d);
+}
+
+// Convert screen coordinates to world position by ray-plane intersection
+static int screen_to_world_plane(int screen_x, int screen_y, int win_w, int win_h,
+                                  float cam_x, float cam_y, float cam_z,
+                                  float cam_yaw, float cam_pitch,
+                                  int plane_type, float plane_offset,
+                                  float *world_x, float *world_y, float *world_z) {
+    // Get plane parameters
+    float plane_nx, plane_ny, plane_nz, plane_d;
+    get_plane_params(plane_type, plane_offset, cam_yaw, cam_pitch, cam_x, cam_y, cam_z,
+                    &plane_nx, &plane_ny, &plane_nz, &plane_d);
+    
+    // Convert screen to normalized device coordinates (-1 to 1)
+    float ndc_x = (2.0f * screen_x) / win_w - 1.0f;
+    float ndc_y = 1.0f - (2.0f * screen_y) / win_h; // flip Y
+    
+    // Unproject to get ray direction (simplified for perspective projection)
+    // This assumes FOV=60 degrees
+    float fov_y = 60.0f;
+    float aspect = (float)win_w / (float)win_h;
+    float tan_half_fov = tanf(fov_y * 3.14159265f / 360.0f);
+    
+    // Ray direction in camera space
+    float ray_cam_x = ndc_x * aspect * tan_half_fov;
+    float ray_cam_y = ndc_y * tan_half_fov;
+    float ray_cam_z = -1.0f; // camera looks along -Z
+    
+    // Transform ray direction to world space using camera rotation
+    // Apply yaw (Y-axis) then pitch (X-axis) rotation
+    float cos_yaw = cosf(cam_yaw), sin_yaw = sinf(cam_yaw);
+    float cos_pitch = cosf(cam_pitch), sin_pitch = sinf(cam_pitch);
+    
+    // Rotate by pitch around X-axis
+    float ray_x_rot = ray_cam_x;
+    float ray_y_rot = ray_cam_y * cos_pitch - ray_cam_z * sin_pitch;
+    float ray_z_rot = ray_cam_y * sin_pitch + ray_cam_z * cos_pitch;
+    
+    // Rotate by yaw around Y-axis
+    float ray_world_x = ray_x_rot * cos_yaw + ray_z_rot * sin_yaw;
+    float ray_world_y = ray_y_rot;
+    float ray_world_z = -ray_x_rot * sin_yaw + ray_z_rot * cos_yaw;
+    
+    // Normalize ray direction
+    float ray_len = sqrtf(ray_world_x * ray_world_x + ray_world_y * ray_world_y + ray_world_z * ray_world_z);
+    ray_world_x /= ray_len;
+    ray_world_y /= ray_len;
+    ray_world_z /= ray_len;
+    
+    // Intersect ray with plane
+    return ray_plane_intersect(cam_x, cam_y, cam_z, ray_world_x, ray_world_y, ray_world_z,
+                              plane_nx, plane_ny, plane_nz, plane_d,
+                              world_x, world_y, world_z);
+}
+
 
 int main(int argc, char *argv[]) {
     // parse runtime options
@@ -756,41 +948,6 @@ int main(int argc, char *argv[]) {
         menu_set_font("/usr/share/fonts/truetype/freefont/FreeSans.ttf", 14);
     }
 
-    // // Variables to drive sliders (double) and toggle (int)
-    // double var_x = test->x;
-    // double var_y = test->y;
-    // double var_w = test->width;
-    // double var_h = test->height;
-    // int var_color = 0;
-
-    
-
-
-    // // Create rows and interactions
-    // MenuRow *row1 = menurow_create();
-    // MenuCallbackData *d_x = malloc(sizeof(MenuCallbackData)); d_x->menu = test; d_x->field = F_X;
-    // MenuCallbackData *d_y = malloc(sizeof(MenuCallbackData)); d_y->menu = test; d_y->field = F_Y;
-    // VariableInteraction *vi_x = variableinteraction_create(&var_x, "X", 0, 700, VAR_SLIDER, on_slider_change, d_x);
-    // VariableInteraction *vi_y = variableinteraction_create(&var_y, "Y", 0, 500, VAR_SLIDER, on_slider_change, d_y);
-    // menurow_add_interaction(row1, vi_x);
-    // menurow_add_interaction(row1, vi_y);
-    // menu_add_row(test, row1);
-
-    // MenuRow *row2 = menurow_create();
-    // MenuCallbackData *d_w = malloc(sizeof(MenuCallbackData)); d_w->menu = test; d_w->field = F_W;
-    // MenuCallbackData *d_h = malloc(sizeof(MenuCallbackData)); d_h->menu = test; d_h->field = F_H;
-    // VariableInteraction *vi_w = variableinteraction_create(&var_w, "W", 50, 1000, VAR_SLIDER, on_slider_change, d_w);
-    // VariableInteraction *vi_h = variableinteraction_create(&var_h, "H", 20, 800, VAR_SLIDER, on_slider_change, d_h);
-    // menurow_add_interaction(row2, vi_w);
-    // menurow_add_interaction(row2, vi_h);
-    // menu_add_row(test, row2);
-
-    // MenuRow *row3 = menurow_create();
-    // MenuCallbackData *d_col = malloc(sizeof(MenuCallbackData)); d_col->menu = test; d_col->field = F_COLOR;
-    // VariableInteraction *vi_col = variableinteraction_create(&var_color, "ToggleColor", 0, 1, VAR_BOOL, on_bool_change, d_col);
-    // menurow_add_interaction(row3, vi_col);
-    // menu_add_row(test, row3);
-
     int running = 1;
     SDL_Event event;
     int win_w = 800, win_h = 600;
@@ -811,6 +968,7 @@ int main(int argc, char *argv[]) {
     int rotate_last_x = 0, rotate_last_y = 0;
     // WASD key states
     int key_w = 0, key_a = 0, key_s = 0, key_d = 0;
+    int key_shift = 0, key_ctrl = 0;
 
     // --- Initial scenario: Box in Sleeve ---
     Simulator *sim = simulator_create(1.0f/20.0f);
@@ -876,13 +1034,20 @@ int main(int argc, char *argv[]) {
     int rect_select_active = 0; // right-button rectangle select active
     int rect_x0 = 0, rect_y0 = 0, rect_x1 = 0, rect_y1 = 0;
     // Last mouse position used for selection dragging (world-space). Using world coords
-    // TODO: implement proper 3D ray-picking for mouse interactions
-    float sel_last_wx = 0.0f, sel_last_wy = 0.0f;
-    // last pick position (world coords) used for rendering the pick cursor
-    float pick_wx = 0.0f, pick_wy = 0.0f;
+    // last pick position (world coords) used for rendering the pick cursor and drag target
+    float pick_wx = 0.0f, pick_wy = 0.0f, pick_wz = 0.0f;
     int pick_active = 0;
     int mouse_left_down = 0;
     int mouse_left_down_on_ui = 0; // true if left-button down started on a menu/UI control
+    
+    // Placement/selection plane system
+    // 6 planes: world X, Y, Z and camera-relative X, Y, Z
+    enum PlaneType { PLANE_WORLD_X = 0, PLANE_WORLD_Y, PLANE_WORLD_Z, PLANE_CAM_X, PLANE_CAM_Y, PLANE_CAM_Z };
+    int current_plane = PLANE_WORLD_Y;  // start with world Y plane (horizontal ground)
+    float plane_offsets[6] = { 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f };  // remembered offsets for each plane
+    float plane_offset_step = 10.0f;  // how much to adjust with left/right arrows
+    float selection_distance_threshold = 20.0f;  // max distance from plane for selection
+    
     EditData edata;
     edata.menus = menus; edata.edit_menu = &edit_menu; edata.select_menu = &select_menu; edata.win_w = &win_w; edata.win_h = &win_h;
     edata.tool_select = &tool_select; edata.tool_node = &tool_node; edata.tool_dist = &tool_dist; edata.tool_spring = &tool_spring; edata.tool_wall = &tool_wall; edata.current_tool = &current_tool;
@@ -933,6 +1098,8 @@ int main(int argc, char *argv[]) {
             dynarray_free(tris, NULL);
         }
     }
+    
+    /* COMMENTED OUT OLD SCENE
     const float offset = 50.0f;
     const float box_size = 200.0f;
     const float half = box_size * 0.5f;
@@ -1041,8 +1208,8 @@ int main(int argc, char *argv[]) {
     // small-radius, and only horizontal/vertical neighbor connections are
     // created (distance constraints + walls). No diagonals.
     {
-        const int GRID_COLS = 12;   // pretty dense horizontally
-        const int GRID_ROWS = 6;    // several rows
+        const int GRID_COLS = 0;   // pretty dense horizontally
+        const int GRID_ROWS = 0;    // several rows
         Node *grid[GRID_ROWS][GRID_COLS];
         const float spacing = 7.0f; // spacing between grid nodes (world units)
         // center the grid between the two bottom anchors (nodes_arr[6], nodes_arr[7])
@@ -1140,6 +1307,70 @@ int main(int argc, char *argv[]) {
             }
         }
     }
+    END OLD SCENE */
+
+    // NEW SCENE: Ground + Tetrahedron
+    // Position in front of camera (0,0,500), slightly below (y < 0)
+    // Camera looks along -Z axis, so objects should be at negative Z
+    
+    // Ground plane: 2 large anchored triangles forming a square
+    float ground_size = 200.0f;
+    float ground_z = -300.0f;  // in front of camera
+    float ground_y = -50.0f;   // below camera
+    
+    // Ground corners
+    Node *g1 = node_create(-1, 1.0f, -ground_size, ground_y, ground_z - ground_size);
+    Node *g2 = node_create(-1, 1.0f,  ground_size, ground_y, ground_z - ground_size);
+    Node *g3 = node_create(-1, 1.0f,  ground_size, ground_y, ground_z + ground_size);
+    Node *g4 = node_create(-1, 1.0f, -ground_size, ground_y, ground_z + ground_size);
+    g1->anchored = true; g2->anchored = true; g3->anchored = true; g4->anchored = true;
+    simulator_add_node(sim, g1);
+    simulator_add_node(sim, g2);
+    simulator_add_node(sim, g3);
+    simulator_add_node(sim, g4);
+    
+    // Ground triangle walls
+    TriangleWall *ground1 = trianglewall_create(g1, g2, g3, 1.0f, 0.0f);
+    TriangleWall *ground2 = trianglewall_create(g1, g3, g4, 1.0f, 0.0f);
+    simulator_add_wall(sim, ground1);
+    simulator_add_wall(sim, ground2);
+    
+    // Tetrahedron above ground, pointy end down
+    float tet_size = 30.0f;
+    float tet_center_z = ground_z;  // same Z as ground center
+    float tet_bottom_y = ground_y + 20.0f;  // 20 units above ground
+    float tet_height = tet_size * sqrtf(2.0f / 3.0f);  // height of regular tetrahedron
+    
+    // Bottom vertex (pointy end)
+    Node *t_bottom = node_create(-1, 1.0f, 0.0f, tet_bottom_y, tet_center_z);
+    simulator_add_node(sim, t_bottom);
+    
+    // Top 3 vertices forming equilateral triangle
+    float top_y = tet_bottom_y + tet_height;
+    float angle_offset = 3.14159265f / 2.0f;  // start at top
+    Node *t1 = node_create(-1, 1.1f, 
+        tet_size * cosf(angle_offset), 
+        top_y, 
+        tet_center_z + tet_size * sinf(angle_offset));
+    Node *t2 = node_create(-1, 1.0f, 
+        tet_size * cosf(angle_offset + 2.0f * 3.14159265f / 3.0f), 
+        top_y, 
+        tet_center_z + tet_size * sinf(angle_offset + 2.0f * 3.14159265f / 3.0f));
+    Node *t3 = node_create(-1, 1.05f, 
+        tet_size * cosf(angle_offset + 4.0f * 3.14159265f / 3.0f), 
+        top_y, 
+        tet_center_z + tet_size * sinf(angle_offset + 4.0f * 3.14159265f / 3.0f));
+    simulator_add_node(sim, t1);
+    simulator_add_node(sim, t2);
+    simulator_add_node(sim, t3);
+    
+    // Distance constraints for all 6 edges of tetrahedron
+    simulator_add_constraint(sim, distconstraint_create(t_bottom, t1, -1));
+    simulator_add_constraint(sim, distconstraint_create(t_bottom, t2, -1));
+    simulator_add_constraint(sim, distconstraint_create(t_bottom, t3, -1));
+    simulator_add_constraint(sim, distconstraint_create(t1, t2, -1));
+    simulator_add_constraint(sim, distconstraint_create(t2, t3, -1));
+    simulator_add_constraint(sim, distconstraint_create(t3, t1, -1));
     printf("Generated initial scenario with %zu nodes, %zu constraints, %zu walls\n",
         dynarray_size(sim->nodes), dynarray_size(sim->constraints), dynarray_size(sim->walls));
 
@@ -1185,11 +1416,18 @@ int main(int argc, char *argv[]) {
 
                 // If not handled by UI menus, handle current tool actions (select, add-node, etc.)
                 if (!menu_handled) {
-                    // convert screen to world coords (3D raycasting - TODO: implement proper ray-plane intersection)
-                    float wx = (float)mx;
-                    float wy = (float)my;
+                    // Convert screen to world coords using ray-plane intersection
+                    float wx = 0.0f, wy = 0.0f, wz = 0.0f;
+                    int hit = screen_to_world_plane(mx, my, win_w, win_h,
+                                                    cam_x, cam_y, cam_z, cam_yaw, cam_pitch,
+                                                    current_plane, plane_offsets[current_plane],
+                                                    &wx, &wy, &wz);
+                    if (!hit) {
+                        // Fallback if ray doesn't hit plane (shouldn't happen normally)
+                        wx = (float)mx; wy = (float)my; wz = 0.0f;
+                    }
                     // store last pick position so we can render it on screen
-                    pick_wx = wx; pick_wy = wy; pick_active = 1;
+                    pick_wx = wx; pick_wy = wy; pick_wz = wz; pick_active = 1;
 
                     if (current_tool == TOOL_ADD_NODE) {
                         // In +Node mode, left-click spawns a node at world coords with parameters from edit menu (if present)
@@ -1202,7 +1440,7 @@ int main(int argc, char *argv[]) {
                             if (edata.node_friction) friction_v = *edata.node_friction;
                             if (edata.node_anchored) anchored_v = *edata.node_anchored;
                             if (edata.node_collide_with_walls) collide_v = *edata.node_collide_with_walls;
-                            Node *nn = node_create(-1, (float)mass, wx, wy, 0.0f);
+                            Node *nn = node_create(-1, (float)mass, wx, wy, wz);
                             if (nn) {
                                 nn->friction = (float)friction_v;
                                 nn->anchored = anchored_v ? true : false;
@@ -1216,6 +1454,11 @@ int main(int argc, char *argv[]) {
                     } else if (current_tool == TOOL_SELECT) {
                         const float pick_px = 8.0f;
                         const float pick_world = pick_px; // TODO: scale based on camera distance in 3D
+
+                        // Get plane parameters for distance filtering
+                        float plane_nx, plane_ny, plane_nz, plane_d;
+                        get_plane_params(current_plane, plane_offsets[current_plane], cam_yaw, cam_pitch,
+                                        cam_x, cam_y, cam_z, &plane_nx, &plane_ny, &plane_nz, &plane_d);
 
                         // LEFT click: build candidate list at pick point and choose first
                         if (event.type == SDL_MOUSEBUTTONDOWN && button == SDL_BUTTON_LEFT) {
@@ -1236,8 +1479,14 @@ int main(int argc, char *argv[]) {
                                 for (size_t ii = 0; ii < dynarray_size(sim->nodes); ++ii) {
                                     Node *nn = (Node*)dynarray_get(sim->nodes, ii);
                                     if (!nn) continue;
-                                    float dx = wx - nn->pos[0]; float dy = wy - nn->pos[1];
-                                    float d2 = dx*dx + dy*dy;
+                                    // Check distance from plane
+                                    float dist_to_plane = point_plane_distance(nn->pos[0], nn->pos[1], nn->pos[2],
+                                                                               plane_nx, plane_ny, plane_nz, plane_d);
+                                    if (dist_to_plane > selection_distance_threshold) continue;
+                                    
+                                    // Check distance from pick position (2D screen space approximation)
+                                    float dx = wx - nn->pos[0]; float dy = wy - nn->pos[1]; float dz = wz - nn->pos[2];
+                                    float d2 = dx*dx + dy*dy + dz*dz;
                                     float r = nn->radius + pick_world;
                                     if (d2 <= r*r) {
                                         ClickCandidate *cc = malloc(sizeof(ClickCandidate)); cc->type = SEL_NODE; cc->obj = nn; dynarray_append(last_candidates, cc);
@@ -1250,6 +1499,13 @@ int main(int argc, char *argv[]) {
                                     if (!c) continue;
                                     if (c->type == CT_DIST || c->type == CT_SPRING) {
                                         if (!c->node || !c->other) continue;
+                                        // Check if constraint endpoints are near plane
+                                        float dist1 = point_plane_distance(c->node->pos[0], c->node->pos[1], c->node->pos[2],
+                                                                          plane_nx, plane_ny, plane_nz, plane_d);
+                                        float dist2 = point_plane_distance(c->other->pos[0], c->other->pos[1], c->other->pos[2],
+                                                                          plane_nx, plane_ny, plane_nz, plane_d);
+                                        if (dist1 > selection_distance_threshold && dist2 > selection_distance_threshold) continue;
+                                        
                                         float d2 = point_segment_distance2(wx, wy, c->node->pos[0], c->node->pos[1], c->other->pos[0], c->other->pos[1]);
                                         if (d2 <= pick_world * pick_world) {
                                             ClickCandidate *cc = malloc(sizeof(ClickCandidate)); cc->type = SEL_CONSTRAINT; cc->obj = c; dynarray_append(last_candidates, cc);
@@ -1261,6 +1517,13 @@ int main(int argc, char *argv[]) {
                                 for (size_t ii = 0; ii < dynarray_size(sim->walls); ++ii) {
                                     TriangleWall *w = (TriangleWall*)dynarray_get(sim->walls, ii);
                                     if (!w || !w->A || !w->B) continue;
+                                    // Check if wall endpoints are near plane
+                                    float dist1 = point_plane_distance(w->A->pos[0], w->A->pos[1], w->A->pos[2],
+                                                                       plane_nx, plane_ny, plane_nz, plane_d);
+                                    float dist2 = point_plane_distance(w->B->pos[0], w->B->pos[1], w->B->pos[2],
+                                                                       plane_nx, plane_ny, plane_nz, plane_d);
+                                    if (dist1 > selection_distance_threshold && dist2 > selection_distance_threshold) continue;
+                                    
                                     float d2 = point_segment_distance2(wx, wy, w->A->pos[0], w->A->pos[1], w->B->pos[0], w->B->pos[1]);
                                     if (d2 <= pick_world * pick_world) {
                                         ClickCandidate *cc = malloc(sizeof(ClickCandidate)); cc->type = SEL_WALL; cc->obj = w; dynarray_append(last_candidates, cc);
@@ -1280,7 +1543,7 @@ int main(int argc, char *argv[]) {
                                     create_select_menu_if_needed(&edata);
                                 } else {
                                     // keep selection; update pick so drag has a target
-                                    pick_wx = wx; pick_wy = wy; pick_active = 1;
+                                    pick_wx = wx; pick_wy = wy; pick_wz = wz; pick_active = 1;
                                 }
                             } else {
                                 // pick first candidate and set selection/filter
@@ -1421,41 +1684,84 @@ int main(int argc, char *argv[]) {
                     rect_x1 = mx; rect_y1 = my;
                 }
                 // update pick position while moving mouse (show where selection will search)
-                if (!menu_handled && (*(edata.current_tool) == TOOL_SELECT)) {
-                    // keep consistent with the screen->world conversion used above
-                    // TODO: proper 3D raycasting for pick position
-                    pick_wx = (float)mx;
-                    pick_wy = (float)my;
-                    pick_active = 1;
+                if (!menu_handled && (*(edata.current_tool) == TOOL_SELECT || *(edata.current_tool) == TOOL_ADD_NODE ||
+                                      *(edata.current_tool) == TOOL_ADD_DIST || *(edata.current_tool) == TOOL_ADD_SPRING ||
+                                      *(edata.current_tool) == TOOL_ADD_WALL)) {
+                    // Use ray-plane intersection for accurate 3D position
+                    float wx = 0.0f, wy = 0.0f, wz = 0.0f;
+                    int hit = screen_to_world_plane(mx, my, win_w, win_h,
+                                                    cam_x, cam_y, cam_z, cam_yaw, cam_pitch,
+                                                    current_plane, plane_offsets[current_plane],
+                                                    &wx, &wy, &wz);
+                    if (hit) {
+                        pick_wx = wx;
+                        pick_wy = wy;
+                        pick_wz = wz;
+                        pick_active = 1;
+                    }
                 }
                 // Force-drag is applied continuously in the per-frame update (see below).
             }
 
-            // Camera controls: WASD for movement, space+drag to rotate, scroll for zoom/speed
+            // Camera controls: WASD for movement, SHIFT for up, CTRL for down, space+drag to rotate, scroll for zoom/speed
             if (event.type == SDL_KEYDOWN) {
                 if (event.key.keysym.sym == SDLK_SPACE) space_down = 1;
                 else if (event.key.keysym.sym == SDLK_w) key_w = 1;
                 else if (event.key.keysym.sym == SDLK_a) key_a = 1;
                 else if (event.key.keysym.sym == SDLK_s) key_s = 1;
                 else if (event.key.keysym.sym == SDLK_d) key_d = 1;
-                else if (event.key.keysym.sym == SDLK_d) key_d = 1;
-                // Selection candidate cycling using left/right arrows
-                else if ((event.key.keysym.sym == SDLK_LEFT || event.key.keysym.sym == SDLK_RIGHT) && current_tool == TOOL_SELECT && last_candidates && dynarray_size(last_candidates) > 0) {
-                    int dir = (event.key.keysym.sym == SDLK_RIGHT) ? 1 : -1;
-                    int count = (int)dynarray_size(last_candidates);
-                    int ni = (last_candidate_index + dir) % count;
-                    if (ni < 0) ni += count;
-                    last_candidate_index = ni;
-                    // select the new candidate
-                    ClickCandidate *cc = (ClickCandidate*)dynarray_get(last_candidates, (size_t)last_candidate_index);
-                    if (cc) {
-                        selection->size = 0;
-                        if (cc->type == SEL_NODE) { sel_filter = SEL_NODE; dynarray_append(selection, cc->obj); }
-                        else if (cc->type == SEL_CONSTRAINT) { sel_filter = SEL_CONSTRAINT; dynarray_append(selection, cc->obj); }
-                        else if (cc->type == SEL_WALL) { sel_filter = SEL_WALL; dynarray_append(selection, cc->obj); }
-                        // refresh selection menu rows
-                        destroy_select_menu_if_present(&edata);
-                        create_select_menu_if_needed(&edata);
+                else if (event.key.keysym.sym == SDLK_LSHIFT || event.key.keysym.sym == SDLK_RSHIFT) key_shift = 1;
+                else if (event.key.keysym.sym == SDLK_LCTRL || event.key.keysym.sym == SDLK_RCTRL) key_ctrl = 1;
+                // Plane selection with up/down arrows
+                else if (event.key.keysym.sym == SDLK_UP) {
+                    current_plane = (current_plane + 1) % 6;
+                }
+                else if (event.key.keysym.sym == SDLK_DOWN) {
+                    current_plane = (current_plane - 1 + 6) % 6;
+                }
+                // Plane offset adjustment with left/right arrows (unless in select tool with candidates)
+                else if (event.key.keysym.sym == SDLK_LEFT) {
+                    if (current_tool == TOOL_SELECT && last_candidates && dynarray_size(last_candidates) > 0) {
+                        // Selection candidate cycling
+                        int dir = -1;
+                        int count = (int)dynarray_size(last_candidates);
+                        int ni = (last_candidate_index + dir) % count;
+                        if (ni < 0) ni += count;
+                        last_candidate_index = ni;
+                        ClickCandidate *cc = (ClickCandidate*)dynarray_get(last_candidates, (size_t)last_candidate_index);
+                        if (cc) {
+                            selection->size = 0;
+                            if (cc->type == SEL_NODE) { sel_filter = SEL_NODE; dynarray_append(selection, cc->obj); }
+                            else if (cc->type == SEL_CONSTRAINT) { sel_filter = SEL_CONSTRAINT; dynarray_append(selection, cc->obj); }
+                            else if (cc->type == SEL_WALL) { sel_filter = SEL_WALL; dynarray_append(selection, cc->obj); }
+                            destroy_select_menu_if_present(&edata);
+                            create_select_menu_if_needed(&edata);
+                        }
+                    } else {
+                        // Adjust plane offset
+                        plane_offsets[current_plane] -= plane_offset_step;
+                    }
+                }
+                else if (event.key.keysym.sym == SDLK_RIGHT) {
+                    if (current_tool == TOOL_SELECT && last_candidates && dynarray_size(last_candidates) > 0) {
+                        // Selection candidate cycling
+                        int dir = 1;
+                        int count = (int)dynarray_size(last_candidates);
+                        int ni = (last_candidate_index + dir) % count;
+                        if (ni < 0) ni += count;
+                        last_candidate_index = ni;
+                        ClickCandidate *cc = (ClickCandidate*)dynarray_get(last_candidates, (size_t)last_candidate_index);
+                        if (cc) {
+                            selection->size = 0;
+                            if (cc->type == SEL_NODE) { sel_filter = SEL_NODE; dynarray_append(selection, cc->obj); }
+                            else if (cc->type == SEL_CONSTRAINT) { sel_filter = SEL_CONSTRAINT; dynarray_append(selection, cc->obj); }
+                            else if (cc->type == SEL_WALL) { sel_filter = SEL_WALL; dynarray_append(selection, cc->obj); }
+                            destroy_select_menu_if_present(&edata);
+                            create_select_menu_if_needed(&edata);
+                        }
+                    } else {
+                        // Adjust plane offset
+                        plane_offsets[current_plane] += plane_offset_step;
                     }
                 }
             } else if (event.type == SDL_KEYUP) {
@@ -1464,6 +1770,8 @@ int main(int argc, char *argv[]) {
                 else if (event.key.keysym.sym == SDLK_a) key_a = 0;
                 else if (event.key.keysym.sym == SDLK_s) key_s = 0;
                 else if (event.key.keysym.sym == SDLK_d) key_d = 0;
+                else if (event.key.keysym.sym == SDLK_LSHIFT || event.key.keysym.sym == SDLK_RSHIFT) key_shift = 0;
+                else if (event.key.keysym.sym == SDLK_LCTRL || event.key.keysym.sym == SDLK_RCTRL) key_ctrl = 0;
             } else if (event.type == SDL_MOUSEWHEEL) {
                 // Scroll to adjust zoom (affects movement speed)
                 float zoom_factor = 1.1f;
@@ -1499,22 +1807,25 @@ int main(int argc, char *argv[]) {
         // update window size in case of resize
         SDL_GetWindowSize(window, &win_w, &win_h);
 
-        // Update camera position based on WASD keys
+        // Update camera position based on WASD keys, SHIFT for up, CTRL for down
         float dt_cam = sim->dt; // use simulation timestep for camera movement
         float move_speed = cam_speed * cam_zoom * dt_cam;
-        if (key_w || key_a || key_s || key_d) {
-            // Compute forward and right vectors from yaw (standard FPS movement on horizontal plane)
-            // Forward is the direction the camera is facing (yaw rotation around Y axis)
-            float forward_x = -sinf(cam_yaw);  // negative because OpenGL Z points toward viewer
-            float forward_z = -cosf(cam_yaw);
-            // Right is perpendicular to forward (90 degrees clockwise from forward)
+        if (key_w || key_a || key_s || key_d || key_shift || key_ctrl) {
+            // Compute forward and right vectors from yaw and pitch (full 3D camera movement)
+            // Forward is the direction the camera is looking (including vertical component)
+            float forward_x = -sinf(cam_yaw) * cosf(cam_pitch);
+            float forward_y = sinf(cam_pitch);
+            float forward_z = -cosf(cam_yaw) * cosf(cam_pitch);
+            // Right is perpendicular to forward in the horizontal plane (ignores pitch)
             float right_x = cosf(cam_yaw);
             float right_z = -sinf(cam_yaw);
             
-            if (key_w) { cam_x += forward_x * move_speed; cam_z += forward_z * move_speed; }
-            if (key_s) { cam_x -= forward_x * move_speed; cam_z -= forward_z * move_speed; }
+            if (key_w) { cam_x += forward_x * move_speed; cam_y += forward_y * move_speed; cam_z += forward_z * move_speed; }
+            if (key_s) { cam_x -= forward_x * move_speed; cam_y -= forward_y * move_speed; cam_z -= forward_z * move_speed; }
             if (key_a) { cam_x -= right_x * move_speed; cam_z -= right_z * move_speed; }
             if (key_d) { cam_x += right_x * move_speed; cam_z += right_z * move_speed; }
+            if (key_shift) { cam_y += move_speed; } // Move up
+            if (key_ctrl) { cam_y -= move_speed; }  // Move down
         }
 
         // Rendering with 3D perspective
@@ -1561,21 +1872,23 @@ int main(int argc, char *argv[]) {
             for (size_t si = 0; si < dynarray_size(selection); ++si) {
                 Node *n = (Node*)dynarray_get(selection, si);
                 if (!n) continue;
-                // Error vector: direction and distance to target
+                // Error vector: direction and distance to target (3D)
                 float rx = pick_wx - n->pos[0];
                 float ry = pick_wy - n->pos[1];
-                float dist2 = rx*rx + ry*ry;
+                float rz = pick_wz - n->pos[2];
+                float dist2 = rx*rx + ry*ry + rz*rz;
                 if (dist2 < 1e-8f) continue;
                 
                 float dist = sqrtf(dist2);
                 float ux = rx / dist;
                 float uy = ry / dist;
+                float uz = rz / dist;
                 
                 // Proportional term: spring-like force based on distance
                 float force_p = K_p * dist;
                 // Derivative term: damping based on velocity toward target
                 // Project velocity onto the direction toward target
-                float vel_dot_u = n->vel[0] * ux + n->vel[1] * uy;
+                float vel_dot_u = n->vel[0] * ux + n->vel[1] * uy + n->vel[2] * uz;
                 float force_d = K_d * vel_dot_u;  // opposes motion toward/away from target
                 
                 // Combined force magnitude
@@ -1588,16 +1901,20 @@ int main(int argc, char *argv[]) {
                 // Apply force in target direction
                 float fx = force_mag * ux;
                 float fy = force_mag * uy;
+                float fz = force_mag * uz;
                 
                 float mass = fmaxf(n->mass, 1e-6f);
-                float dvx = (fx) * sim->dt;
-                float dvy = (fy ) * sim->dt;
+                float dvx = fx * sim->dt;
+                float dvy = fy * sim->dt;
+                float dvz = fz * sim->dt;
 
                 n->vel[0] *= 0.99f;
                 n->vel[1] *= 0.99f;
+                n->vel[2] *= 0.99f;
 
                 n->vel[0] += dvx;
                 n->vel[1] += dvy;
+                n->vel[2] += dvz;
             }
         }
         if (!paused) {
@@ -1632,7 +1949,14 @@ int main(int argc, char *argv[]) {
             glLineWidth(1.0f);
         }
 
-        simulator_draw(sim);
+        // Draw selection/placement plane grid (translucent) after reference grid
+        if (current_tool == TOOL_SELECT || current_tool == TOOL_ADD_NODE || 
+            current_tool == TOOL_ADD_DIST || current_tool == TOOL_ADD_SPRING || current_tool == TOOL_ADD_WALL) {
+            render_plane_grid(current_plane, plane_offsets[current_plane], cam_yaw, cam_pitch,
+                             cam_x, cam_y, cam_z, 400.0f, (float)grid_cell_size);
+        }
+
+        simulator_draw(sim, cam_yaw, cam_pitch);
         // draw selection highlights (in world coordinates, 3D)
         if (dynarray_size(selection) > 0) {
             glColor3f(0.0f, 1.0f, 0.0f);
@@ -1659,6 +1983,40 @@ int main(int argc, char *argv[]) {
             }
             glEnd();
         }
+        
+        // Draw pale blue camera-facing circle at pick position (drag target indicator)
+        if (pick_active && (current_tool == TOOL_SELECT || current_tool == TOOL_ADD_NODE ||
+                           current_tool == TOOL_ADD_DIST || current_tool == TOOL_ADD_SPRING ||
+                           current_tool == TOOL_ADD_WALL)) {
+            glEnable(GL_BLEND);
+            glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+            glColor4f(0.5f, 0.7f, 1.0f, 0.6f); // pale blue, translucent
+            
+            float pick_radius = 8.0f;
+            
+            // Create camera-facing billboard at pick position
+            // Get camera right and up vectors
+            float right_x = cosf(cam_yaw);
+            float right_y = 0.0f;
+            float right_z = -sinf(cam_yaw);
+            
+            float up_x = sinf(cam_yaw) * sinf(cam_pitch);
+            float up_y = cosf(cam_pitch);
+            float up_z = cosf(cam_yaw) * sinf(cam_pitch);
+            
+            glBegin(GL_TRIANGLE_FAN);
+            glVertex3f(pick_wx, pick_wy, pick_wz); // center
+            for (int k = 0; k <= 20; ++k) {
+                float theta = 2.0f * 3.14159265f * (float)k / 20.0f;
+                float offset_x = pick_radius * (cosf(theta) * right_x + sinf(theta) * up_x);
+                float offset_y = pick_radius * (cosf(theta) * right_y + sinf(theta) * up_y);
+                float offset_z = pick_radius * (cosf(theta) * right_z + sinf(theta) * up_z);
+                glVertex3f(pick_wx + offset_x, pick_wy + offset_y, pick_wz + offset_z);
+            }
+            glEnd();
+            glDisable(GL_BLEND);
+        }
+        
         glPopMatrix();
 
         // restore projection/modelview
@@ -1666,6 +2024,16 @@ int main(int argc, char *argv[]) {
         glMatrixMode(GL_PROJECTION);
         glPopMatrix();
         glMatrixMode(GL_MODELVIEW);
+
+        // Disable depth test and set up 2D orthographic projection for UI
+        glDisable(GL_DEPTH_TEST);
+        glMatrixMode(GL_PROJECTION);
+        glPushMatrix();
+        glLoadIdentity();
+        glOrtho(0, win_w, win_h, 0, -1, 1);
+        glMatrixMode(GL_MODELVIEW);
+        glPushMatrix();
+        glLoadIdentity();
 
         // Render menu UI (draw all registered menus)
         for (size_t mi = 0; mi < menus->size; ++mi) {
@@ -1704,6 +2072,17 @@ int main(int argc, char *argv[]) {
             int ty = win_h - pad - th;
             Color white = {255,255,255,255};
             menu_draw_text_at(fps_text, tx, ty, white);
+        }
+        
+        // Draw plane info in top-left when in placement/selection modes
+        if (current_tool == TOOL_SELECT || current_tool == TOOL_ADD_NODE || 
+            current_tool == TOOL_ADD_DIST || current_tool == TOOL_ADD_SPRING || current_tool == TOOL_ADD_WALL) {
+            const char* plane_names[] = {"World X", "World Y", "World Z", "Camera X", "Camera Y", "Camera Z"};
+            char plane_text[128];
+            snprintf(plane_text, sizeof(plane_text), "Plane: %s (offset: %.1f)\nUp/Down: change plane | Left/Right: adjust offset", 
+                    plane_names[current_plane], plane_offsets[current_plane]);
+            Color cyan = {100,200,255,255};
+            menu_draw_text_at(plane_text, 8, 8, cyan);
         }
         
         // Pop 2D UI matrices

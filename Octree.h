@@ -14,11 +14,17 @@ typedef struct {
     float max[3];
 } AABB;
 
+// Node entry that stores both index and position for redistribution
+typedef struct {
+    int node_idx;
+    float pos[3];
+} NodeEntry;
+
 // Octree node for spatial partitioning
 struct OctreeNode {
     AABB bounds;
     OctreeNode *children[8];  // NULL if leaf
-    DynArray *node_indices;   // Indices of Nodes in this cell (leaf only)
+    DynArray *node_entries;   // NodeEntry* in this cell (leaf only)
     DynArray *triangle_indices; // Indices of TriangleWalls stored at this level
     int depth;
     int is_leaf;
@@ -40,6 +46,15 @@ int octree_insert_triangle(OctreeNode *root, int tri_idx,
 // Query triangles that could collide with a point at given position.
 // Returns a DynArray* of int* (triangle indices). Caller must free.
 DynArray* octree_query_triangles(OctreeNode *root, float pos[3]);
+
+// Query nodes in the leaf cell containing the given position.
+// Returns a DynArray* of int* (node indices). Caller must free.
+DynArray* octree_query_nodes(OctreeNode *root, float pos[3]);
+
+// Find the closest node to a given position within max_distance.
+// Returns node index or -1 if none found.
+int octree_find_closest_node(OctreeNode *root, Node **all_nodes, size_t num_nodes,
+                             float pos[3], float max_distance);
 
 // Clear all node and triangle indices from the octree (for rebuilding)
 void octree_clear(OctreeNode *root);

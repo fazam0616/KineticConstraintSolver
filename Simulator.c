@@ -340,6 +340,13 @@ static void compute_triangle_collision_forces(Simulator *s, float *collision_for
         octree_insert_triangle(s->octree, (int)wi, w->A->pos, w->B->pos, w->C->pos);
     }
     
+    // Insert all nodes into octree for spatial queries
+    for (size_t ni = 0; ni < n_nodes; ++ni) {
+        Node *node = (Node*)dynarray_get(s->nodes, ni);
+        if (!node) continue;
+        octree_insert_node(s->octree, (int)ni, node->pos);
+    }
+    
     // Check each node against candidate triangles from octree
     for (size_t ni = 0; ni < n_nodes; ++ni) {
         Node *node = (Node*)dynarray_get(s->nodes, ni);
@@ -684,23 +691,34 @@ void simulator_step(Simulator *s) {
     if (corr_f) free(corr_f);
 
 }
-void simulator_draw(Simulator *s) {
+void simulator_draw(Simulator *s, float cam_yaw, float cam_pitch) {
     if (!s) return;
     // draw constraints
     for (size_t i = 0; i < dynarray_size(s->constraints); ++i) {
         Constraint *c = (Constraint*)dynarray_get(s->constraints, i);
         if (c && c->draw) c->draw(c);
     }
-    // draw triangle walls (all 3 edges as black lines in full 3D)
+    // draw triangle walls as filled white triangles with black outline in full 3D
     for (size_t i = 0; i < dynarray_size(s->walls); ++i) {
         TriangleWall *w = (TriangleWall*)dynarray_get(s->walls, i);
         if (!w || !w->A || !w->B || !w->C) continue;
+        
+        // Draw filled white triangle
+        glColor3f(1.0f, 1.0f, 1.0f);
+        glBegin(GL_TRIANGLES);
+        glVertex3f(w->A->pos[0], w->A->pos[1], w->A->pos[2]);
+        glVertex3f(w->B->pos[0], w->B->pos[1], w->B->pos[2]);
+        glVertex3f(w->C->pos[0], w->C->pos[1], w->C->pos[2]);
+        glEnd();
+        
+        // Draw black outline
         glColor3f(0.0f, 0.0f, 0.0f);
         glBegin(GL_LINE_LOOP);
         glVertex3f(w->A->pos[0], w->A->pos[1], w->A->pos[2]);
         glVertex3f(w->B->pos[0], w->B->pos[1], w->B->pos[2]);
         glVertex3f(w->C->pos[0], w->C->pos[1], w->C->pos[2]);
         glEnd();
+        
         // draw vertices as small black dots
         glPointSize(4.0f);
         glBegin(GL_POINTS);
@@ -714,8 +732,27 @@ void simulator_draw(Simulator *s) {
     for (size_t i = 0; i < dynarray_size(s->nodes); ++i) {
         Node *n = (Node*)dynarray_get(s->nodes, i);
         if (!n) continue;
-        node_draw(n, n->radius);
+        node_draw(n, n->radius, cam_yaw, cam_pitch);
     }
+}
+
+// Find the closest node to a given position within max_distance
+int simulator_find_closest_node(Simulator *s, float pos[3], float max_distance) {
+    if (!s || !s->octree || !s->nodes) return -1;
+    
+    size_t n_nodes = dynarray_size(s->nodes);
+    if (n_nodes == 0) return -1;
+    
+    // Convert DynArray to array of Node pointers
+    Node **node_array = (Node**)malloc(sizeof(Node*) * n_nodes);
+    for (size_t i = 0; i < n_nodes; ++i) {
+        node_array[i] = (Node*)dynarray_get(s->nodes, i);
+    }
+    
+    int result = octree_find_closest_node(s->octree, node_array, n_nodes, pos, max_distance);
+    
+    free(node_array);
+    return result;
 }
 
 // Triangle struct for mesh output
