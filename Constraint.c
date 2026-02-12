@@ -14,7 +14,7 @@
 
 // Helper: zero out dense row
 static void zero_row(float *out, size_t n_nodes) {
-    size_t n = n_nodes * 2;
+    size_t n = n_nodes * 3;
     for (size_t i = 0; i < n; ++i) out[i] = 0.0f;
 }
 
@@ -31,7 +31,8 @@ static float dist_err(Constraint *self) {
     DistConstraintImpl *d = (DistConstraintImpl*)self;
     float dx = d->base.node->pos[0] - d->other->pos[0];
     float dy = d->base.node->pos[1] - d->other->pos[1];
-    float dist = sqrtf(dx*dx + dy*dy);
+    float dz = d->base.node->pos[2] - d->other->pos[2];
+    float dist = sqrtf(dx*dx + dy*dy + dz*dz);
     return dist - d->base.rest_length;
 }
 
@@ -40,18 +41,21 @@ static void dist_dc_node(Constraint *self, Node **nodes, size_t n_nodes, float *
     zero_row(out_row, n_nodes);
     float dx = d->other->pos[0] - d->base.node->pos[0];
     float dy = d->other->pos[1] - d->base.node->pos[1];
-    float norm = sqrtf(dx*dx + dy*dy);
-    float nx = 0.0f, ny = 0.0f;
-    if (norm > 1e-9f) { nx = dx / norm; ny = dy / norm; }
+    float dz = d->other->pos[2] - d->base.node->pos[2];
+    float norm = sqrtf(dx*dx + dy*dy + dz*dz);
+    float nx = 0.0f, ny = 0.0f, nz = 0.0f;
+    if (norm > 1e-9f) { nx = dx / norm; ny = dy / norm; nz = dz / norm; }
     int ni = d->base.node ? d->base.node->idx : -1;
     int oi = d->other ? d->other->idx : -1;
     if (ni >= 0) {
-        out_row[2 * ni + 0] = nx;
-        out_row[2 * ni + 1] = ny;
+        out_row[3 * ni + 0] = nx;
+        out_row[3 * ni + 1] = ny;
+        out_row[3 * ni + 2] = nz;
     }
     if (oi >= 0 && !d->other->anchored) {
-        out_row[2 * oi + 0] = -nx;
-        out_row[2 * oi + 1] = -ny;
+        out_row[3 * oi + 0] = -nx;
+        out_row[3 * oi + 1] = -ny;
+        out_row[3 * oi + 2] = -nz;
     }
 }
 
@@ -59,24 +63,25 @@ static void dist_dc_sparse(Constraint *self, Node **nodes, size_t n_nodes, DynAr
     DistConstraintImpl *d = (DistConstraintImpl*)self;
     float dx = d->other->pos[0] - d->base.node->pos[0];
     float dy = d->other->pos[1] - d->base.node->pos[1];
-    float norm = sqrtf(dx*dx + dy*dy);
-    float nx = 0.0f, ny = 0.0f;
-    if (norm > 1e-9f) { nx = dx / norm; ny = dy / norm; }
-    typedef struct { int idx; float v[2]; } Pair;
+    float dz = d->other->pos[2] - d->base.node->pos[2];
+    float norm = sqrtf(dx*dx + dy*dy + dz*dz);
+    float nx = 0.0f, ny = 0.0f, nz = 0.0f;
+    if (norm > 1e-9f) { nx = dx / norm; ny = dy / norm; nz = dz / norm; }
+    typedef struct { int idx; float v[3]; } Pair;
     int ni = d->base.node ? d->base.node->idx : -1;
     int oi = d->other ? d->other->idx : -1;
     if (ni >= 0) {
-        Pair *p1 = malloc(sizeof(Pair)); p1->idx = ni; p1->v[0] = -nx; p1->v[1] = -ny; dynarray_append(out, p1);
+        Pair *p1 = malloc(sizeof(Pair)); p1->idx = ni; p1->v[0] = -nx; p1->v[1] = -ny; p1->v[2] = -nz; dynarray_append(out, p1);
     }
     if (oi >= 0 && !d->other->anchored) {
-        Pair *p2 = malloc(sizeof(Pair)); p2->idx = oi; p2->v[0] = nx; p2->v[1] = ny; dynarray_append(out, p2);
+        Pair *p2 = malloc(sizeof(Pair)); p2->idx = oi; p2->v[0] = nx; p2->v[1] = ny; p2->v[2] = nz; dynarray_append(out, p2);
     }
 }
 
 // AnchorConstraint implementation (uses a position instead of another Node)
 typedef struct {
     DistConstraintImpl base_impl;
-    float anchor_pos[2];
+    float anchor_pos[3];
 } AnchorImpl;
 
 static void anchor_dc_node(Constraint *self, Node **nodes, size_t n_nodes, float *out_row) {
@@ -86,13 +91,15 @@ static void anchor_dc_node(Constraint *self, Node **nodes, size_t n_nodes, float
     if (!node) return;
     float dx = a->anchor_pos[0] - node->pos[0];
     float dy = a->anchor_pos[1] - node->pos[1];
-    float norm = sqrtf(dx*dx + dy*dy);
-    float nx = 0.0f, ny = 0.0f;
-    if (norm > 1e-9f) { nx = dx / norm; ny = dy / norm; }
+    float dz = a->anchor_pos[2] - node->pos[2];
+    float norm = sqrtf(dx*dx + dy*dy + dz*dz);
+    float nx = 0.0f, ny = 0.0f, nz = 0.0f;
+    if (norm > 1e-9f) { nx = dx / norm; ny = dy / norm; nz = dz / norm; }
     int idx = a->base_impl.node_idx;
     if (idx >= 0) {
-        out_row[2*idx + 0] = nx;
-        out_row[2*idx + 1] = ny;
+        out_row[3*idx + 0] = nx;
+        out_row[3*idx + 1] = ny;
+        out_row[3*idx + 2] = nz;
     }
 }
 
@@ -102,13 +109,14 @@ static void anchor_dc_sparse(Constraint *self, Node **nodes, size_t n_nodes, Dyn
     if (!node) return;
     float dx = a->anchor_pos[0] - node->pos[0];
     float dy = a->anchor_pos[1] - node->pos[1];
-    float norm = sqrtf(dx*dx + dy*dy);
-    float nx = 0.0f, ny = 0.0f;
-    if (norm > 1e-9f) { nx = dx / norm; ny = dy / norm; }
-    typedef struct { int idx; float v[2]; } Pair;
+    float dz = a->anchor_pos[2] - node->pos[2];
+    float norm = sqrtf(dx*dx + dy*dy + dz*dz);
+    float nx = 0.0f, ny = 0.0f, nz = 0.0f;
+    if (norm > 1e-9f) { nx = dx / norm; ny = dy / norm; nz = dz / norm; }
+    typedef struct { int idx; float v[3]; } Pair;
     int idx = node ? node->idx : -1;
     if (idx >= 0) {
-        Pair *p = malloc(sizeof(Pair)); p->idx = idx; p->v[0] = nx; p->v[1] = ny; dynarray_append(out, p);
+        Pair *p = malloc(sizeof(Pair)); p->idx = idx; p->v[0] = nx; p->v[1] = ny; p->v[2] = nz; dynarray_append(out, p);
     }
 }
 
@@ -119,18 +127,21 @@ static void anchor_dc_triplet(Constraint *self, void *T, int row) {
     if (!node) return;
     float dx = a->anchor_pos[0] - node->pos[0];
     float dy = a->anchor_pos[1] - node->pos[1];
-    float norm = sqrtf(dx*dx + dy*dy);
-    double nx = 0.0, ny = 0.0;
+    float dz = a->anchor_pos[2] - node->pos[2];
+    float norm = sqrtf(dx*dx + dy*dy + dz*dz);
+    double nx = 0.0, ny = 0.0, nz = 0.0;
     if (norm > 1e-9f) { 
         float inv_n = 1.0f / norm;
-        nx = (double)(dx * inv_n); ny = (double)(dy * inv_n);
+        nx = (double)(dx * inv_n); ny = (double)(dy * inv_n); nz = (double)(dz * inv_n);
     }
-    int idx = node ? (2 * node->idx) : -1;
+    int idx = node ? (3 * node->idx) : -1;
     if (idx >= 0) {
         int c0 = idx;
         int c1 = idx + 1;
+        int c2 = idx + 2;
         cs_entry(ct, row, c0, nx);
         cs_entry(ct, row, c1, ny);
+        cs_entry(ct, row, c2, nz);
     }
 }
 
@@ -138,19 +149,20 @@ static float anchor_err(Constraint *self) {
     AnchorImpl *a = (AnchorImpl*)self;
     float dx = a->base_impl.base.node->pos[0] - a->anchor_pos[0];
     float dy = a->base_impl.base.node->pos[1] - a->anchor_pos[1];
-    return sqrtf(dx*dx + dy*dy);
+    float dz = a->base_impl.base.node->pos[2] - a->anchor_pos[2];
+    return sqrtf(dx*dx + dy*dy + dz*dz);
 }
 
 static void anchor_draw(Constraint *self) {
     AnchorImpl *a = (AnchorImpl*)self;
     glColor3f(0.8f,0.6f,0.0f);
     glBegin(GL_LINES);
-    glVertex2f(a->base_impl.base.node->pos[0], a->base_impl.base.node->pos[1]);
-    glVertex2f(a->anchor_pos[0], a->anchor_pos[1]);
+    glVertex3f(a->base_impl.base.node->pos[0], a->base_impl.base.node->pos[1], a->base_impl.base.node->pos[2]);
+    glVertex3f(a->anchor_pos[0], a->anchor_pos[1], a->anchor_pos[2]);
     glEnd();
 }
 
-Constraint* anchorconstraint_create(Node *node, float x, float y) {
+Constraint* anchorconstraint_create(Node *node, float x, float y, float z) {
     AnchorImpl *a = (AnchorImpl*)malloc(sizeof(AnchorImpl));
     memset(a,0,sizeof(*a));
     a->base_impl.base.node = node;
@@ -161,7 +173,7 @@ Constraint* anchorconstraint_create(Node *node, float x, float y) {
     a->base_impl.other = NULL;
     a->base_impl.node_idx = node ? node->idx : -1;
     a->base_impl.other_idx = -1;
-    a->anchor_pos[0] = x; a->anchor_pos[1] = y;
+    a->anchor_pos[0] = x; a->anchor_pos[1] = y; a->anchor_pos[2] = z;
     a->base_impl.base.err = anchor_err;
     a->base_impl.base.dc_node = anchor_dc_node;
     a->base_impl.base.dc_sparse = anchor_dc_sparse;
@@ -180,22 +192,27 @@ static void dist_dc_triplet(Constraint *self, void *T, int row) {
 
     float dx = d->other->pos[0] - d->base.node->pos[0];
     float dy = d->other->pos[1] - d->base.node->pos[1];
-    float norm = sqrtf(dx*dx + dy*dy);
-    double nx = 0.0, ny = 0.0;
-    if (norm > 1e-9f) { nx = (double)(dx / norm); ny = (double)(dy / norm); }
+    float dz = d->other->pos[2] - d->base.node->pos[2];
+    float norm = sqrtf(dx*dx + dy*dy + dz*dz);
+    double nx = 0.0, ny = 0.0, nz = 0.0;
+    if (norm > 1e-9f) { nx = (double)(dx / norm); ny = (double)(dy / norm); nz = (double)(dz / norm); }
     int ni = d->base.node ? d->base.node->idx : -1;
     int oi = d->other ? d->other->idx : -1;
     if (ni >= 0) {
-        int c0 = 2 * ni + 0;
-        int c1 = 2 * ni + 1;
+        int c0 = 3 * ni + 0;
+        int c1 = 3 * ni + 1;
+        int c2 = 3 * ni + 2;
         cs_entry(ct, row, c0, nx);
         cs_entry(ct, row, c1, ny);
+        cs_entry(ct, row, c2, nz);
     }
     if (oi >= 0 && !d->other->anchored) {
-        int c0 = 2 * oi + 0;
-        int c1 = 2 * oi + 1;
+        int c0 = 3 * oi + 0;
+        int c1 = 3 * oi + 1;
+        int c2 = 3 * oi + 2;
         cs_entry(ct, row, c0, -nx);
         cs_entry(ct, row, c1, -ny);
+        cs_entry(ct, row, c2, -nz);
     }
 }
 
@@ -203,8 +220,8 @@ static void dist_draw(Constraint *self) {
     DistConstraintImpl *d = (DistConstraintImpl*)self;
     glColor3f(0.0f, 0.6f, 0.0f);
     glBegin(GL_LINES);
-    glVertex2f(d->base.node->pos[0], d->base.node->pos[1]);
-    glVertex2f(d->other->pos[0], d->other->pos[1]);
+    glVertex3f(d->base.node->pos[0], d->base.node->pos[1], d->base.node->pos[2]);
+    glVertex3f(d->other->pos[0], d->other->pos[1], d->other->pos[2]);
     glEnd();
 }
 
@@ -219,7 +236,8 @@ Constraint* distconstraint_create(Node *node, Node *other, float distance) {
     if (distance <= 0.0f && node && other) {
         float dx = node->pos[0] - other->pos[0];
         float dy = node->pos[1] - other->pos[1];
-        distance = sqrtf(dx*dx + dy*dy);
+        float dz = node->pos[2] - other->pos[2];
+        distance = sqrtf(dx*dx + dy*dy + dz*dz);
     }
     d->base.rest_length = distance;
     d->other = other;
@@ -245,7 +263,8 @@ static float spring_err(Constraint *self) {
     DistConstraintImpl *d = (DistConstraintImpl*)self;
     float dx = d->base.node->pos[0] - d->other->pos[0];
     float dy = d->base.node->pos[1] - d->other->pos[1];
-    float dist = sqrtf(dx*dx + dy*dy);
+    float dz = d->base.node->pos[2] - d->other->pos[2];
+    float dist = sqrtf(dx*dx + dy*dy + dz*dz);
     return dist - d->distance;
 }
 
@@ -256,7 +275,8 @@ static void spring_draw(Constraint *self) {
     SpringImpl *sp = (SpringImpl*)self;
     float dx = d->base.node->pos[0] - d->other->pos[0];
     float dy = d->base.node->pos[1] - d->other->pos[1];
-    float dist = sqrtf(dx*dx + dy*dy);
+    float dz = d->base.node->pos[2] - d->other->pos[2];
+    float dist = sqrtf(dx*dx + dy*dy + dz*dz);
     float rest = (d->base.rest_length > 0.0f) ? d->base.rest_length : 1.0f;
     float ext = dist - rest; // positive = stretch, negative = compression
     // energy = 0.5 * k * ext^2
@@ -278,8 +298,8 @@ static void spring_draw(Constraint *self) {
     }
     glColor3f(r, g, b);
     glBegin(GL_LINES);
-    glVertex2f(d->base.node->pos[0], d->base.node->pos[1]);
-    glVertex2f(d->other->pos[0], d->other->pos[1]);
+    glVertex3f(d->base.node->pos[0], d->base.node->pos[1], d->base.node->pos[2]);
+    glVertex3f(d->other->pos[0], d->other->pos[1], d->other->pos[2]);
     glEnd();
 }
 
@@ -307,14 +327,13 @@ Constraint* springconstraint_create(Node *node, Node *other, float stiffness, fl
 
 
 
-// AnchorConstraint (implemented above)
-WallSegment* wallsegment_create(Node *A, Node *B, float restitution, float friction) {
-
-    WallSegment *w = (WallSegment*)malloc(sizeof(WallSegment));
-    w->A = A; w->B = B; w->restitution = restitution; w->friction = friction;
+// Triangle wall (3D boundary)
+TriangleWall* trianglewall_create(Node *A, Node *B, Node *C, float restitution, float friction) {
+    TriangleWall *w = (TriangleWall*)malloc(sizeof(TriangleWall));
+    w->A = A; w->B = B; w->C = C; w->restitution = restitution; w->friction = friction;
     return w;
 }
-void wallsegment_free(WallSegment *w) { free(w); }
+void trianglewall_free(TriangleWall *w) { free(w); }
 
 // Note: callers must free pairs appended by dc_sparse.
 

@@ -314,14 +314,10 @@ int menu_handle_mouse_motion(Menu *menu, int mx, int my) {
 
 void menu_render(Menu *menu, int window_w, int window_h) {
     if (!menu) return;
-    // setup 2D orthographic projection matching window pixels
-    glMatrixMode(GL_PROJECTION);
-    glPushMatrix();
-    glLoadIdentity();
-    glOrtho(0, window_w, window_h, 0, -1, 1);
-    glMatrixMode(GL_MODELVIEW);
-    glPushMatrix();
-    glLoadIdentity();
+    // Note: 2D orthographic projection is already set up by caller
+    // Just use it directly without pushing/popping
+    (void)window_w; // suppress unused warning
+    (void)window_h;
 
     // draw background
     draw_filled_rect(menu->x, menu->y, menu->width, menu->height, menu->bgColor);
@@ -335,13 +331,8 @@ void menu_render(Menu *menu, int window_w, int window_h) {
 
     // layout rows and items
     size_t rows = menu->rows->size;
-    if (rows == 0) {
-        glPopMatrix();
-        glMatrixMode(GL_PROJECTION);
-        glPopMatrix();
-        glMatrixMode(GL_MODELVIEW);
-        return;
-    }
+    if (rows == 0) return;
+    
     int avail_h = menu->height - title_h;
     for (size_t r = 0; r < rows; ++r) {
         MenuRow *row = (MenuRow*)menu->rows->items[r];
@@ -405,12 +396,6 @@ void menu_render(Menu *menu, int window_w, int window_h) {
             }
         }
     }
-
-    // restore matrices
-    glPopMatrix();
-    glMatrixMode(GL_PROJECTION);
-    glPopMatrix();
-    glMatrixMode(GL_MODELVIEW);
 }
 
 

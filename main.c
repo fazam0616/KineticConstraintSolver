@@ -247,7 +247,7 @@ static void create_select_menu_if_needed(EditData *ed) {
         menu_add_row(m, r_delw);
 
         if (ed && ed->selection && dynarray_size(ed->selection) == 1) {
-            WallSegment *w = (WallSegment*)dynarray_get(ed->selection, 0);
+            TriangleWall *w = (TriangleWall*)dynarray_get(ed->selection, 0);
             if (w) {
                 MenuRow *r_wf = menurow_create();
                 double *wf = malloc(sizeof(double)); *wf = w->friction;
@@ -520,7 +520,7 @@ static void sel_cb_toggle_anchor(VariableInteraction *vi, void *user_data) {
             Node *n = (Node*)dynarray_get(ed->selection, i);
             if (!n) continue;
             if (!n->anchored) {
-                Constraint *ac = anchorconstraint_create(n, n->pos[0], n->pos[1]);
+                Constraint *ac = anchorconstraint_create(n, n->pos[0], n->pos[1], n->pos[2]);
                 if (ac && ed->sim) simulator_add_constraint(ed->sim, ac);
                 // anchorconstraint_create already sets n->anchored = true
             }
@@ -679,12 +679,12 @@ static void sel_cb_delete_selection(VariableInteraction *vi, void *user_data) {
         create_select_menu_if_needed(ed);
     } else if (f == SEL_WALL) {
         for (size_t si = 0; si < dynarray_size(ed->selection); ++si) {
-            WallSegment *w = (WallSegment*)dynarray_get(ed->selection, si);
+            TriangleWall *w = (TriangleWall*)dynarray_get(ed->selection, si);
             if (!w) continue;
             DynArray *ws = ed->sim->walls;
             for (ssize_t wi = (ssize_t)dynarray_size(ws) - 1; wi >= 0; --wi) {
-                if ((WallSegment*)dynarray_get(ws, (size_t)wi) == w) {
-                    wallsegment_free(w);
+                if ((TriangleWall*)dynarray_get(ws, (size_t)wi) == w) {
+                    trianglewall_free(w);
                     for (size_t j = (size_t)wi; j + 1 < ws->size; ++j) ws->items[j] = ws->items[j+1];
                     ws->size -= 1; break;
                 }
@@ -800,12 +800,17 @@ int main(int argc, char *argv[]) {
     int fps_frames = 0;
     int fps_value = 0;
 
-    // Camera for pan/zoom
-    float cam_x = 0.0f, cam_y = 0.0f;
-    float cam_scale = 1.0f;
+    // 3D Camera: position, orientation (yaw=horizontal, pitch=vertical), and movement speed
+    float cam_x = 0.0f, cam_y = 0.0f, cam_z = 500.0f;  // start 500 units back from origin
+    float cam_yaw = 0.0f;   // horizontal rotation (radians) - looking forward
+    float cam_pitch = 0.0f; // vertical rotation (radians) - looking straight ahead
+    float cam_speed = 50.0f; // units per second for WASD movement
+    float cam_zoom = 1.0f;   // multiplier for movement speed
     int space_down = 0;
-    int panning = 0;
-    int pan_last_x = 0, pan_last_y = 0;
+    int rotating_camera = 0;
+    int rotate_last_x = 0, rotate_last_y = 0;
+    // WASD key states
+    int key_w = 0, key_a = 0, key_s = 0, key_d = 0;
 
     // --- Initial scenario: Box in Sleeve ---
     Simulator *sim = simulator_create(1.0f/20.0f);
@@ -865,13 +870,13 @@ int main(int argc, char *argv[]) {
     int current_tool = TOOL_NONE;
     int tool_select = 0, tool_node = 0, tool_dist = 0, tool_spring = 0, tool_wall = 0;
     // Selection state
-    DynArray *selection = dynarray_create(8); // holds Node* / Constraint* / WallSegment*
+    DynArray *selection = dynarray_create(8); // holds Node* / Constraint* / TriangleWall*
     int sel_filter = SEL_NONE;
     int selection_dragging = 0; // dragging selected objects
     int rect_select_active = 0; // right-button rectangle select active
     int rect_x0 = 0, rect_y0 = 0, rect_x1 = 0, rect_y1 = 0;
     // Last mouse position used for selection dragging (world-space). Using world coords
-    // avoids errors if cam_scale or cam_x/cam_y change during a drag.
+    // TODO: implement proper 3D ray-picking for mouse interactions
     float sel_last_wx = 0.0f, sel_last_wy = 0.0f;
     // last pick position (world coords) used for rendering the pick cursor
     float pick_wx = 0.0f, pick_wy = 0.0f;
@@ -911,7 +916,7 @@ int main(int argc, char *argv[]) {
         const float cx = 0.0f, cy = 220.0f, R = 100.0f;
         for (int i = 0; i < n; ++i) {
             float a = (float)i * 2.0f * 3.14159265f / (float)n;
-            Node *pn = node_create(-1, 1.0f, cx + R * cosf(a), cy + R * sinf(a));
+            Node *pn = node_create(-1, 1.0f, cx + R * cosf(a), cy + R * sinf(a), 0.0f);
             pn->mass = 150.0f;
             // do not add to simulator; pass as polygon vertices
             dynarray_append(poly, pn);
@@ -937,10 +942,10 @@ int main(int argc, char *argv[]) {
     int ni = 0;
 
     // Box corners (friction = 0)
-    nodes_arr[ni] = node_create(-1, 1.0f, -half + offset, -half); nodes_arr[ni]->friction = 0.0f; simulator_add_node(sim, nodes_arr[ni++]);
-    nodes_arr[ni] = node_create(-1, 1.0f,  half + offset, -half); nodes_arr[ni]->friction = 0.0f; simulator_add_node(sim, nodes_arr[ni++]);
-    nodes_arr[ni] = node_create(-1, 1.0f,  half + offset,  half); nodes_arr[ni]->friction = 0.0f; simulator_add_node(sim, nodes_arr[ni++]);
-    nodes_arr[ni] = node_create(-1, 1.0f, -half + offset,  half); nodes_arr[ni]->friction = 0.0f; simulator_add_node(sim, nodes_arr[ni++]);
+    nodes_arr[ni] = node_create(-1, 1.0f, -half + offset, -half, 0.0f); nodes_arr[ni]->friction = 0.0f; simulator_add_node(sim, nodes_arr[ni++]);
+    nodes_arr[ni] = node_create(-1, 1.0f,  half + offset, -half, 0.0f); nodes_arr[ni]->friction = 0.0f; simulator_add_node(sim, nodes_arr[ni++]);
+    nodes_arr[ni] = node_create(-1, 1.0f,  half + offset,  half, 0.0f); nodes_arr[ni]->friction = 0.0f; simulator_add_node(sim, nodes_arr[ni++]);
+    nodes_arr[ni] = node_create(-1, 1.0f, -half + offset,  half, 0.0f); nodes_arr[ni]->friction = 0.0f; simulator_add_node(sim, nodes_arr[ni++]);
 
     // Sleeve top and bottom panels (anchored walls)
     float sleeve_y = half + 5;
@@ -948,21 +953,37 @@ int main(int argc, char *argv[]) {
     float sleeve_left = -sleeve_length * 0.5f;
     float sleeve_right =  sleeve_length * 0.5f;
 
-    nodes_arr[ni] = node_create(-1, 1.0f, sleeve_left + offset,  sleeve_y); simulator_add_node(sim, nodes_arr[ni++]);
-    nodes_arr[ni] = node_create(-1, 1.0f, sleeve_right + offset, sleeve_y); simulator_add_node(sim, nodes_arr[ni++]);
-    WallSegment *wtop = wallsegment_create(nodes_arr[4], nodes_arr[5], 1.0f, 0.0f); simulator_add_wall(sim, wtop);
+    nodes_arr[ni] = node_create(-1, 1.0f, sleeve_left + offset,  sleeve_y, 0.0f); simulator_add_node(sim, nodes_arr[ni++]);
+    nodes_arr[ni] = node_create(-1, 1.0f, sleeve_right + offset, sleeve_y, 0.0f); simulator_add_node(sim, nodes_arr[ni++]);
+    // Create triangle wall for top boundary (A, B, C where C is midpoint offset in z)
+    Node *wtop_c = node_create(-1, 0.0f, 
+        (nodes_arr[4]->pos[0] + nodes_arr[5]->pos[0]) * 0.5f,
+        (nodes_arr[4]->pos[1] + nodes_arr[5]->pos[1]) * 0.5f,
+        10.0f);  // offset in z
+    wtop_c->anchored = true; wtop_c->collide_with_walls = false;
+    simulator_add_node(sim, wtop_c);
+    TriangleWall *wtop = trianglewall_create(nodes_arr[4], nodes_arr[5], wtop_c, 1.0f, 0.0f); 
+    simulator_add_wall(sim, wtop);
 
-    nodes_arr[ni] = node_create(-1, 1.0f, sleeve_left + offset, -sleeve_y); simulator_add_node(sim, nodes_arr[ni++]);
-    nodes_arr[ni] = node_create(-1, 1.0f, sleeve_right + offset,-sleeve_y); simulator_add_node(sim, nodes_arr[ni++]);
-    WallSegment *wbot = wallsegment_create(nodes_arr[6], nodes_arr[7], 1.0f, 0.0f); simulator_add_wall(sim, wbot);
+    nodes_arr[ni] = node_create(-1, 1.0f, sleeve_left + offset, -sleeve_y, 0.0f); simulator_add_node(sim, nodes_arr[ni++]);
+    nodes_arr[ni] = node_create(-1, 1.0f, sleeve_right + offset,-sleeve_y, 0.0f); simulator_add_node(sim, nodes_arr[ni++]);
+    // Create triangle wall for bottom boundary
+    Node *wbot_c = node_create(-1, 0.0f,
+        (nodes_arr[6]->pos[0] + nodes_arr[7]->pos[0]) * 0.5f,
+        (nodes_arr[6]->pos[1] + nodes_arr[7]->pos[1]) * 0.5f,
+        10.0f);
+    wbot_c->anchored = true; wbot_c->collide_with_walls = false;
+    simulator_add_node(sim, wbot_c);
+    TriangleWall *wbot = trianglewall_create(nodes_arr[6], nodes_arr[7], wbot_c, 1.0f, 0.0f);
+    simulator_add_wall(sim, wbot);
 
     // Additional support / spacer nodes
-    nodes_arr[ni] = node_create(-1, 1.0f, -box_size + offset, 0.0f); simulator_add_node(sim, nodes_arr[ni++]);
-    nodes_arr[ni] = node_create(-1, 1.0f, -box_size - half,    0.0f); simulator_add_node(sim, nodes_arr[ni++]);
+    nodes_arr[ni] = node_create(-1, 1.0f, -box_size + offset, 0.0f, 0.0f); simulator_add_node(sim, nodes_arr[ni++]);
+    nodes_arr[ni] = node_create(-1, 1.0f, -box_size - half,    0.0f, 0.0f); simulator_add_node(sim, nodes_arr[ni++]);
     // a heavier moving node
-    nodes_arr[ni] = node_create(-1, 50.0f, -box_size - half, 30.0f); simulator_add_node(sim, nodes_arr[ni++]);
-    nodes_arr[ni] = node_create(-1, 1.0f,  half * 1.25f + offset, 0.0f); simulator_add_node(sim, nodes_arr[ni++]);
-    nodes_arr[ni] = node_create(-1, 1.0f,  box_size * 1.5f + offset,  0.0f); simulator_add_node(sim, nodes_arr[ni++]);
+    nodes_arr[ni] = node_create(-1, 50.0f, -box_size - half, 30.0f, 0.0f); simulator_add_node(sim, nodes_arr[ni++]);
+    nodes_arr[ni] = node_create(-1, 1.0f,  half * 1.25f + offset, 0.0f, 0.0f); simulator_add_node(sim, nodes_arr[ni++]);
+    nodes_arr[ni] = node_create(-1, 1.0f,  box_size * 1.5f + offset,  0.0f, 0.0f); simulator_add_node(sim, nodes_arr[ni++]);
     // give node index 10 an initial leftward velocity
     if (ni > 10) {
         nodes_arr[10]->vel[0] = -25.0f; nodes_arr[10]->vel[1] = 0.0f;
@@ -971,12 +992,12 @@ int main(int argc, char *argv[]) {
     // Anchor constraints (anchor at current node position)
     // panels top/bot and two support nodes
     Constraint *ac;
-    ac = anchorconstraint_create(nodes_arr[4], nodes_arr[4]->pos[0], nodes_arr[4]->pos[1]); simulator_add_constraint(sim, ac);
-    ac = anchorconstraint_create(nodes_arr[5], nodes_arr[5]->pos[0], nodes_arr[5]->pos[1]); simulator_add_constraint(sim, ac);
-    ac = anchorconstraint_create(nodes_arr[6], nodes_arr[6]->pos[0], nodes_arr[6]->pos[1]); simulator_add_constraint(sim, ac);
-    ac = anchorconstraint_create(nodes_arr[7], nodes_arr[7]->pos[0], nodes_arr[7]->pos[1]); simulator_add_constraint(sim, ac);
-    ac = anchorconstraint_create(nodes_arr[9], nodes_arr[9]->pos[0], nodes_arr[9]->pos[1]); simulator_add_constraint(sim, ac);
-    ac = anchorconstraint_create(nodes_arr[12], nodes_arr[12]->pos[0], nodes_arr[12]->pos[1]); simulator_add_constraint(sim, ac);
+    ac = anchorconstraint_create(nodes_arr[4], nodes_arr[4]->pos[0], nodes_arr[4]->pos[1], nodes_arr[4]->pos[2]); simulator_add_constraint(sim, ac);
+    ac = anchorconstraint_create(nodes_arr[5], nodes_arr[5]->pos[0], nodes_arr[5]->pos[1], nodes_arr[5]->pos[2]); simulator_add_constraint(sim, ac);
+    ac = anchorconstraint_create(nodes_arr[6], nodes_arr[6]->pos[0], nodes_arr[6]->pos[1], nodes_arr[6]->pos[2]); simulator_add_constraint(sim, ac);
+    ac = anchorconstraint_create(nodes_arr[7], nodes_arr[7]->pos[0], nodes_arr[7]->pos[1], nodes_arr[7]->pos[2]); simulator_add_constraint(sim, ac);
+    ac = anchorconstraint_create(nodes_arr[9], nodes_arr[9]->pos[0], nodes_arr[9]->pos[1], nodes_arr[9]->pos[2]); simulator_add_constraint(sim, ac);
+    ac = anchorconstraint_create(nodes_arr[12], nodes_arr[12]->pos[0], nodes_arr[12]->pos[1], nodes_arr[12]->pos[2]); simulator_add_constraint(sim, ac);
 
     // Box structural constraints (edges, diagonals, and some internal links)
     {
@@ -999,8 +1020,22 @@ int main(int argc, char *argv[]) {
     }
 
     // Sleeve inner walls along box top/bottom
-    WallSegment *w1 = wallsegment_create(nodes_arr[0], nodes_arr[1], 1.0f, 0.0f); simulator_add_wall(sim, w1);
-    WallSegment *w2 = wallsegment_create(nodes_arr[2], nodes_arr[3], 1.0f, 0.0f); simulator_add_wall(sim, w2);
+    Node *w1_c = node_create(-1, 0.0f,
+        (nodes_arr[0]->pos[0] + nodes_arr[1]->pos[0]) * 0.5f,
+        (nodes_arr[0]->pos[1] + nodes_arr[1]->pos[1]) * 0.5f,
+        10.0f);
+    w1_c->anchored = true; w1_c->collide_with_walls = false;
+    simulator_add_node(sim, w1_c);
+    TriangleWall *w1 = trianglewall_create(nodes_arr[0], nodes_arr[1], w1_c, 1.0f, 0.0f);
+    simulator_add_wall(sim, w1);
+    Node *w2_c = node_create(-1, 0.0f,
+        (nodes_arr[2]->pos[0] + nodes_arr[3]->pos[0]) * 0.5f,
+        (nodes_arr[2]->pos[1] + nodes_arr[3]->pos[1]) * 0.5f,
+        10.0f);
+    w2_c->anchored = true; w2_c->collide_with_walls = false;
+    simulator_add_node(sim, w2_c);
+    TriangleWall *w2 = trianglewall_create(nodes_arr[2], nodes_arr[3], w2_c, 1.0f, 0.0f);
+    simulator_add_wall(sim, w2);
     // Create a dense grid of free nodes below the bottom panel and attach
     // the two bottom anchors to the grid with springs. Grid nodes are
     // small-radius, and only horizontal/vertical neighbor connections are
@@ -1023,7 +1058,7 @@ int main(int argc, char *argv[]) {
             for (int c = 0; c < GRID_COLS; ++c) {
                 float x = grid_start_x + c * spacing;
                 float y = grid_start_y - r * spacing;
-                Node *n = node_create(-1, 1.0f, x, y);
+                Node *n = node_create(-1, 1.0f, x, y, 0.0f);
                 if (!n) continue;
                 // reduce visual radius so grid looks dense and tidy
                 n->radius = 1.0f;
@@ -1050,7 +1085,13 @@ int main(int argc, char *argv[]) {
                         Constraint *dc = distconstraint_create(n, hn, rest);
                         if (dc) simulator_add_constraint(sim, dc);
                         // also add a wall segment between neighbors so collisions behave
-                        WallSegment *ws = wallsegment_create(n, hn, 1.0f, 0.0f);
+                        Node *ws_c = node_create(-1, 0.0f,
+                            (n->pos[0] + hn->pos[0]) * 0.5f,
+                            (n->pos[1] + hn->pos[1]) * 0.5f,
+                            10.0f);
+                        ws_c->anchored = true; ws_c->collide_with_walls = false;
+                        simulator_add_node(sim, ws_c);
+                        TriangleWall *ws = trianglewall_create(n, hn, ws_c, 1.0f, 0.0f);
                         if (ws) simulator_add_wall(sim, ws);
                     }
                 }
@@ -1063,7 +1104,13 @@ int main(int argc, char *argv[]) {
                         float rest = sqrtf(dx*dx + dy*dy);
                         Constraint *dc = distconstraint_create(n, vn, rest);
                         if (dc) simulator_add_constraint(sim, dc);
-                        WallSegment *ws = wallsegment_create(n, vn, 1.0f, 0.0f);
+                        Node *ws_c = node_create(-1, 0.0f,
+                            (n->pos[0] + vn->pos[0]) * 0.5f,
+                            (n->pos[1] + vn->pos[1]) * 0.5f,
+                            10.0f);
+                        ws_c->anchored = true; ws_c->collide_with_walls = false;
+                        simulator_add_node(sim, ws_c);
+                        TriangleWall *ws = trianglewall_create(n, vn, ws_c, 1.0f, 0.0f);
                         if (ws) simulator_add_wall(sim, ws);
                     }
                 }
@@ -1138,10 +1185,9 @@ int main(int argc, char *argv[]) {
 
                 // If not handled by UI menus, handle current tool actions (select, add-node, etc.)
                 if (!menu_handled) {
-                    // convert screen to world coords (account for Y-flip and camera)
-                    // screen -> world: world = (screen / cam_scale) + cam_x
-                    float wx = ((float)mx + cam_x) / cam_scale ;
-                    float wy = ((float)(win_h - my) + cam_y) / cam_scale;
+                    // convert screen to world coords (3D raycasting - TODO: implement proper ray-plane intersection)
+                    float wx = (float)mx;
+                    float wy = (float)my;
                     // store last pick position so we can render it on screen
                     pick_wx = wx; pick_wy = wy; pick_active = 1;
 
@@ -1156,7 +1202,7 @@ int main(int argc, char *argv[]) {
                             if (edata.node_friction) friction_v = *edata.node_friction;
                             if (edata.node_anchored) anchored_v = *edata.node_anchored;
                             if (edata.node_collide_with_walls) collide_v = *edata.node_collide_with_walls;
-                            Node *nn = node_create(-1, (float)mass, wx, wy);
+                            Node *nn = node_create(-1, (float)mass, wx, wy, 0.0f);
                             if (nn) {
                                 nn->friction = (float)friction_v;
                                 nn->anchored = anchored_v ? true : false;
@@ -1169,7 +1215,7 @@ int main(int argc, char *argv[]) {
                         }
                     } else if (current_tool == TOOL_SELECT) {
                         const float pick_px = 8.0f;
-                        const float pick_world = pick_px / cam_scale; // convert pixel radius to world units
+                        const float pick_world = pick_px; // TODO: scale based on camera distance in 3D
 
                         // LEFT click: build candidate list at pick point and choose first
                         if (event.type == SDL_MOUSEBUTTONDOWN && button == SDL_BUTTON_LEFT) {
@@ -1213,7 +1259,7 @@ int main(int argc, char *argv[]) {
                             }
                             if (allow_walls && sim->walls) {
                                 for (size_t ii = 0; ii < dynarray_size(sim->walls); ++ii) {
-                                    WallSegment *w = (WallSegment*)dynarray_get(sim->walls, ii);
+                                    TriangleWall *w = (TriangleWall*)dynarray_get(sim->walls, ii);
                                     if (!w || !w->A || !w->B) continue;
                                     float d2 = point_segment_distance2(wx, wy, w->A->pos[0], w->A->pos[1], w->B->pos[0], w->B->pos[1]);
                                     if (d2 <= pick_world * pick_world) {
@@ -1256,8 +1302,9 @@ int main(int argc, char *argv[]) {
                         // RIGHT mouse: rectangle select start/finish handled below (button up/down)
                         if (event.type == SDL_MOUSEBUTTONDOWN && button == SDL_BUTTON_RIGHT) {
                             rect_select_active = 1; rect_x0 = mx; rect_y0 = my; rect_x1 = mx; rect_y1 = my;
-                            pick_wx = ((float)mx + cam_x) / cam_scale;
-                            pick_wy = ((float)(win_h - my) + cam_y) / cam_scale;
+                            // TODO: proper 3D picking
+                            pick_wx = (float)mx;
+                            pick_wy = (float)my;
                             pick_active = 1;
                         } else if (event.type == SDL_MOUSEBUTTONUP && button == SDL_BUTTON_LEFT) {
                             // leave dragging toggle state unchanged; mouse_left_down is cleared
@@ -1270,10 +1317,11 @@ int main(int argc, char *argv[]) {
                                 int ry0 = rect_y0 < rect_y1 ? rect_y0 : rect_y1;
                                 int rx1 = rect_x0 > rect_x1 ? rect_x0 : rect_x1;
                                 int ry1 = rect_y0 > rect_y1 ? rect_y0 : rect_y1;
-                                float wx0 = ((float)rx0 + cam_x) / cam_scale;
-                                float wy1 = ((float)(win_h - ry0) + cam_y) / cam_scale;
-                                float wx1 = ((float)rx1 + cam_x) / cam_scale;
-                                float wy0 = ((float)(win_h - ry1) + cam_y) / cam_scale;
+                                // TODO: proper 3D rectangle selection
+                                float wx0 = (float)rx0;
+                                float wy1 = (float)ry0;
+                                float wx1 = (float)rx1;
+                                float wy0 = (float)ry1;
                                 // choose filter by finding first object inside rect: nodes -> constraints -> walls
                                 int found_type = SEL_NONE;
                                 size_t n_nodes = dynarray_size(sim->nodes);
@@ -1303,7 +1351,7 @@ int main(int argc, char *argv[]) {
                     }
                     else if (current_tool == TOOL_ADD_DIST || current_tool == TOOL_ADD_SPRING || current_tool == TOOL_ADD_WALL) {
                         const float pick_px = 8.0f;
-                        const float pick_world = pick_px / cam_scale;
+                        const float pick_world = pick_px; // TODO: scale based on camera distance
                         if (event.type == SDL_MOUSEBUTTONDOWN && button == SDL_BUTTON_LEFT) {
                             // find node under mouse
                             Node *found = NULL;
@@ -1338,7 +1386,13 @@ int main(int argc, char *argv[]) {
                                     } else if (current_tool == TOOL_ADD_WALL) {
                                         float wf = edata.wall_friction ? (float)(*(edata.wall_friction)) : 1.0f;
                                         float wr = edata.wall_restitution ? (float)(*(edata.wall_restitution)) : 0.0f;
-                                        WallSegment *w = wallsegment_create(pending_tool_node, found, wf, wr);
+                                        Node *w_c = node_create(-1, 0.0f,
+                                            (pending_tool_node->pos[0] + found->pos[0]) * 0.5f,
+                                            (pending_tool_node->pos[1] + found->pos[1]) * 0.5f,
+                                            10.0f);
+                                        w_c->anchored = true; w_c->collide_with_walls = false;
+                                        simulator_add_node(sim, w_c);
+                                        TriangleWall *w = trianglewall_create(pending_tool_node, found, w_c, wf, wr);
                                         if (w) simulator_add_wall(sim, w);
                                         // if +Dist toggle is set, also add a distance constraint between the nodes
                                         if (edata.wall_add_dist && edata.wall_add_dist[0]) {
@@ -1369,16 +1423,22 @@ int main(int argc, char *argv[]) {
                 // update pick position while moving mouse (show where selection will search)
                 if (!menu_handled && (*(edata.current_tool) == TOOL_SELECT)) {
                     // keep consistent with the screen->world conversion used above
-                    pick_wx = ((float)mx + cam_x) / cam_scale;
-                    pick_wy = ((float)(win_h - my) + cam_y) / cam_scale;
+                    // TODO: proper 3D raycasting for pick position
+                    pick_wx = (float)mx;
+                    pick_wy = (float)my;
                     pick_active = 1;
                 }
                 // Force-drag is applied continuously in the per-frame update (see below).
             }
 
-            // Camera controls: space + drag to pan; mouse wheel to zoom
+            // Camera controls: WASD for movement, space+drag to rotate, scroll for zoom/speed
             if (event.type == SDL_KEYDOWN) {
                 if (event.key.keysym.sym == SDLK_SPACE) space_down = 1;
+                else if (event.key.keysym.sym == SDLK_w) key_w = 1;
+                else if (event.key.keysym.sym == SDLK_a) key_a = 1;
+                else if (event.key.keysym.sym == SDLK_s) key_s = 1;
+                else if (event.key.keysym.sym == SDLK_d) key_d = 1;
+                else if (event.key.keysym.sym == SDLK_d) key_d = 1;
                 // Selection candidate cycling using left/right arrows
                 else if ((event.key.keysym.sym == SDLK_LEFT || event.key.keysym.sym == SDLK_RIGHT) && current_tool == TOOL_SELECT && last_candidates && dynarray_size(last_candidates) > 0) {
                     int dir = (event.key.keysym.sym == SDLK_RIGHT) ? 1 : -1;
@@ -1399,31 +1459,39 @@ int main(int argc, char *argv[]) {
                     }
                 }
             } else if (event.type == SDL_KEYUP) {
-                if (event.key.keysym.sym == SDLK_SPACE) space_down = 0;
+                if (event.key.keysym.sym == SDLK_SPACE) { space_down = 0; rotating_camera = 0; }
+                else if (event.key.keysym.sym == SDLK_w) key_w = 0;
+                else if (event.key.keysym.sym == SDLK_a) key_a = 0;
+                else if (event.key.keysym.sym == SDLK_s) key_s = 0;
+                else if (event.key.keysym.sym == SDLK_d) key_d = 0;
             } else if (event.type == SDL_MOUSEWHEEL) {
-                // zoom about screen origin; scale factor step
-                if (event.wheel.y > 0) cam_scale *= 1.1f; else if (event.wheel.y < 0) cam_scale *= 0.9f;
-                if (cam_scale < 0.05f) cam_scale = 0.05f;
-                if (cam_scale > 20.0f) cam_scale = 20.0f;
+                // Scroll to adjust zoom (affects movement speed)
+                float zoom_factor = 1.1f;
+                if (event.wheel.y > 0) cam_zoom *= zoom_factor;
+                else if (event.wheel.y < 0) cam_zoom /= zoom_factor;
+                if (cam_zoom < 0.1f) cam_zoom = 0.1f;
+                if (cam_zoom > 10.0f) cam_zoom = 10.0f;
             } else if (event.type == SDL_MOUSEBUTTONDOWN) {
                 if (space_down && event.button.button == SDL_BUTTON_LEFT) {
-                    panning = 1;
-                    pan_last_x = event.button.x;
-                    pan_last_y = event.button.y;
+                    rotating_camera = 1;
+                    rotate_last_x = event.button.x;
+                    rotate_last_y = event.button.y;
                 }
             } else if (event.type == SDL_MOUSEBUTTONUP) {
-                if (event.button.button == SDL_BUTTON_LEFT) panning = 0;
+                if (event.button.button == SDL_BUTTON_LEFT) rotating_camera = 0;
             } else if (event.type == SDL_MOUSEMOTION) {
-                if (panning) {
-                    int dx = event.motion.x - pan_last_x;
-                    int dy = event.motion.y - pan_last_y;
-                    // convert screen delta to world delta (account for scale and Y-flip)
-                    float world_dx = (float)dx;
-                    float world_dy = -(float)dy;
-                    cam_x -= world_dx;
-                    cam_y -= world_dy;
-                    pan_last_x = event.motion.x;
-                    pan_last_y = event.motion.y;
+                if (rotating_camera) {
+                    int dx = event.motion.x - rotate_last_x;
+                    int dy = event.motion.y - rotate_last_y;
+                    // Horizontal mouse movement rotates yaw (left/right)
+                    cam_yaw += (float)dx * 0.005f;
+                    // Vertical mouse movement rotates pitch (up/down)
+                    cam_pitch += (float)dy * 0.005f;
+                    // Clamp pitch to avoid gimbal lock
+                    if (cam_pitch > 1.5f) cam_pitch = 1.5f;
+                    if (cam_pitch < -1.5f) cam_pitch = -1.5f;
+                    rotate_last_x = event.motion.x;
+                    rotate_last_y = event.motion.y;
                 }
             }
         }
@@ -1431,19 +1499,53 @@ int main(int argc, char *argv[]) {
         // update window size in case of resize
         SDL_GetWindowSize(window, &win_w, &win_h);
 
-        // Rendering (clear only)
-        glViewport(0,0,win_w,win_h);
-        glClearColor(0.2f, 0.3f, 0.6f, 1.0f);
-        glClear(GL_COLOR_BUFFER_BIT);
+        // Update camera position based on WASD keys
+        float dt_cam = sim->dt; // use simulation timestep for camera movement
+        float move_speed = cam_speed * cam_zoom * dt_cam;
+        if (key_w || key_a || key_s || key_d) {
+            // Compute forward and right vectors from yaw (standard FPS movement on horizontal plane)
+            // Forward is the direction the camera is facing (yaw rotation around Y axis)
+            float forward_x = -sinf(cam_yaw);  // negative because OpenGL Z points toward viewer
+            float forward_z = -cosf(cam_yaw);
+            // Right is perpendicular to forward (90 degrees clockwise from forward)
+            float right_x = cosf(cam_yaw);
+            float right_z = -sinf(cam_yaw);
+            
+            if (key_w) { cam_x += forward_x * move_speed; cam_z += forward_z * move_speed; }
+            if (key_s) { cam_x -= forward_x * move_speed; cam_z -= forward_z * move_speed; }
+            if (key_a) { cam_x -= right_x * move_speed; cam_z -= right_z * move_speed; }
+            if (key_d) { cam_x += right_x * move_speed; cam_z += right_z * move_speed; }
+        }
 
-        // Render simulator (use pixel orthographic projection)
+        // Rendering with 3D perspective
+        glViewport(0,0,win_w,win_h);
+        glClearColor(0.6f, 0.7f, 0.9f, 1.0f);  // Sky blue background
+        glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
+        glEnable(GL_DEPTH_TEST);
+        glDisable(GL_CULL_FACE);  // Don't cull backfaces so triangles are visible from both sides
+
+        // Render simulator with 3D perspective projection
         glMatrixMode(GL_PROJECTION);
         glPushMatrix();
         glLoadIdentity();
-        glOrtho(0, win_w, win_h, 0, -1, 1);
+        // Perspective projection: FOV=60 degrees, aspect ratio, near=10, far=10000
+        float aspect = (float)win_w / (float)win_h;
+        float fov_y = 60.0f;
+        float near_plane = 10.0f;
+        float far_plane = 10000.0f;
+        // gluPerspective(fov_y, aspect, near_plane, far_plane);
+        // Manual perspective calculation (equivalent to gluPerspective)
+        float f = 1.0f / tanf(fov_y * 3.14159265f / 360.0f);
+        glFrustum(-near_plane * aspect / f, near_plane * aspect / f, 
+                  -near_plane / f, near_plane / f, near_plane, far_plane);
+        
         glMatrixMode(GL_MODELVIEW);
         glPushMatrix();
         glLoadIdentity();
+        // Apply camera transformation: rotate then translate
+        glRotatef(-cam_pitch * 180.0f / 3.14159265f, 1.0f, 0.0f, 0.0f); // pitch around X
+        glRotatef(-cam_yaw * 180.0f / 3.14159265f, 0.0f, 1.0f, 0.0f);   // yaw around Y
+        glTranslatef(-cam_x, -cam_y, -cam_z); // translate to camera position
 
         // Apply force-drag: when the user is holding the left mouse button and the
         // Selection menu's Drag toggle is enabled, apply a proportional force to
@@ -1501,85 +1603,37 @@ int main(int argc, char *argv[]) {
         if (!paused) {
             simulator_step(sim);
         }
-        // Draw simulator with a Y-flip so world +Y (up) maps to screen Y downwards
-        glPushMatrix();
-        glTranslatef(0.0f, (float)win_h, 0.0f);
-        glScalef(1.0f, -1.0f, 1.0f);
-        // apply camera pan & zoom (in world coordinates)
-        glTranslatef(-cam_x, -cam_y, 0.0f);
-        glScalef(cam_scale, cam_scale, 1.0f);
 
-        // Draw spatial-hash grid lines (same cell size used by collision detection)
+        // Draw 3D reference grid at z=0 plane (XY plane)
         if (show_grid) {
-            float cell_size = (float)grid_cell_size; // user-controlled via Controls menu
-            // compute visible world bounds (consistent with screen->world used earlier)
-            float left_world = cam_x / cam_scale;
-            float right_world = ((float)win_w + cam_x) / cam_scale;
-            float bottom_world = cam_y / cam_scale;
-            float top_world = ((float)win_h + cam_y) / cam_scale;
-
-            int ix0 = (int)floorf(left_world / cell_size) - 1;
-            int ix1 = (int)floorf(right_world / cell_size) + 1;
-            int iy0 = (int)floorf(bottom_world / cell_size) - 1;
-            int iy1 = (int)floorf(top_world / cell_size) + 1;
-
-            // faint grid lines
-            glColor3f(0.85f, 0.85f, 0.9f);
+            float cell_size = (float)grid_cell_size;
+            int grid_extent = 20; // draw ±20 cells from origin
+            glColor3f(0.7f, 0.7f, 0.75f);
             glLineWidth(1.0f);
             glBegin(GL_LINES);
-            for (int ix = ix0; ix <= ix1; ++ix) {
+            for (int ix = -grid_extent; ix <= grid_extent; ++ix) {
                 float x = (float)ix * cell_size;
-                glVertex2f(x, bottom_world - cell_size);
-                glVertex2f(x, top_world + cell_size);
+                glVertex3f(x, -grid_extent * cell_size, 0.0f);
+                glVertex3f(x, grid_extent * cell_size, 0.0f);
             }
-            for (int iy = iy0; iy <= iy1; ++iy) {
+            for (int iy = -grid_extent; iy <= grid_extent; ++iy) {
                 float y = (float)iy * cell_size;
-                glVertex2f(left_world - cell_size, y);
-                glVertex2f(right_world + cell_size, y);
+                glVertex3f(-grid_extent * cell_size, y, 0.0f);
+                glVertex3f(grid_extent * cell_size, y, 0.0f);
             }
             glEnd();
-
-            // Highlight cells each wall is scanning for collisions in light magenta
-            // We approximate the same cell coverage algorithm used in the simulator by
-            // marking all grid cells whose indices intersect the wall bounding box.
-            glEnable(GL_BLEND);
-            glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
-            glColor4f(1.0f, 0.0f, 1.0f, 0.18f);
-            for (size_t wi = 0; wi < dynarray_size(sim->walls); ++wi) {
-                WallSegment *w = (WallSegment*)dynarray_get(sim->walls, wi);
-                if (!w || !w->A || !w->B) continue;
-                float ax = w->A->pos[0], ay = w->A->pos[1];
-                float bx = w->B->pos[0], by = w->B->pos[1];
-                float minx = fminf(ax,bx), miny = fminf(ay,by);
-                float maxx = fmaxf(ax,bx), maxy = fmaxf(ay,by);
-                int wix0 = (int)floorf(minx / cell_size);
-                int wiy0 = (int)floorf(miny / cell_size);
-                int wix1 = (int)floorf(maxx / cell_size);
-                int wiy1 = (int)floorf(maxy / cell_size);
-                // clamp to visible region for efficiency
-                if (wix1 < ix0 || wix0 > ix1 || wiy1 < iy0 || wiy0 > iy1) continue;
-                if (wix0 < ix0) wix0 = ix0; if (wiy0 < iy0) wiy0 = iy0;
-                if (wix1 > ix1) wix1 = ix1; if (wiy1 > iy1) wiy1 = iy1;
-                for (int ix = wix0; ix <= wix1; ++ix) {
-                    for (int iy = wiy0; iy <= wiy1; ++iy) {
-                        float x0 = (float)ix * cell_size;
-                        float y0 = (float)iy * cell_size;
-                        float x1 = x0 + cell_size;
-                        float y1 = y0 + cell_size;
-                        glBegin(GL_QUADS);
-                        glVertex2f(x0, y0);
-                        glVertex2f(x1, y0);
-                        glVertex2f(x1, y1);
-                        glVertex2f(x0, y1);
-                        glEnd();
-                    }
-                }
-            }
-            glDisable(GL_BLEND);
+            // Draw axes
+            glLineWidth(3.0f);
+            glBegin(GL_LINES);
+            glColor3f(1.0f, 0.0f, 0.0f); glVertex3f(0,0,0); glVertex3f(200,0,0); // X red
+            glColor3f(0.0f, 1.0f, 0.0f); glVertex3f(0,0,0); glVertex3f(0,200,0); // Y green
+            glColor3f(0.0f, 0.0f, 1.0f); glVertex3f(0,0,0); glVertex3f(0,0,200); // Z blue
+            glEnd();
+            glLineWidth(1.0f);
         }
 
         simulator_draw(sim);
-        // draw selection highlights (in world coordinates)
+        // draw selection highlights (in world coordinates, 3D)
         if (dynarray_size(selection) > 0) {
             glColor3f(0.0f, 1.0f, 0.0f);
             for (size_t si = 0; si < dynarray_size(selection); ++si) {
@@ -1589,7 +1643,7 @@ int main(int argc, char *argv[]) {
                 glBegin(GL_LINE_LOOP);
                 for (int k = 0; k < 20; ++k) {
                     float theta = 2.0f * 3.14159265f * (float)k / 20.0f;
-                    glVertex2f(n->pos[0] + r * cosf(theta), n->pos[1] + r * sinf(theta));
+                    glVertex3f(n->pos[0] + r * cosf(theta), n->pos[1] + r * sinf(theta), n->pos[2]);
                 }
                 glEnd();
             }
@@ -1618,12 +1672,9 @@ int main(int argc, char *argv[]) {
             Menu *m = (Menu*)menus->items[mi];
             if (m) menu_render(m, win_w, win_h);
         }
+        
         // draw rectangle selection overlay in screen space if active
         if (rect_select_active) {
-            glMatrixMode(GL_PROJECTION);
-            glPushMatrix(); glLoadIdentity(); glOrtho(0, win_w, win_h, 0, -1, 1);
-            glMatrixMode(GL_MODELVIEW);
-            glPushMatrix(); glLoadIdentity();
             glColor4f(0.0f, 1.0f, 0.0f, 0.25f);
             glBegin(GL_LINE_LOOP);
             glVertex2i(rect_x0, rect_y0);
@@ -1631,8 +1682,6 @@ int main(int argc, char *argv[]) {
             glVertex2i(rect_x1, rect_y1);
             glVertex2i(rect_x0, rect_y1);
             glEnd();
-            glPopMatrix();
-            glMatrixMode(GL_PROJECTION); glPopMatrix(); glMatrixMode(GL_MODELVIEW);
         }
 
         // Update FPS counter
@@ -1654,23 +1703,14 @@ int main(int argc, char *argv[]) {
             int tx = win_w - pad - tw;
             int ty = win_h - pad - th;
             Color white = {255,255,255,255};
-            // Ensure we have a pixel-orthographic projection for text drawing
-            glMatrixMode(GL_PROJECTION);
-            glPushMatrix();
-            glLoadIdentity();
-            glOrtho(0, win_w, win_h, 0, -1, 1);
-            glMatrixMode(GL_MODELVIEW);
-            glPushMatrix();
-            glLoadIdentity();
-
             menu_draw_text_at(fps_text, tx, ty, white);
-
-            // restore matrices
-            glPopMatrix();
-            glMatrixMode(GL_PROJECTION);
-            glPopMatrix();
-            glMatrixMode(GL_MODELVIEW);
         }
+        
+        // Pop 2D UI matrices
+        glPopMatrix(); // modelview
+        glMatrixMode(GL_PROJECTION);
+        glPopMatrix();
+        glMatrixMode(GL_MODELVIEW);
 
         SDL_GL_SwapWindow(window);
     }
@@ -1761,10 +1801,10 @@ static void sel_cb_delete_nodes(VariableInteraction *vi, void *user_data) {
         // remove walls referencing this node
         DynArray *ws = sim->walls;
         for (ssize_t wi = (ssize_t)dynarray_size(ws) - 1; wi >= 0; --wi) {
-            WallSegment *w = (WallSegment*)dynarray_get(ws, (size_t)wi);
+            TriangleWall *w = (TriangleWall*)dynarray_get(ws, (size_t)wi);
             if (!w) continue;
-            if (w->A == n || w->B == n) {
-                wallsegment_free(w);
+            if (w->A == n || w->B == n || w->C == n) {
+                trianglewall_free(w);
                 for (size_t j = (size_t)wi; j + 1 < ws->size; ++j) ws->items[j] = ws->items[j+1];
                 ws->size -= 1;
             }
@@ -1839,7 +1879,7 @@ static void sel_cb_set_wall_prop(VariableInteraction *vi, void *user_data) {
     const char *name = vi->name;
     double v = *(double*)vi->variable;
     for (size_t i = 0; i < dynarray_size(ed->selection); ++i) {
-        WallSegment *w = (WallSegment*)dynarray_get(ed->selection, i);
+        TriangleWall *w = (TriangleWall*)dynarray_get(ed->selection, i);
         if (!w) continue;
         if (strcmp(name, "Friction") == 0) w->friction = (float)v;
         else if (strcmp(name, "Restitution") == 0) w->restitution = (float)v;

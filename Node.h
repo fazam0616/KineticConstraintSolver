@@ -9,8 +9,8 @@ typedef struct Node Node;
 struct Node {
     int idx;
     float mass;
-    float pos[2];
-    float vel[2];
+    float pos[3];
+    float vel[3];
     DynArray *constraints; // Constraint*
     float radius;
     bool isGravity;
@@ -21,7 +21,7 @@ struct Node {
     bool sim_ignore;
 };
 
-Node* node_create(int idx, float mass, float x, float y);
+Node* node_create(int idx, float mass, float x, float y, float z);
 void node_free(Node *n);
 void node_draw(Node *n, float radius);
 

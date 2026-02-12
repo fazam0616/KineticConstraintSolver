@@ -1,4 +1,5 @@
 #include "Simulator.h"
+#include "Octree.h"
 #include <stdlib.h>
 #include <string.h>
 #include <stdio.h>
@@ -105,7 +106,7 @@ static int cg_solve_sparse(int n, cs *A, double *b, double *x, int max_iter, dou
 static cs* build_sparse_A_from_constraints(Simulator *s, double *invm, size_t *out_m, cs **out_Jc, cs **out_Jct) {
     size_t m_total = dynarray_size(s->constraints);
     size_t n = dynarray_size(s->nodes);
-    size_t n2 = n * 2;
+    size_t n3 = n * 3;
     // count included constraints (non-spring)
     size_t m = 0;
     for (size_t ci = 0; ci < m_total; ++ci) {
@@ -119,7 +120,7 @@ static cs* build_sparse_A_from_constraints(Simulator *s, double *invm, size_t *o
 
     // estimate nzmax: each constraint affects few nodes; use 4 per constraint as heuristic
     int nzmax = (int)(m * 4 + 16);
-    cs *T = cs_spalloc((int)m, (int)n2, nzmax, 1, 1); // triplet form
+    cs *T = cs_spalloc((int)m, (int)n3, nzmax, 1, 1); // triplet form
     if (!T) return NULL;
 
     // temporary storage used by dc_sparse
@@ -161,7 +162,7 @@ static cs* build_sparse_A_from_constraints(Simulator *s, double *invm, size_t *o
 
     /* scale columns by invm[col] (do NOT include dt here) */
     for (int col = 0; col < Jc_scaled->n; ++col) {
-        double scale = (invm && col < (int)n2) ? invm[col] : 1.0;
+        double scale = (invm && col < (int)n3) ? invm[col] : 1.0;
 
         for (int p = Jc_scaled->p[col]; p < Jc_scaled->p[col+1]; ++p) Jc_scaled->x[p] *= scale * dt * dt;
     }
@@ -188,10 +189,12 @@ Simulator* simulator_create(float dt) {
     // Note: rendering uses a top-left origin (y increases downward),
     // Internal physics uses positive-up coordinates: negative y is downwards.
     // Set gravity to negative to point downward in world coordinates.
-    s->gravity[0] = 0.0f; s->gravity[1] = -9.81f;
+    s->gravity[0] = 0.0f; s->gravity[1] = -9.81f; s->gravity[2] = 0.0f;
     s->solver_iters = 100;
     s->damping = 0.01f;
     s->velocity_blend = 0.5f; // blend factor between old velocity and position-derived velocity
+    // Create octree spanning a reasonable world space (can be resized later)
+    s->octree = octree_create(-1000.0f, -1000.0f, -1000.0f, 1000.0f, 1000.0f, 1000.0f, 8);
     return s;
 }
 
@@ -209,10 +212,10 @@ void simulator_free(Simulator *s) {
         free(c);
     }
     dynarray_free(s->constraints, NULL);
-    // free wall segments
+    // free triangle walls
     for (size_t i = 0; i < dynarray_size(s->walls); ++i) {
-        WallSegment *w = (WallSegment*)dynarray_get(s->walls, i);
-        if (w) wallsegment_free(w);
+        TriangleWall *w = (TriangleWall*)dynarray_get(s->walls, i);
+        if (w) trianglewall_free(w);
     }
     dynarray_free(s->walls, NULL);
     free(s);
@@ -229,317 +232,237 @@ void simulator_add_constraint(Simulator *s, Constraint *c) {
     dynarray_append(s->constraints, c);
 }
 
-void simulator_add_wall(Simulator *s, WallSegment *w) {
+void simulator_add_wall(Simulator *s, TriangleWall *w) {
     if (!s || !w) return;
     dynarray_append(s->walls, w);
 }
 
-// Helper: build spatial hash mapping cell_key -> DynArray of node indices (as int* allocated)
-// Simple spatial hash for two 32-bit integers (ix,iy).
-static size_t spatial_hash_fn(const void *key, size_t bucket_count) {
-    const int *k = (const int*)key;
-    uint32_t a = (uint32_t)k[0];
-    uint32_t b = (uint32_t)k[1];
-    // use fast multiplicative hashing (common for spatial hashing)
-    uint64_t z = (uint64_t)a * 73856093u ^ (uint64_t)b * 19349663u;
-    return (size_t)(z % (uint64_t)bucket_count);
-}
-
-static HashMap* build_spatial_hash(Simulator *s, float cell_size) {
-    size_t n = dynarray_size(s->nodes);
-    // create hashmap that stores 2 ints as key (ix, iy)
-    HashMap *map = hashmap_create(1024, sizeof(int)*2, spatial_hash_fn);
-    for (size_t i = 0; i < n; ++i) {
-        Node *node = (Node*)dynarray_get(s->nodes, i);
-        if (!node) continue;
-        int ix = (int)floorf(node->pos[0] / cell_size);
-        int iy = (int)floorf(node->pos[1] / cell_size);
-        int key[2]; key[0] = ix; key[1] = iy;
-        DynArray *cell = (DynArray*)hashmap_get(map, key);
-        if (!cell) {
-            cell = dynarray_create(8);
-            // store the DynArray pointer in the hashmap (will be freed by hashmap_free)
-            hashmap_put(map, key, cell);
-        }
-        int *idxptr = (int*)malloc(sizeof(int)); *idxptr = (int)i;
-        dynarray_append(cell, idxptr);
-    }
-    return map;
-}
-
-
-void free_cell_dynarray(void *v) { dynarray_free((DynArray*)v, free); }
-
-// Helper: get grid cells spanned by a wall segment A->B. We will return a DynArray of keys (char*) allocated
-static DynArray* wall_segment_cells(WallSegment *w, float cell_size) {
-    // Return a DynArray of allocated int[2] keys {ix, iy} describing
-    // which cells the wall spans. Caller is responsible for freeing each
-    // int* element and the DynArray container.
-    DynArray *cells = dynarray_create(8);
-    float ax = w->A->pos[0], ay = w->A->pos[1];
-    float bx = w->B->pos[0], by = w->B->pos[1];
-    float minx = fminf(ax,bx), miny = fminf(ay,by);
-    float maxx = fmaxf(ax,bx), maxy = fmaxf(ay,by);
-    int ix0 = (int)floorf(minx / cell_size), iy0 = (int)floorf(miny / cell_size);
-    int ix1 = (int)floorf(maxx / cell_size), iy1 = (int)floorf(maxy / cell_size);
-    for (int ix = ix0; ix <= ix1; ++ix) {
-        for (int iy = iy0; iy <= iy1; ++iy) {
-            int *key = (int*)malloc(sizeof(int) * 2);
-            key[0] = ix; key[1] = iy;
-            dynarray_append(cells, key);
-        }
-    }
-    return cells;
-}
-
-// Helper: check collision between wall segment and node; returns 1 if collision, fills penetration, normal (out_normal), t (0..1)
-static int wall_check_collision(WallSegment *w, Node *node, float *out_penetration, float out_normal[2], float *out_t) {
-    float ax = w->A->pos[0], ay = w->A->pos[1];
-    float bx = w->B->pos[0], by = w->B->pos[1];
-    float vx = bx - ax, vy = by - ay;
-    float wx = node->pos[0] - ax, wy = node->pos[1] - ay;
-    float len2 = vx*vx + vy*vy;
+// Helper: check collision between triangle wall and node (3D point-triangle collision)
+// Returns 1 if collision detected, fills out_penetration, out_normal[3], and barycentric coords
+static int triangle_check_collision(TriangleWall *w, Node *node, 
+                                    float *out_penetration, float out_normal[3],
+                                    float *out_u, float *out_v) {
+    // Get triangle vertices
+    float *a = w->A->pos;
+    float *b = w->B->pos;
+    float *c = w->C->pos;
+    float *p = node->pos;
     
-    float t = 0.0f;
-    if (len2 > 1e-9f) {
-        t = (wx*vx + wy*vy) / len2;
-        if (t < 0.0f) t = 0.0f;
-        else if (t > 1.0f) t = 1.0f;
-    }
+    // Compute triangle edges
+    float e1[3] = {b[0] - a[0], b[1] - a[1], b[2] - a[2]};
+    float e2[3] = {c[0] - a[0], c[1] - a[1], c[2] - a[2]};
     
-    float px = ax + vx * t;
-    float py = ay + vy * t;
-    float nx = node->pos[0] - px;
-    float ny = node->pos[1] - py;
-    float dist_sq = nx*nx + ny*ny;
-    float dist = sqrtf(dist_sq);
-    float penetration = node->radius*node->radius - dist_sq;
+    // Compute triangle normal via cross product
+    float normal[3] = {
+        e1[1]*e2[2] - e1[2]*e2[1],
+        e1[2]*e2[0] - e1[0]*e2[2],
+        e1[0]*e2[1] - e1[1]*e2[0]
+    };
+    float normal_len = sqrtf(normal[0]*normal[0] + normal[1]*normal[1] + normal[2]*normal[2]);
+    if (normal_len < 1e-9f) return 0; // degenerate triangle
+    normal[0] /= normal_len; normal[1] /= normal_len; normal[2] /= normal_len;
     
-    if (out_t) *out_t = t;
+    // Project point onto triangle plane
+    float ap[3] = {p[0] - a[0], p[1] - a[1], p[2] - a[2]};
+    float dist_to_plane = ap[0]*normal[0] + ap[1]*normal[1] + ap[2]*normal[2];
+    
+    // Check if point is within radius distance from plane
+    if (fabsf(dist_to_plane) > node->radius) return 0;
+    
+    // Project point onto plane
+    float proj[3] = {
+        p[0] - normal[0] * dist_to_plane,
+        p[1] - normal[1] * dist_to_plane,
+        p[2] - normal[2] * dist_to_plane
+    };
+    
+    // Compute barycentric coordinates of projected point
+    // Using method: solve [e1 e2] * [u v]^T = proj - a
+    float v0[3] = {proj[0] - a[0], proj[1] - a[1], proj[2] - a[2]};
+    
+    float dot00 = e1[0]*e1[0] + e1[1]*e1[1] + e1[2]*e1[2];
+    float dot01 = e1[0]*e2[0] + e1[1]*e2[1] + e1[2]*e2[2];
+    float dot02 = e1[0]*v0[0] + e1[1]*v0[1] + e1[2]*v0[2];
+    float dot11 = e2[0]*e2[0] + e2[1]*e2[1] + e2[2]*e2[2];
+    float dot12 = e2[0]*v0[0] + e2[1]*v0[1] + e2[2]*v0[2];
+    
+    float inv_denom = 1.0f / (dot00 * dot11 - dot01 * dot01);
+    float u = (dot11 * dot02 - dot01 * dot12) * inv_denom;
+    float v = (dot00 * dot12 - dot01 * dot02) * inv_denom;
+    
+    // Check if point is inside triangle
+    if (u < 0.0f || v < 0.0f || (u + v) > 1.0f) return 0;
+    
+    // Collision detected - compute penetration
+    float penetration = node->radius - fabsf(dist_to_plane);
+    if (penetration <= 0.0f) return 0;
+    
+    // Set outputs
     if (out_penetration) *out_penetration = penetration;
-    
-    // Early exit: no collision
-    if (penetration <= 0.0f) {
-        if (out_normal) { out_normal[0] = 0.0f; out_normal[1] = 1.0f; }
-        return 0;
-    }
-    
-    // Collision detected: compute normal
     if (out_normal) {
-        if (dist > 1e-9f) {
-            out_normal[0] = nx / dist;
-            out_normal[1] = ny / dist;
+        // Normal points away from triangle toward node
+        if (dist_to_plane < 0.0f) {
+            out_normal[0] = -normal[0];
+            out_normal[1] = -normal[1];
+            out_normal[2] = -normal[2];
         } else {
-            out_normal[0] = 0.0f;
-            out_normal[1] = 1.0f;
+            out_normal[0] = normal[0];
+            out_normal[1] = normal[1];
+            out_normal[2] = normal[2];
         }
     }
+    if (out_u) *out_u = u;
+    if (out_v) *out_v = v;
     
     return 1;
 }
 
-// Compute collision forces of nodes with walls and write into provided collision_forces (len = n_nodes*2)
-// Helper: check if wall segment overlaps with cell bounds
-static int wall_overlaps_cell(WallSegment *w, float cell_x, float cell_y, float cell_size) {
-    float ax = w->A->pos[0], ay = w->A->pos[1];
-    float bx = w->B->pos[0], by = w->B->pos[1];
-    float minx = fminf(ax, bx), miny = fminf(ay, by);
-    float maxx = fmaxf(ax, bx), maxy = fmaxf(ay, by);
-    
-    float cell_minx = cell_x * cell_size;
-    float cell_miny = cell_y * cell_size;
-    float cell_maxx = cell_minx + cell_size;
-    float cell_maxy = cell_miny + cell_size;
-    
-    // AABB overlap test
-    return !(maxx < cell_minx || minx > cell_maxx || 
-             maxy < cell_miny || miny > cell_maxy);
-}
-
-// Compute collision forces: iterate cells -> walls -> nodes
-static void compute_wall_collision_forces(Simulator *s, float *collision_forces) {
+// Compute collision forces using octree acceleration structure
+static void compute_triangle_collision_forces(Simulator *s, float *collision_forces) {
     if (!s || !collision_forces) return;
     const float PENETRATION_STIFFNESS = 500.0f;
     const float NORMAL_DAMP_K = 100.0f;
     const float Kt = 150.0f;
-    float cell_size = 64.0f;
-
+    
     size_t n_nodes = dynarray_size(s->nodes);
-    if (n_nodes == 0) return;
-
-    HashMap *hash = build_spatial_hash(s, cell_size);
     size_t n_walls = dynarray_size(s->walls);
-
-    /* Precompute walls per bucket: for each wall, compute the cells it spans
-       and insert the wall index into the corresponding bucket-list. This
-       produces an array of DynArray* of length hash->bucket_count where each
-       entry is a list of int* (wall-index pointers). */
-    DynArray **walls_per_bucket = (DynArray**)calloc(hash->bucket_count, sizeof(DynArray*));
-    for (size_t wi = 0; wi < n_walls; ++wi) {
-        WallSegment *w = (WallSegment*)dynarray_get(s->walls, wi);
-        if (!w) continue;
-        DynArray *cells = wall_segment_cells(w, cell_size);
-        for (size_t ci = 0; ci < dynarray_size(cells); ++ci) {
-            int *k = (int*)dynarray_get(cells, ci);
-            if (!k) continue;
-            size_t bucket = 0;
-            if (hash->hash_fn) bucket = hash->hash_fn(k, hash->bucket_count) % hash->bucket_count;
-            else bucket = 0; /* shouldn't happen: we pass spatial_hash_fn when creating map */
-            if (!walls_per_bucket[bucket]) walls_per_bucket[bucket] = dynarray_create(4);
-            /* avoid duplicates: linear scan (small lists expected) */
-            int found = 0;
-            for (size_t z = 0; z < dynarray_size(walls_per_bucket[bucket]); ++z) {
-                int *exist = (int*)dynarray_get(walls_per_bucket[bucket], z);
-                if (exist && *exist == (int)wi) { found = 1; break; }
-            }
-            if (!found) {
-                int *wi_ptr = (int*)malloc(sizeof(int)); *wi_ptr = (int)wi;
-                dynarray_append(walls_per_bucket[bucket], wi_ptr);
-            }
-            free(k);
-        }
-        dynarray_free(cells, NULL);
+    if (n_nodes == 0 || n_walls == 0) return;
+    
+    // Rebuild octree each frame (simple approach - could be optimized)
+    if (s->octree) {
+        octree_clear(s->octree);
     }
-
-    // Iterate through hash buckets and their linked nodes; use precomputed walls list
-    for (size_t bucket = 0; bucket < hash->bucket_count; ++bucket) {
-        DynArray *walls_list = walls_per_bucket[bucket];
-        if (!walls_list || dynarray_size(walls_list) == 0) continue;
-        HashNode *hn = hash->buckets[bucket];
-        for (; hn; hn = hn->next) {
-            DynArray *cell_nodes = (DynArray*)hn->value;
-            if (!cell_nodes || dynarray_size(cell_nodes) == 0) continue;
-
-            // For each wall referenced by this bucket
-            for (size_t wz = 0; wz < dynarray_size(walls_list); ++wz) {
-                int *wip = (int*)dynarray_get(walls_list, wz);
-                if (!wip) continue;
-                int wi = *wip;
-                if (wi < 0 || (size_t)wi >= n_walls) continue;
-                WallSegment *w = (WallSegment*)dynarray_get(s->walls, (size_t)wi);
-                if (!w) continue;
-
-                int A_anchored = w->A ? w->A->anchored : 0;
-                int B_anchored = w->B ? w->B->anchored : 0;
-                int both_anchored = A_anchored && B_anchored;
-
-                // For each node in this cell
-                for (size_t ni = 0; ni < dynarray_size(cell_nodes); ++ni) {
-                    int *ip = (int*)dynarray_get(cell_nodes, ni);
-                    int i = *ip;
-                    if (i < 0 || (size_t)i >= n_nodes) continue;
-                    Node *node = (Node*)dynarray_get(s->nodes, i);
-                    if (!node) continue;
-                    if (node->sim_ignore) continue;
-                    if (node->anchored && !node->collide_when_anchored) continue;
-                    if (!node->collide_with_walls) continue;
-
-                    float penetration = 0.0f;
-                    float normal[2];
-                    float t = 0.0f;
-                    int collided = wall_check_collision(w, node, &penetration, normal, &t);
-                    if (!collided) continue;
-
-                    // Separation force
-                    float sep_fx = normal[0] * (penetration * PENETRATION_STIFFNESS);
-                    float sep_fy = normal[1] * (penetration * PENETRATION_STIFFNESS);
-
-                    // Wall velocity at contact point
-                    float wvx = 0.0f, wvy = 0.0f;
-                    float *w_b_vel = w->B->vel;
-                    float *w_a_vel = w->A->vel;
-                    float t_inv = 1.0f - t;
-
-                    if (both_anchored) {
-                        wvx = 0.0f; wvy = 0.0f;
-                    } else if (A_anchored) {
-                        wvx = w_b_vel[0] * t; wvy = w_b_vel[1] * t;
-                    } else if (B_anchored) {
-                        wvx = w_a_vel[0] * t_inv; wvy = w_a_vel[1] * t_inv;
-                    } else {
-                        wvx = w_a_vel[0] * t_inv + w_b_vel[0] * t;
-                        wvy = w_a_vel[1] * t_inv + w_b_vel[1] * t;
-                    }
-
-                    // Relative velocity
-                    float rvx = node->vel[0] - wvx;
-                    float rvy = node->vel[1] - wvy;
-                    float normal_velocity = rvx * normal[0] + rvy * normal[1];
-
-                    // Damping when moving into wall
-                    if (normal_velocity < 0.0f) {
-                        float damping_fx = normal[0] * (-normal_velocity * node->mass * NORMAL_DAMP_K);
-                        float damping_fy = normal[1] * (-normal_velocity * node->mass * NORMAL_DAMP_K);
-                        sep_fx += damping_fx;
-                        sep_fy += damping_fy;
-                    }
-
-                    // Friction / tangential damping
-                    float tangent_x = rvx - normal[0] * normal_velocity;
-                    float tangent_y = rvy - normal[1] * normal_velocity;
-                    float t_mag_sq = tangent_x * tangent_x + tangent_y * tangent_y;
-                    if (t_mag_sq > 1e-16f) {
-                        float t_mag = sqrtf(t_mag_sq);
-                        float t_dir_x = tangent_x / t_mag;
-                        float t_dir_y = tangent_y / t_mag;
-                        float rv_dot_t = (rvx * t_dir_x + rvy * t_dir_y) * Kt * node->mass;
-                        float tangential_damping_x = -t_dir_x * (rv_dot_t);
-                        float tangential_damping_y = -t_dir_y * (rv_dot_t);
-
-                        if (!node->anchored) {
-                            float mu = node->friction * w->friction;
-                            float sep_mag_sq = sep_fx * sep_fx + sep_fy * sep_fy;
-                            float max_fric = mu * sqrtf(sep_mag_sq);
-                            float fric_mag_sq = tangential_damping_x * tangential_damping_x + 
-                                               tangential_damping_y * tangential_damping_y;
-                            if (fric_mag_sq > max_fric * max_fric) {
-                                float sign = (rv_dot_t >= 0.0f) ? 1.0f : -1.0f;
-                                tangential_damping_x = -t_dir_x * max_fric * sign;
-                                tangential_damping_y = -t_dir_y * max_fric * sign;
-                            }
-                            sep_fx += tangential_damping_x;
-                            sep_fy += tangential_damping_y;
-                        }
-                    }
-
-                    // Accumulate collision force on node
-                    collision_forces[2*i + 0] += sep_fx;
-                    collision_forces[2*i + 1] += sep_fy;
-
-                    // Reaction to wall endpoints
-                    float reaction_x = -sep_fx;
-                    float reaction_y = -sep_fy;
-                    float one_minus_t = 1.0f - t;
-                    if (w->A && w->A->idx >= 0) {
-                        int ai = w->A->idx;
-                        if (ai >= 0 && (size_t)ai < n_nodes) {
-                            collision_forces[2*ai+0] += reaction_x * one_minus_t;
-                            collision_forces[2*ai+1] += reaction_y * one_minus_t;
-                        }
-                    }
-                    if (w->B && w->B->idx >= 0) {
-                        int bi = w->B->idx;
-                        if (bi >= 0 && (size_t)bi < n_nodes) {
-                            collision_forces[2*bi+0] += reaction_x * t;
-                            collision_forces[2*bi+1] += reaction_y * t;
-                        }
-                    }
+    
+    // Insert all triangle walls into octree
+    for (size_t wi = 0; wi < n_walls; ++wi) {
+        TriangleWall *w = (TriangleWall*)dynarray_get(s->walls, wi);
+        if (!w || !w->A || !w->B || !w->C) continue;
+        octree_insert_triangle(s->octree, (int)wi, w->A->pos, w->B->pos, w->C->pos);
+    }
+    
+    // Check each node against candidate triangles from octree
+    for (size_t ni = 0; ni < n_nodes; ++ni) {
+        Node *node = (Node*)dynarray_get(s->nodes, ni);
+        if (!node) continue;
+        if (node->anchored && !node->collide_when_anchored) continue;
+        if (!node->collide_with_walls) continue;
+        
+        // Query triangles that could collide with this node
+        DynArray *candidates = octree_query_triangles(s->octree, node->pos);
+        if (!candidates) continue;
+        
+        for (size_t ci = 0; ci < dynarray_size(candidates); ++ci) {
+            int *tri_idx_ptr = (int*)dynarray_get(candidates, ci);
+            if (!tri_idx_ptr) continue;
+            int tri_idx = *tri_idx_ptr;
+            if (tri_idx < 0 || (size_t)tri_idx >= n_walls) continue;
+            
+            TriangleWall *w = (TriangleWall*)dynarray_get(s->walls, tri_idx);
+            if (!w) continue;
+            
+            float penetration;
+            float normal[3];
+            float u, v;
+            
+            if (triangle_check_collision(w, node, &penetration, normal, &u, &v)) {
+                // Compute separation force
+                float sep_force[3] = {
+                    normal[0] * penetration * PENETRATION_STIFFNESS,
+                    normal[1] * penetration * PENETRATION_STIFFNESS,
+                    normal[2] * penetration * PENETRATION_STIFFNESS
+                };
+                
+                // Compute relative velocity (node vel relative to triangle)
+                // Triangle velocity is weighted average of vertices
+                float wall_vel[3] = {0, 0, 0};
+                if (!w->A->anchored) {
+                    wall_vel[0] += (1.0f - u - v) * w->A->vel[0];
+                    wall_vel[1] += (1.0f - u - v) * w->A->vel[1];
+                    wall_vel[2] += (1.0f - u - v) * w->A->vel[2];
+                }
+                if (!w->B->anchored) {
+                    wall_vel[0] += u * w->B->vel[0];
+                    wall_vel[1] += u * w->B->vel[1];
+                    wall_vel[2] += u * w->B->vel[2];
+                }
+                if (!w->C->anchored) {
+                    wall_vel[0] += v * w->C->vel[0];
+                    wall_vel[1] += v * w->C->vel[1];
+                    wall_vel[2] += v * w->C->vel[2];
+                }
+                
+                float rel_vel[3] = {
+                    node->vel[0] - wall_vel[0],
+                    node->vel[1] - wall_vel[1],
+                    node->vel[2] - wall_vel[2]
+                };
+                
+                float normal_vel = rel_vel[0]*normal[0] + rel_vel[1]*normal[1] + rel_vel[2]*normal[2];
+                
+                // Normal damping (only if moving into wall)
+                if (normal_vel < 0.0f) {
+                    sep_force[0] -= normal[0] * normal_vel * NORMAL_DAMP_K;
+                    sep_force[1] -= normal[1] * normal_vel * NORMAL_DAMP_K;
+                    sep_force[2] -= normal[2] * normal_vel * NORMAL_DAMP_K;
+                }
+                
+                // Tangential friction
+                float tangent[3] = {
+                    rel_vel[0] - normal[0] * normal_vel,
+                    rel_vel[1] - normal[1] * normal_vel,
+                    rel_vel[2] - normal[2] * normal_vel
+                };
+                float tangent_len = sqrtf(tangent[0]*tangent[0] + tangent[1]*tangent[1] + tangent[2]*tangent[2]);
+                
+                if (tangent_len > 1e-9f) {
+                    float sep_mag = sqrtf(sep_force[0]*sep_force[0] + sep_force[1]*sep_force[1] + sep_force[2]*sep_force[2]);
+                    float max_fric = node->friction * sep_mag;
+                    float fric_mag = fminf(Kt * tangent_len, max_fric);
+                    
+                    float fric_force[3] = {
+                        -(tangent[0] / tangent_len) * fric_mag,
+                        -(tangent[1] / tangent_len) * fric_mag,
+                        -(tangent[2] / tangent_len) * fric_mag
+                    };
+                    
+                    sep_force[0] += fric_force[0];
+                    sep_force[1] += fric_force[1];
+                    sep_force[2] += fric_force[2];
+                }
+                
+                // Apply force to node
+                collision_forces[3*ni + 0] += sep_force[0];
+                collision_forces[3*ni + 1] += sep_force[1];
+                collision_forces[3*ni + 2] += sep_force[2];
+                
+                // Apply reaction forces to triangle vertices (distributed by barycentric weights)
+                if (!w->A->anchored) {
+                    float weight_a = 1.0f - u - v;
+                    collision_forces[3*w->A->idx + 0] -= sep_force[0] * weight_a;
+                    collision_forces[3*w->A->idx + 1] -= sep_force[1] * weight_a;
+                    collision_forces[3*w->A->idx + 2] -= sep_force[2] * weight_a;
+                }
+                if (!w->B->anchored) {
+                    collision_forces[3*w->B->idx + 0] -= sep_force[0] * u;
+                    collision_forces[3*w->B->idx + 1] -= sep_force[1] * u;
+                    collision_forces[3*w->B->idx + 2] -= sep_force[2] * u;
+                }
+                if (!w->C->anchored) {
+                    collision_forces[3*w->C->idx + 0] -= sep_force[0] * v;
+                    collision_forces[3*w->C->idx + 1] -= sep_force[1] * v;
+                    collision_forces[3*w->C->idx + 2] -= sep_force[2] * v;
                 }
             }
         }
+        
+        // Free candidate list
+        dynarray_free(candidates, free);
     }
-
-    // free walls_per_bucket lists
-    for (size_t b = 0; b < hash->bucket_count; ++b) {
-        if (walls_per_bucket[b]) {
-            dynarray_free(walls_per_bucket[b], free);
-        }
-    }
-    free(walls_per_bucket);
-
-    hashmap_free(hash, free_cell_dynarray);
 }
 
+// Legacy 2D spatial hash collision code (deprecated, kept for reference)
+// Helper: build spatial hash mapping cell_key -> DynArray of node indices (as int* allocated)
+// Simple spatial hash for two 32-bit integers (ix,iy).
 void simulator_step(Simulator *s) {
     if (!s) return;
     float dt = s->dt;
@@ -551,27 +474,27 @@ void simulator_step(Simulator *s) {
        current number of non-spring constraints (m). We conservatively
        compute an initial allocation for b/l based on the current
        constraint count; if m grows we will realloc. */
-    float *collision_forces = (float*)malloc(n_nodes * 2 * sizeof(float));
-    double *external_forces = (double*)malloc(sizeof(double) * n_nodes * 2);
-    size_t n2 = n_nodes * 2;
-    double *invm = (double*)malloc(sizeof(double) * n2);
+    float *collision_forces = (float*)malloc(n_nodes * 3 * sizeof(float));
+    double *external_forces = (double*)malloc(sizeof(double) * n_nodes * 3);
+    size_t n3 = n_nodes * 3;
+    double *invm = (double*)malloc(sizeof(double) * n3);
 
     // estimate maximum m (non-spring constraints) at start
     size_t m_alloc = dynarray_size(s->constraints);
     
     double *b = (double*)malloc(m_alloc * sizeof(double));
     double *l = (double*)malloc(m_alloc * sizeof(double));
-    double *corr_f = (double*)malloc(n2 * sizeof(double));
+    double *corr_f = (double*)malloc(n3 * sizeof(double));
 
     for (int sub = 0; sub < N; ++sub) {
         float sub_dt = dt / (float)N;
 
         /* zero scratch arrays for this substep */
-        memset(collision_forces, 0, sizeof(float) * n_nodes * 2);
-        memset(external_forces, 0, sizeof(double) * n_nodes * 2);
+        memset(collision_forces, 0, sizeof(float) * n_nodes * 3);
+        memset(external_forces, 0, sizeof(double) * n_nodes * 3);
 
         // compute collision forces fresh each substep
-        compute_wall_collision_forces(s, collision_forces);
+        compute_triangle_collision_forces(s, collision_forces);
         // printf("Substep %d: computed collision forces\n", sub);
         // 1) accumulate external forces (gravity + collisions) into external_forces
         //    instead of applying them directly to velocities. external_forces
@@ -584,15 +507,18 @@ void simulator_step(Simulator *s) {
             // gravity: accumulate as force = m * g
             if (n->isGravity) {
                 double mass = (double)fmaxf(n->mass, 1e-9f);
-                external_forces[2*i + 0] += mass * (double)s->gravity[0];
-                external_forces[2*i + 1] += mass * (double)s->gravity[1];
+                external_forces[3*i + 0] += mass * (double)s->gravity[0];
+                external_forces[3*i + 1] += mass * (double)s->gravity[1];
+                external_forces[3*i + 2] += mass * (double)s->gravity[2];
             }
             // collision forces were computed earlier as forces (float)
             if (collision_forces) {
-                double fx = (double)collision_forces[2*i + 0];
-                double fy = (double)collision_forces[2*i + 1];
-                external_forces[2*i + 0] += fx;
-                external_forces[2*i + 1] += fy;
+                double fx = (double)collision_forces[3*i + 0];
+                double fy = (double)collision_forces[3*i + 1];
+                double fz = (double)collision_forces[3*i + 2];
+                external_forces[3*i + 0] += fx;
+                external_forces[3*i + 1] += fy;
+                external_forces[3*i + 2] += fz;
             }
         }
 
@@ -607,35 +533,38 @@ void simulator_step(Simulator *s) {
             if (!a || !b) continue;
             float dx = a->pos[0] - b->pos[0];
             float dy = a->pos[1] - b->pos[1];
-            float dist = sqrtf(dx*dx + dy*dy);
+            float dz = a->pos[2] - b->pos[2];
+            float dist = sqrtf(dx*dx + dy*dy + dz*dz);
             if (dist < 1e-9f) continue;
             float rest = c->rest_length;
             float k = c->stiffness;
             float mag = k * (dist - rest);
-            float dirx = dx / dist, diry = dy / dist;
+            float dirx = dx / dist, diry = dy / dist, dirz = dz / dist;
             // force on A = -mag * dir (pull A toward B if stretched)
-            float fax = -mag * dirx, fay = -mag * diry;
+            float fax = -mag * dirx, fay = -mag * diry, faz = -mag * dirz;
             // accumulate spring forces into external_forces (force on A, opposite on B)
             if (!(a->anchored || a->sim_ignore)) {
-                external_forces[2*a->idx + 0] += (double)fax;
-                external_forces[2*a->idx + 1] += (double)fay;
+                external_forces[3*a->idx + 0] += (double)fax;
+                external_forces[3*a->idx + 1] += (double)fay;
+                external_forces[3*a->idx + 2] += (double)faz;
             }
             if (!(b->anchored || b->sim_ignore)) {
-                external_forces[2*b->idx + 0] -= (double)fax;
-                external_forces[2*b->idx + 1] -= (double)fay;
+                external_forces[3*b->idx + 0] -= (double)fax;
+                external_forces[3*b->idx + 1] -= (double)fay;
+                external_forces[3*b->idx + 2] -= (double)faz;
             }
         }
 
         // 2) Build J, A and solve for constraint multipliers (only non-spring constraints included in J)
         size_t m = 0;
-        // build invm vector (length n2) — reuse allocated array
+        // build invm vector (length n3) — reuse allocated array
         for (size_t i = 0; i < n_nodes; ++i) {
             Node *nn = (Node*)dynarray_get(s->nodes, i);
             double inv = (nn->anchored || nn->mass <= 0.0f) ? 0.0 : 1.0 / nn->mass;
-            invm[2*i + 0] = invm[2*i + 1] = inv;
+            invm[3*i + 0] = invm[3*i + 1] = invm[3*i + 2] = inv;
         }
         cs *Jc = NULL;
-        cs *Jct = NULL; // Jct is n2 x m (CSC)
+        cs *Jct = NULL; // Jct is n3 x m (CSC)
         cs *A_sparse = build_sparse_A_from_constraints(s, invm, &m, &Jc, &Jct);
 
         // regularize diagonal slightly where present
@@ -688,11 +617,11 @@ void simulator_step(Simulator *s) {
 
         // corr_f = -J^T * l
         // reuse corr_f buffer — zero before use (cs_gaxpy accumulates into y)
-        memset(corr_f, 0, sizeof(double) * n2);
+        memset(corr_f, 0, sizeof(double) * n3);
         if (Jc) {
             // Efficient: compute corr_f = -dt * (Jc^T * l).
-            // Use CSparse's transpose + gaxpy to compute y = Jc^T * l where Jc is m x n2.
-            // cs_gaxpy performs y = A * x (A in CSC). For A=Jct, x=l (len m), y=len n2.
+            // Use CSparse's transpose + gaxpy to compute y = Jc^T * l where Jc is m x n3.
+            // cs_gaxpy performs y = A * x (A in CSC). For A=Jct, x=l (len m), y=len n3.
             cs_gaxpy(Jct, l, corr_f);
             // scale by -dt
             for (int k = 0; k < Jct->m; ++k) corr_f[k] = -corr_f[k] * (double)dt;
@@ -709,8 +638,8 @@ void simulator_step(Simulator *s) {
         // fprintf(stderr, "l (m):\n");
         // for (size_t i = 0; i < m; ++i) fprintf(stderr, "% .6f ", l[i]);
         // fprintf(stderr, "\n");
-        // fprintf(stderr, "corr_f (n2):\n");
-        // for (size_t i = 0; i < n2; ++i) fprintf(stderr, "% .6f ", corr_f[i]);
+        // fprintf(stderr, "corr_f (n3):\n");
+        // for (size_t i = 0; i < n3; ++i) fprintf(stderr, "% .6f ", corr_f[i]);
         // fprintf(stderr, "\n-------------------------------\n");
 
         // apply accel = M_inv @ (corr_f + external_forces) to velocities (scale by sub_dt)
@@ -718,20 +647,26 @@ void simulator_step(Simulator *s) {
         for (size_t i = 0; i < n_nodes; ++i) {
             Node *nn = (Node*)dynarray_get(s->nodes, i);
             if (nn->anchored || nn->sim_ignore) continue;
-            double fcx = (double)corr_f[2*i + 0]*N;
-            double fcy = (double)corr_f[2*i + 1]*N;
-            double extx = external_forces ? external_forces[2*i + 0] : 0.0;
-            double exty = external_forces ? external_forces[2*i + 1] : 0.0;
+            double fcx = (double)corr_f[3*i + 0]*N;
+            double fcy = (double)corr_f[3*i + 1]*N;
+            double fcz = (double)corr_f[3*i + 2]*N;
+            double extx = external_forces ? external_forces[3*i + 0] : 0.0;
+            double exty = external_forces ? external_forces[3*i + 1] : 0.0;
+            double extz = external_forces ? external_forces[3*i + 2] : 0.0;
             double total_fx = fcx + extx;
             double total_fy = fcy + exty;
-            double ax = invm[2*i + 0] * total_fx;
-            double ay = invm[2*i + 1] * total_fy;
+            double total_fz = fcz + extz;
+            double ax = invm[3*i + 0] * total_fx;
+            double ay = invm[3*i + 1] * total_fy;
+            double az = invm[3*i + 2] * total_fz;
             nn->vel[0] += (float)(ax * (double)sub_dt);
             nn->vel[1] += (float)(ay * (double)sub_dt);
+            nn->vel[2] += (float)(az * (double)sub_dt);
 
             if (nn->anchored || nn->sim_ignore) continue;
             nn->pos[0] += (float)(nn->vel[0] * (double)sub_dt);
             nn->pos[1] += (float)(nn->vel[1] * (double)sub_dt);
+            nn->pos[2] += (float)(nn->vel[2] * (double)sub_dt);
         }
 
         /* free A_sparse and Jc for this substep (they were allocated inside build_sparse_A_from_constraints)
@@ -756,22 +691,24 @@ void simulator_draw(Simulator *s) {
         Constraint *c = (Constraint*)dynarray_get(s->constraints, i);
         if (c && c->draw) c->draw(c);
     }
-    // draw wall segments (black lines)
+    // draw triangle walls (all 3 edges as black lines in full 3D)
     for (size_t i = 0; i < dynarray_size(s->walls); ++i) {
-        WallSegment *w = (WallSegment*)dynarray_get(s->walls, i);
-        if (!w) continue;
+        TriangleWall *w = (TriangleWall*)dynarray_get(s->walls, i);
+        if (!w || !w->A || !w->B || !w->C) continue;
         glColor3f(0.0f, 0.0f, 0.0f);
-        glBegin(GL_LINES);
-        glVertex2f(w->A->pos[0], w->A->pos[1]);
-        glVertex2f(w->B->pos[0], w->B->pos[1]);
+        glBegin(GL_LINE_LOOP);
+        glVertex3f(w->A->pos[0], w->A->pos[1], w->A->pos[2]);
+        glVertex3f(w->B->pos[0], w->B->pos[1], w->B->pos[2]);
+        glVertex3f(w->C->pos[0], w->C->pos[1], w->C->pos[2]);
         glEnd();
-    // draw endpoints as small black dots
-    glPointSize(4.0f);
-    glBegin(GL_POINTS);
-    glVertex2f(w->A->pos[0], w->A->pos[1]);
-    glVertex2f(w->B->pos[0], w->B->pos[1]);
-    glEnd();
-    glPointSize(1.0f);
+        // draw vertices as small black dots
+        glPointSize(4.0f);
+        glBegin(GL_POINTS);
+        glVertex3f(w->A->pos[0], w->A->pos[1], w->A->pos[2]);
+        glVertex3f(w->B->pos[0], w->B->pos[1], w->B->pos[2]);
+        glVertex3f(w->C->pos[0], w->C->pos[1], w->C->pos[2]);
+        glEnd();
+        glPointSize(1.0f);
     }
     // draw nodes (use each node's radius so rendering matches physics/visual size)
     for (size_t i = 0; i < dynarray_size(s->nodes); ++i) {
@@ -842,7 +779,7 @@ DynArray* simulator_generate_mesh_from_nodes(Simulator *sim, DynArray *poly_node
             float t = (float)j / (float)k;
             float x = A->pos[0] * (1.0f - t) + B->pos[0] * t;
             float y = A->pos[1] * (1.0f - t) + B->pos[1] * t;
-            Node *nn = node_create(-1, 1.0f, x, y);
+            Node *nn = node_create(-1, 1.0f, x, y, 0.0f);
             simulator_add_node(sim, nn);
             dynarray_append(outline, nn);
         }
@@ -905,7 +842,7 @@ DynArray* simulator_generate_mesh_from_nodes(Simulator *sim, DynArray *poly_node
                 if (dx*dx + dy*dy < dup_thresh2) { too_close = 1; break; }
             }
             if (too_close) continue;
-            Node *nn = node_create(-1, 1.0f, (float)x, (float)y);
+            Node *nn = node_create(-1, 1.0f, (float)x, (float)y, 0.0f);
             simulator_add_node(sim, nn);
             grid[ix*ny + iy] = nn;
         }
@@ -994,7 +931,7 @@ DynArray* simulator_generate_mesh_from_nodes(Simulator *sim, DynArray *poly_node
                     double cy = miny + gy * spacing;
                     if (!point_in_polygon(poly_pts, n_orig, cx, cy)) continue;
                     /* create new interior node at cell center */
-                    Node *nn = node_create(-1, 1.0f, (float)cx, (float)cy);
+                    Node *nn = node_create(-1, 1.0f, (float)cx, (float)cy, 0.0f);
                     simulator_add_node(sim, nn);
                     grid[idx] = nn;
                     /* connect new node to any existing neighbor nodes (8-connectivity) */

@@ -41,18 +41,19 @@ Constraint* distconstraint_create(Node *node, Node *other, float distance);
 
 Constraint* springconstraint_create(Node *node, Node *other, float stiffness, float distance);
 
-Constraint* anchorconstraint_create(Node *node, float x, float y);
+Constraint* anchorconstraint_create(Node *node, float x, float y, float z);
 
-// Wall segment
-typedef struct WallSegment {
+// Triangle wall (3D boundary)
+typedef struct TriangleWall {
     Node *A;
     Node *B;
+    Node *C;
     float restitution;
     float friction;
-} WallSegment;
+} TriangleWall;
 
-WallSegment* wallsegment_create(Node *A, Node *B, float restitution, float friction);
-void wallsegment_free(WallSegment *w);
+TriangleWall* trianglewall_create(Node *A, Node *B, Node *C, float restitution, float friction);
+void trianglewall_free(TriangleWall *w);
 
 // Refresh internal cached node indices inside constraint implementations.
 // Call this after node indices change (for example after deleting nodes).

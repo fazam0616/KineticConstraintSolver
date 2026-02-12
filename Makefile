@@ -4,14 +4,14 @@
 CC = gcc
 
 # Source files
-SRC = main.c Menu.c datastructures.c Node.c Constraint.c Simulator.c
+SRC = main.c Menu.c datastructures.c Node.c Constraint.c Simulator.c Octree.c
 
 # Compiler flags
 ## CSparse / SuiteSparse settings
 # You can set CSPARSE_INC and CSPARSE_LIB when calling make, for example:
 # make CSPARSE_INC=./SuiteSparse/CSparse/Include CSPARSE_LIB=./SuiteSparse/CSparse/build/libcsparse.so
-CSPARSE_INC ?=
-CSPARSE_LIB ?= -lcsparse
+CSPARSE_INC ?= /usr/include/suitesparse
+CSPARSE_LIB ?= -L/usr/lib/x86_64-linux-gnu -lcxsparse
 
 # Compiler flags (always enable debug jacobian)
 CFLAGS = -Wall -Wextra -g -DDEBUG_JACOBIAN $(if $(CSPARSE_INC),-I$(CSPARSE_INC))
