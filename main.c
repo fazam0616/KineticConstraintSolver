@@ -1703,7 +1703,7 @@ int main(int argc, char *argv[]) {
                 // Force-drag is applied continuously in the per-frame update (see below).
             }
 
-            // Camera controls: WASD for movement, SHIFT for up, CTRL for down, space+drag to rotate, scroll for zoom/speed
+            // Camera controls: WASD for movement, SHIFT for up, CTRL for down, P to pause, space+drag to rotate, scroll for zoom/speed
             if (event.type == SDL_KEYDOWN) {
                 if (event.key.keysym.sym == SDLK_SPACE) space_down = 1;
                 else if (event.key.keysym.sym == SDLK_w) key_w = 1;
@@ -1712,6 +1712,9 @@ int main(int argc, char *argv[]) {
                 else if (event.key.keysym.sym == SDLK_d) key_d = 1;
                 else if (event.key.keysym.sym == SDLK_LSHIFT || event.key.keysym.sym == SDLK_RSHIFT) key_shift = 1;
                 else if (event.key.keysym.sym == SDLK_LCTRL || event.key.keysym.sym == SDLK_RCTRL) key_ctrl = 1;
+                else if (event.key.keysym.sym == SDLK_p) {
+                    paused = !paused; // Toggle pause
+                }
                 // Plane selection with up/down arrows
                 else if (event.key.keysym.sym == SDLK_UP) {
                     current_plane = (current_plane + 1) % 6;

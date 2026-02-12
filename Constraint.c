@@ -219,10 +219,12 @@ static void dist_dc_triplet(Constraint *self, void *T, int row) {
 static void dist_draw(Constraint *self) {
     DistConstraintImpl *d = (DistConstraintImpl*)self;
     glColor3f(0.0f, 0.6f, 0.0f);
+    glLineWidth(3.0f);
     glBegin(GL_LINES);
     glVertex3f(d->base.node->pos[0], d->base.node->pos[1], d->base.node->pos[2]);
     glVertex3f(d->other->pos[0], d->other->pos[1], d->other->pos[2]);
     glEnd();
+    glLineWidth(1.0f);
 }
 
 Constraint* distconstraint_create(Node *node, Node *other, float distance) {
@@ -297,10 +299,12 @@ static void spring_draw(Constraint *self) {
         r = g = b = 1.0f;
     }
     glColor3f(r, g, b);
+    glLineWidth(3.0f);
     glBegin(GL_LINES);
     glVertex3f(d->base.node->pos[0], d->base.node->pos[1], d->base.node->pos[2]);
     glVertex3f(d->other->pos[0], d->other->pos[1], d->other->pos[2]);
     glEnd();
+    glLineWidth(1.0f);
 }
 
 Constraint* springconstraint_create(Node *node, Node *other, float stiffness, float distance) {
