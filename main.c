@@ -760,7 +760,7 @@ static int ray_plane_intersect(float ray_ox, float ray_oy, float ray_oz,
     if (fabsf(denom) < 1e-6f) return 0; // ray parallel to plane
     
     float t = (plane_d - (ray_ox * plane_nx + ray_oy * plane_ny + ray_oz * plane_nz)) / denom;
-    if (t < 0.0f) return 0; // intersection behind ray origin
+    // Allow intersections in both directions (remove t < 0 check) so objects behind the plane are also selectable
     
     *hit_x = ray_ox + t * ray_dx;
     *hit_y = ray_oy + t * ray_dy;
@@ -1044,7 +1044,7 @@ int main(int argc, char *argv[]) {
     // 6 planes: world X, Y, Z and camera-relative X, Y, Z
     enum PlaneType { PLANE_WORLD_X = 0, PLANE_WORLD_Y, PLANE_WORLD_Z, PLANE_CAM_X, PLANE_CAM_Y, PLANE_CAM_Z };
     int current_plane = PLANE_WORLD_Y;  // start with world Y plane (horizontal ground)
-    float plane_offsets[6] = { 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f };  // remembered offsets for each plane
+    float plane_offsets[6] = { 0.0f, 0.0f, 0.0f, 10.0f, 10.0f, 10.0f };  // remembered offsets for each plane (camera planes start at +10)
     float plane_offset_step = 10.0f;  // how much to adjust with left/right arrows
     float selection_distance_threshold = 20.0f;  // max distance from plane for selection
     
@@ -1479,9 +1479,9 @@ int main(int argc, char *argv[]) {
                                 for (size_t ii = 0; ii < dynarray_size(sim->nodes); ++ii) {
                                     Node *nn = (Node*)dynarray_get(sim->nodes, ii);
                                     if (!nn) continue;
-                                    // Check distance from plane
-                                    float dist_to_plane = point_plane_distance(nn->pos[0], nn->pos[1], nn->pos[2],
-                                                                               plane_nx, plane_ny, plane_nz, plane_d);
+                                    // Check absolute distance from plane (both sides)
+                                    float dist_to_plane = fabsf(point_plane_distance(nn->pos[0], nn->pos[1], nn->pos[2],
+                                                                               plane_nx, plane_ny, plane_nz, plane_d));
                                     if (dist_to_plane > selection_distance_threshold) continue;
                                     
                                     // Check distance from pick position (2D screen space approximation)
@@ -1499,11 +1499,11 @@ int main(int argc, char *argv[]) {
                                     if (!c) continue;
                                     if (c->type == CT_DIST || c->type == CT_SPRING) {
                                         if (!c->node || !c->other) continue;
-                                        // Check if constraint endpoints are near plane
-                                        float dist1 = point_plane_distance(c->node->pos[0], c->node->pos[1], c->node->pos[2],
-                                                                          plane_nx, plane_ny, plane_nz, plane_d);
-                                        float dist2 = point_plane_distance(c->other->pos[0], c->other->pos[1], c->other->pos[2],
-                                                                          plane_nx, plane_ny, plane_nz, plane_d);
+                                        // Check if constraint endpoints are near plane (both sides)
+                                        float dist1 = fabsf(point_plane_distance(c->node->pos[0], c->node->pos[1], c->node->pos[2],
+                                                                          plane_nx, plane_ny, plane_nz, plane_d));
+                                        float dist2 = fabsf(point_plane_distance(c->other->pos[0], c->other->pos[1], c->other->pos[2],
+                                                                          plane_nx, plane_ny, plane_nz, plane_d));
                                         if (dist1 > selection_distance_threshold && dist2 > selection_distance_threshold) continue;
                                         
                                         float d2 = point_segment_distance2(wx, wy, c->node->pos[0], c->node->pos[1], c->other->pos[0], c->other->pos[1]);
@@ -1517,11 +1517,11 @@ int main(int argc, char *argv[]) {
                                 for (size_t ii = 0; ii < dynarray_size(sim->walls); ++ii) {
                                     TriangleWall *w = (TriangleWall*)dynarray_get(sim->walls, ii);
                                     if (!w || !w->A || !w->B) continue;
-                                    // Check if wall endpoints are near plane
-                                    float dist1 = point_plane_distance(w->A->pos[0], w->A->pos[1], w->A->pos[2],
-                                                                       plane_nx, plane_ny, plane_nz, plane_d);
-                                    float dist2 = point_plane_distance(w->B->pos[0], w->B->pos[1], w->B->pos[2],
-                                                                       plane_nx, plane_ny, plane_nz, plane_d);
+                                    // Check if wall endpoints are near plane (both sides)
+                                    float dist1 = fabsf(point_plane_distance(w->A->pos[0], w->A->pos[1], w->A->pos[2],
+                                                                       plane_nx, plane_ny, plane_nz, plane_d));
+                                    float dist2 = fabsf(point_plane_distance(w->B->pos[0], w->B->pos[1], w->B->pos[2],
+                                                                       plane_nx, plane_ny, plane_nz, plane_d));
                                     if (dist1 > selection_distance_threshold && dist2 > selection_distance_threshold) continue;
                                     
                                     float d2 = point_segment_distance2(wx, wy, w->A->pos[0], w->A->pos[1], w->B->pos[0], w->B->pos[1]);
