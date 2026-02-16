@@ -26,6 +26,7 @@ struct OctreeNode {
     OctreeNode *children[8];  // NULL if leaf
     DynArray *node_entries;   // NodeEntry* in this cell (leaf only)
     DynArray *triangle_indices; // Indices of TriangleWalls stored at this level
+    DynArray *constraint_indices; // Indices of constraints (for edge-edge collisions)
     int depth;
     int is_leaf;
 };
@@ -37,6 +38,14 @@ void octree_free(OctreeNode *node);
 
 // Insert a node (by index) into the octree at the appropriate leaf
 void octree_insert_node(OctreeNode *root, int node_idx, float pos[3]);
+
+// Insert a constraint (by index) into ancestor node containing both endpoints
+void octree_insert_constraint(OctreeNode *root, int constraint_idx,
+                             float pos_a[3], float pos_b[3]);
+
+// Insert a constraint (by index) into the ancestor node containing both endpoints
+void octree_insert_constraint(OctreeNode *root, int constraint_idx, 
+                             float pos_a[3], float pos_b[3]);
 
 // Insert a triangle (by index) into the octree at the minimal common ancestor
 // of all three vertices. Returns the depth at which it was stored.
@@ -50,6 +59,10 @@ DynArray* octree_query_triangles(OctreeNode *root, float pos[3]);
 // Query nodes in the leaf cell containing the given position.
 // Returns a DynArray* of int* (node indices). Caller must free.
 DynArray* octree_query_nodes(OctreeNode *root, float pos[3]);
+
+// Query constraints in region containing both points (finds ancestor node).
+// Returns a DynArray* of int* (constraint indices). Caller must free.
+DynArray* octree_query_constraints(OctreeNode *root, float pos_a[3], float pos_b[3]);
 
 // Find the closest node to a given position within max_distance.
 // Returns node index or -1 if none found.

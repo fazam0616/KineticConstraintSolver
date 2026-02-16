@@ -49,6 +49,9 @@ typedef struct {
     int *wall_add_dist;
     double *wall_friction;
     double *wall_restitution;
+    // Pointers to pending node tracking for tools
+    Node **pending_tool_node;
+    Node **pending_tool_node2;
 } EditData;
 
 // helper: remove and free a menu from the menus list if present
@@ -394,6 +397,9 @@ static void on_tool_change(VariableInteraction *vi, void *user_data) {
             *(ed->drag_enabled) = 0;
         }
     }
+    // Clear pending nodes when switching tools
+    if (ed->pending_tool_node) *(ed->pending_tool_node) = NULL;
+    if (ed->pending_tool_node2) *(ed->pending_tool_node2) = NULL;
     // Update row 2 contents
     update_edit_row2_for_tool(ed);
     // If select tool, create bottom selection menu; otherwise destroy it
@@ -739,7 +745,7 @@ static void get_plane_params(int plane_type, float offset, float cam_yaw, float 
         case 5: // PLANE_CAM_Z: perpendicular to camera forward vector
             {
                 float forward_x = -sinf(cam_yaw) * cosf(cam_pitch);
-                float forward_y = -sinf(cam_pitch);
+                float forward_y = sinf(cam_pitch);
                 float forward_z = -cosf(cam_yaw) * cosf(cam_pitch);
                 *normal_x = forward_x; *normal_y = forward_y; *normal_z = forward_z;
                 *d = cam_x * forward_x + cam_y * forward_y + cam_z * forward_z + offset;
@@ -982,8 +988,8 @@ int main(int argc, char *argv[]) {
          sim->dt via callback. */
      double step_size = sim->dt;
      int paused = 0;
-    // Grid rendering controls (toggle + cell size slider)
-    int show_grid = 1;
+    // Octree rendering control
+    int show_octree = 1;
     double grid_cell_size = 10.0; /* default matches Simulator.c cell size; slider range below */
 
     Menu *ctrl = menu_create(10, 10, 220, 110, 100, "Controls", (Color){255,255,255,255}, (Color){40,40,60,255});
@@ -1004,9 +1010,9 @@ int main(int argc, char *argv[]) {
     VariableInteraction *vi_sps = variableinteraction_create(&sps, "Steps/s", 15.0, 500.0, VAR_SLIDER, sim_on_step_change, sim);
     menurow_add_interaction(r_sps, vi_sps);
     menu_add_row(ctrl, r_sps);
-    // Row: Grid toggle
+    // Row: Octree toggle
     MenuRow *r_grid = menurow_create();
-    VariableInteraction *vi_grid = variableinteraction_create(&show_grid, "Show Grid", 0, 1, VAR_BOOL, NULL, NULL);
+    VariableInteraction *vi_grid = variableinteraction_create(&show_octree, "Show Octree", 0, 1, VAR_BOOL, NULL, NULL);
     menurow_add_interaction(r_grid, vi_grid);
     menu_add_row(ctrl, r_grid);
     // Row: Cell size slider (0.5 .. 75)
@@ -1069,8 +1075,12 @@ int main(int argc, char *argv[]) {
 
     int n = 6;
 
-    // pending node for pair-based tool actions (dist/spring/wall)
+    // pending nodes for tool actions (dist/spring use 1, wall uses 2)
     Node *pending_tool_node = NULL;
+    Node *pending_tool_node2 = NULL;
+    // Hook up pending node pointers to EditData
+    edata.pending_tool_node = &pending_tool_node;
+    edata.pending_tool_node2 = &pending_tool_node2;
     // last click candidates for cycling with arrow keys
     DynArray *last_candidates = NULL; // ClickCandidate*
     int last_candidate_index = 0;
@@ -1338,7 +1348,7 @@ int main(int argc, char *argv[]) {
     // Tetrahedron above ground, pointy end down
     float tet_size = 30.0f;
     float tet_center_z = ground_z;  // same Z as ground center
-    float tet_bottom_y = ground_y + 20.0f;  // 20 units above ground
+    float tet_bottom_y = ground_y + 50.0f;  // 20 units above ground
     float tet_height = tet_size * sqrtf(2.0f / 3.0f);  // height of regular tetrahedron
     
     // Bottom vertex (pointy end)
@@ -1371,6 +1381,160 @@ int main(int argc, char *argv[]) {
     simulator_add_constraint(sim, distconstraint_create(t1, t2, -1));
     simulator_add_constraint(sim, distconstraint_create(t2, t3, -1));
     simulator_add_constraint(sim, distconstraint_create(t3, t1, -1));
+    
+    // Triangle walls for all 4 faces of tetrahedron
+    TriangleWall *tet_face1 = trianglewall_create(t1, t2, t3, 1.0f, 0.0f);  // Top face
+    TriangleWall *tet_face2 = trianglewall_create(t_bottom, t2, t1, 1.0f, 0.0f);  // Side 1
+    TriangleWall *tet_face3 = trianglewall_create(t_bottom, t3, t2, 1.0f, 0.0f);  // Side 2
+    TriangleWall *tet_face4 = trianglewall_create(t_bottom, t1, t3, 1.0f, 0.0f);  // Side 3
+    simulator_add_wall(sim, tet_face1);
+    simulator_add_wall(sim, tet_face2);
+    simulator_add_wall(sim, tet_face3);
+    simulator_add_wall(sim, tet_face4);
+    
+    // Double pendulum: above and to the side
+    // Anchor point at (150, 50, -300) - off to the right, above ground
+    float pend_anchor_x = 150.0f;
+    float pend_anchor_y = 50.0f;
+    float pend_anchor_z = -300.0f;
+    float arm_length = 40.0f;
+    
+    // Anchor node (fixed)
+    Node *pend_anchor = node_create(-1, 1.0f, pend_anchor_x, pend_anchor_y, pend_anchor_z);
+    pend_anchor->anchored = true;
+    simulator_add_node(sim, pend_anchor);
+    
+    // First bob: lying flat on xz plane (extend in +x direction)
+    Node *pend_bob1 = node_create(-1, 5.0f, pend_anchor_x + arm_length, pend_anchor_y, pend_anchor_z);
+    simulator_add_node(sim, pend_bob1);
+    
+    // Second bob: pointing up (extend in +y direction from bob1)
+    Node *pend_bob2 = node_create(-1, 5.0f, pend_bob1->pos[0], pend_bob1->pos[1] + arm_length, pend_bob1->pos[2]);
+    simulator_add_node(sim, pend_bob2);
+    
+    // Distance constraints for pendulum arms
+    simulator_add_constraint(sim, distconstraint_create(pend_anchor, pend_bob1, -1));
+    simulator_add_constraint(sim, distconstraint_create(pend_bob1, pend_bob2, -1));
+    
+    // Equilateral Triangular Prism near tetrahedron
+    float prism_side = 30.0f;  // side length of equilateral triangle base
+    float prism_height = 60.0f;  // height/length of prism
+    float prism_x = 80.0f;  // offset to the right of tetrahedron
+    float prism_y = ground_y + 40.0f;  // base at 40 units above ground
+    float prism_z = ground_z;  // same Z as ground
+    
+    // Bottom triangle vertices (equilateral triangle in XZ plane)
+    float tri_height = prism_side * sqrtf(3.0f) / 2.0f;  // height of equilateral triangle
+    Node *pb1 = node_create(-1, 1.0f, prism_x, prism_y, prism_z - tri_height / 3.0f);
+    Node *pb2 = node_create(-1, 1.0f, prism_x - prism_side / 2.0f, prism_y, prism_z + tri_height * 2.0f / 3.0f);
+    Node *pb3 = node_create(-1, 1.0f, prism_x + prism_side / 2.0f, prism_y, prism_z + tri_height * 2.0f / 3.0f);
+    simulator_add_node(sim, pb1);
+    simulator_add_node(sim, pb2);
+    simulator_add_node(sim, pb3);
+    
+    // Top triangle vertices (directly above bottom triangle)
+    Node *pt1 = node_create(-1, 1.0f, pb1->pos[0], prism_y + prism_height, pb1->pos[2]);
+    Node *pt2 = node_create(-1, 1.0f, pb2->pos[0], prism_y + prism_height, pb2->pos[2]);
+    Node *pt3 = node_create(-1, 1.0f, pb3->pos[0], prism_y + prism_height, pb3->pos[2]);
+    simulator_add_node(sim, pt1);
+    simulator_add_node(sim, pt2);
+    simulator_add_node(sim, pt3);
+    
+    // Distance constraints for all edges (3 bottom, 3 top, 3 vertical)
+    simulator_add_constraint(sim, distconstraint_create(pb1, pb2, -1));
+    simulator_add_constraint(sim, distconstraint_create(pb2, pb3, -1));
+    simulator_add_constraint(sim, distconstraint_create(pb3, pb1, -1));
+    simulator_add_constraint(sim, distconstraint_create(pt1, pt2, -1));
+    simulator_add_constraint(sim, distconstraint_create(pt2, pt3, -1));
+    simulator_add_constraint(sim, distconstraint_create(pt3, pt1, -1));
+    simulator_add_constraint(sim, distconstraint_create(pb1, pt1, -1));
+    simulator_add_constraint(sim, distconstraint_create(pb2, pt2, -1));
+    simulator_add_constraint(sim, distconstraint_create(pb3, pt3, -1));
+    
+    // Diagonal constraints for rectangular faces (prevent shearing)
+    simulator_add_constraint(sim, distconstraint_create(pb1, pt2, -1));  // Side 1 diagonal
+    simulator_add_constraint(sim, distconstraint_create(pb2, pt3, -1));  // Side 2 diagonal
+    simulator_add_constraint(sim, distconstraint_create(pb3, pt1, -1));  // Side 3 diagonal
+    
+    // Triangle walls for bottom and top faces
+    TriangleWall *prism_bottom = trianglewall_create(pb1, pb3, pb2, 1.0f, 0.0f);  // Bottom (clockwise from below)
+    TriangleWall *prism_top = trianglewall_create(pt1, pt2, pt3, 1.0f, 0.0f);  // Top (clockwise from above)
+    simulator_add_wall(sim, prism_bottom);
+    simulator_add_wall(sim, prism_top);
+    
+    // Rectangular side walls (each split into 2 triangles)
+    // Side 1: pb1-pb2-pt2-pt1
+    TriangleWall *prism_side1a = trianglewall_create(pb1, pb2, pt2, 1.0f, 0.0f);
+    TriangleWall *prism_side1b = trianglewall_create(pb1, pt2, pt1, 1.0f, 0.0f);
+    simulator_add_wall(sim, prism_side1a);
+    simulator_add_wall(sim, prism_side1b);
+    
+    // Side 2: pb2-pb3-pt3-pt2
+    TriangleWall *prism_side2a = trianglewall_create(pb2, pb3, pt3, 1.0f, 0.0f);
+    TriangleWall *prism_side2b = trianglewall_create(pb2, pt3, pt2, 1.0f, 0.0f);
+    simulator_add_wall(sim, prism_side2a);
+    simulator_add_wall(sim, prism_side2b);
+    
+    // Side 3: pb3-pb1-pt1-pt3
+    TriangleWall *prism_side3a = trianglewall_create(pb3, pb1, pt1, 1.0f, 0.0f);
+    TriangleWall *prism_side3b = trianglewall_create(pb3, pt1, pt3, 1.0f, 0.0f);
+    simulator_add_wall(sim, prism_side3a);
+    simulator_add_wall(sim, prism_side3b);
+    
+    // Edge-Edge Collision Test (to the left)
+    // Single anchor with a triangular pendulum that swings and collides with a horizontal triangle
+    float test_x = -250.0f;
+    float test_y = ground_y + 60.0f;
+    float test_z = ground_z;
+    
+    // Anchor point
+    Node *edge_anchor = node_create(-1, 0.5f, test_x, test_y, test_z);
+    edge_anchor->anchored = true;
+    simulator_add_node(sim, edge_anchor);
+    
+    // Triangular pendulum (3 nodes forming triangle, displaced to create swing)
+    float pend_arm = 40.0f;
+    float pend_tri_size = 25.0f;
+    Node *pend1 = node_create(-1, 2.0f, test_x + pend_arm - pend_tri_size/2, test_y - 20.0f, test_z);
+    Node *pend2 = node_create(-1, 2.0f, test_x + pend_arm + pend_tri_size/2, test_y - 20.0f, test_z);
+    Node *pend3 = node_create(-1, 2.0f, test_x + pend_arm, test_y - 20.0f - pend_tri_size * 0.866f, test_z);
+    simulator_add_node(sim, pend1);
+    simulator_add_node(sim, pend2);
+    simulator_add_node(sim, pend3);
+    
+    // Distance constraints: anchor to each vertex and between all vertices
+    simulator_add_constraint(sim, distconstraint_create(edge_anchor, pend1, -1));
+    simulator_add_constraint(sim, distconstraint_create(edge_anchor, pend2, -1));
+    simulator_add_constraint(sim, distconstraint_create(edge_anchor, pend3, -1));
+    simulator_add_constraint(sim, distconstraint_create(pend1, pend2, -1));
+    simulator_add_constraint(sim, distconstraint_create(pend2, pend3, -1));
+    simulator_add_constraint(sim, distconstraint_create(pend3, pend1, -1));
+    
+    // Pendulum triangle as collision surface
+    TriangleWall *pend_wall = trianglewall_create(pend1, pend2, pend3, 1.0f, 0.0f);
+    simulator_add_wall(sim, pend_wall);
+    
+    // Static horizontal triangle (flat on x-z plane) positioned to collide with pendulum
+    float horiz_y = test_y - 45.0f;  // positioned in swing path
+    Node *horiz1 = node_create(-1, 1.0f, test_x - 20.0f, horiz_y, test_z - 20.0f);
+    Node *horiz2 = node_create(-1, 1.0f, test_x + 10.0f, horiz_y, test_z - 20.0f);
+    Node *horiz3 = node_create(-1, 1.0f, test_x - 5.0f, horiz_y, test_z + 20.0f);
+    horiz1->anchored = true;
+    horiz2->anchored = true;
+    horiz3->anchored = true;
+    simulator_add_node(sim, horiz1);
+    simulator_add_node(sim, horiz2);
+    simulator_add_node(sim, horiz3);
+    
+    // Distance constraints for horizontal triangle structure
+    simulator_add_constraint(sim, distconstraint_create(horiz1, horiz2, -1));
+    simulator_add_constraint(sim, distconstraint_create(horiz2, horiz3, -1));
+    simulator_add_constraint(sim, distconstraint_create(horiz3, horiz1, -1));
+    
+    // Horizontal triangle as collision surface
+    TriangleWall *horiz_wall = trianglewall_create(horiz1, horiz2, horiz3, 1.0f, 0.0f);
+    simulator_add_wall(sim, horiz_wall);
+    
     printf("Generated initial scenario with %zu nodes, %zu constraints, %zu walls\n",
         dynarray_size(sim->nodes), dynarray_size(sim->constraints), dynarray_size(sim->walls));
 
@@ -1614,57 +1778,92 @@ int main(int argc, char *argv[]) {
                     }
                     else if (current_tool == TOOL_ADD_DIST || current_tool == TOOL_ADD_SPRING || current_tool == TOOL_ADD_WALL) {
                         const float pick_px = 8.0f;
-                        const float pick_world = pick_px; // TODO: scale based on camera distance
+                        const float pick_world = pick_px; // TODO: scale based on camera distance in 3D
+                        
+                        // Get plane parameters for distance filtering (same as selection tool)
+                        float plane_nx, plane_ny, plane_nz, plane_d;
+                        get_plane_params(current_plane, plane_offsets[current_plane], cam_yaw, cam_pitch,
+                                        cam_x, cam_y, cam_z, &plane_nx, &plane_ny, &plane_nz, &plane_d);
+                        
                         if (event.type == SDL_MOUSEBUTTONDOWN && button == SDL_BUTTON_LEFT) {
-                            // find node under mouse
+                            // find node under mouse using same plane-based filtering as selection
                             Node *found = NULL;
                             for (size_t ii = 0; ii < dynarray_size(sim->nodes); ++ii) {
                                 Node *nn = (Node*)dynarray_get(sim->nodes, ii);
                                 if (!nn) continue;
-                                float dx = wx - nn->pos[0]; float dy = wy - nn->pos[1];
-                                float d2 = dx*dx + dy*dy;
+                                
+                                // Check absolute distance from plane (both sides)
+                                float dist_to_plane = fabsf(point_plane_distance(nn->pos[0], nn->pos[1], nn->pos[2],
+                                                                           plane_nx, plane_ny, plane_nz, plane_d));
+                                if (dist_to_plane > selection_distance_threshold) continue;
+                                
+                                // Check 3D distance from pick position
+                                float dx = wx - nn->pos[0]; float dy = wy - nn->pos[1]; float dz = wz - nn->pos[2];
+                                float d2 = dx*dx + dy*dy + dz*dz;
                                 float r = nn->radius + pick_world;
                                 if (d2 <= r*r) { found = nn; break; }
                             }
                             if (found) {
-                                if (pending_tool_node == NULL) {
-                                    // set the first endpoint
-                                    pending_tool_node = found;
-                                } else if (pending_tool_node == found) {
-                                    // clicked same node again: clear pending
-                                    pending_tool_node = NULL;
-                                } else {
-                                    // create the requested constraint/wall between pending_tool_node and found
-                                    if (current_tool == TOOL_ADD_DIST) {
-                                        Constraint *c = distconstraint_create(pending_tool_node, found, -1);
-                                        if (c) simulator_add_constraint(sim, c);
-                                    } else if (current_tool == TOOL_ADD_SPRING) {
-                                        // rest length = current distance; stiffness from edit prefs
-                                        float dx = pending_tool_node->pos[0] - found->pos[0];
-                                        float dy = pending_tool_node->pos[1] - found->pos[1];
-                                        float rest = sqrtf(dx*dx + dy*dy);
-                                        float stiff = edata.spring_stiffness ? (float)(*(edata.spring_stiffness)) : 10.0f;
-                                        Constraint *c = springconstraint_create(pending_tool_node, found, stiff, rest);
-                                        if (c) simulator_add_constraint(sim, c);
-                                    } else if (current_tool == TOOL_ADD_WALL) {
-                                        float wf = edata.wall_friction ? (float)(*(edata.wall_friction)) : 1.0f;
-                                        float wr = edata.wall_restitution ? (float)(*(edata.wall_restitution)) : 0.0f;
-                                        Node *w_c = node_create(-1, 0.0f,
-                                            (pending_tool_node->pos[0] + found->pos[0]) * 0.5f,
-                                            (pending_tool_node->pos[1] + found->pos[1]) * 0.5f,
-                                            10.0f);
-                                        w_c->anchored = true; w_c->collide_with_walls = false;
-                                        simulator_add_node(sim, w_c);
-                                        TriangleWall *w = trianglewall_create(pending_tool_node, found, w_c, wf, wr);
-                                        if (w) simulator_add_wall(sim, w);
-                                        // if +Dist toggle is set, also add a distance constraint between the nodes
-                                        if (edata.wall_add_dist && edata.wall_add_dist[0]) {
-                                            Constraint *dc = distconstraint_create(pending_tool_node, found, -1);
-                                            if (dc) simulator_add_constraint(sim, dc);
+                                if (current_tool == TOOL_ADD_WALL) {
+                                    // Wall tool requires 3 nodes
+                                    if (pending_tool_node == NULL) {
+                                        // First node
+                                        pending_tool_node = found;
+                                    } else if (pending_tool_node2 == NULL) {
+                                        if (pending_tool_node == found) {
+                                            // Clicked same node: clear
+                                            pending_tool_node = NULL;
+                                        } else {
+                                            // Second node
+                                            pending_tool_node2 = found;
+                                        }
+                                    } else {
+                                        if (pending_tool_node == found || pending_tool_node2 == found) {
+                                            // Clicked already selected node: reset
+                                            pending_tool_node = NULL;
+                                            pending_tool_node2 = NULL;
+                                        } else {
+                                            // Third node - create triangle wall
+                                            float wf = edata.wall_friction ? (float)(*(edata.wall_friction)) : 1.0f;
+                                            float wr = edata.wall_restitution ? (float)(*(edata.wall_restitution)) : 0.0f;
+                                            TriangleWall *w = trianglewall_create(pending_tool_node, pending_tool_node2, found, wf, wr);
+                                            if (w) simulator_add_wall(sim, w);
+                                            // if +Dist toggle is set, add distance constraints for all edges
+                                            if (edata.wall_add_dist && edata.wall_add_dist[0]) {
+                                                simulator_add_constraint(sim, distconstraint_create(pending_tool_node, pending_tool_node2, -1));
+                                                simulator_add_constraint(sim, distconstraint_create(pending_tool_node2, found, -1));
+                                                simulator_add_constraint(sim, distconstraint_create(found, pending_tool_node, -1));
+                                            }
+                                            pending_tool_node = NULL;
+                                            pending_tool_node2 = NULL;
                                         }
                                     }
-                                    // clear pending after creation
-                                    pending_tool_node = NULL;
+                                } else {
+                                    // Dist/Spring tools use 2 nodes
+                                    if (pending_tool_node == NULL) {
+                                        // set the first endpoint
+                                        pending_tool_node = found;
+                                    } else if (pending_tool_node == found) {
+                                        // clicked same node again: clear pending
+                                        pending_tool_node = NULL;
+                                    } else {
+                                        // create the requested constraint between pending_tool_node and found
+                                        if (current_tool == TOOL_ADD_DIST) {
+                                            Constraint *c = distconstraint_create(pending_tool_node, found, -1);
+                                            if (c) simulator_add_constraint(sim, c);
+                                        } else if (current_tool == TOOL_ADD_SPRING) {
+                                            // rest length = current distance; stiffness from edit prefs
+                                            float dx = pending_tool_node->pos[0] - found->pos[0];
+                                            float dy = pending_tool_node->pos[1] - found->pos[1];
+                                            float dz = pending_tool_node->pos[2] - found->pos[2];
+                                            float rest = sqrtf(dx*dx + dy*dy + dz*dz);
+                                            float stiff = edata.spring_stiffness ? (float)(*(edata.spring_stiffness)) : 10.0f;
+                                            Constraint *c = springconstraint_create(pending_tool_node, found, stiff, rest);
+                                            if (c) simulator_add_constraint(sim, c);
+                                        }
+                                        // clear pending after creation
+                                        pending_tool_node = NULL;
+                                    }
                                 }
                             }
                         }
@@ -1924,32 +2123,41 @@ int main(int argc, char *argv[]) {
             simulator_step(sim);
         }
 
-        // Draw 3D reference grid at z=0 plane (XY plane)
-        if (show_grid) {
-            float cell_size = (float)grid_cell_size;
-            int grid_extent = 20; // draw ±20 cells from origin
-            glColor3f(0.7f, 0.7f, 0.75f);
+        // Draw octree wireframe in magenta
+        if (show_octree && sim->octree) {
+            glColor3f(1.0f, 0.0f, 1.0f); // Magenta
             glLineWidth(1.0f);
-            glBegin(GL_LINES);
-            for (int ix = -grid_extent; ix <= grid_extent; ++ix) {
-                float x = (float)ix * cell_size;
-                glVertex3f(x, -grid_extent * cell_size, 0.0f);
-                glVertex3f(x, grid_extent * cell_size, 0.0f);
+            // Recursive function to draw octree node wireframes
+            void draw_octree_node(OctreeNode *node) {
+                if (!node) return;
+                // Draw wireframe cube for this node's bounds
+                float minx = node->bounds.min[0], miny = node->bounds.min[1], minz = node->bounds.min[2];
+                float maxx = node->bounds.max[0], maxy = node->bounds.max[1], maxz = node->bounds.max[2];
+                glBegin(GL_LINES);
+                // Bottom face
+                glVertex3f(minx, miny, minz); glVertex3f(maxx, miny, minz);
+                glVertex3f(maxx, miny, minz); glVertex3f(maxx, miny, maxz);
+                glVertex3f(maxx, miny, maxz); glVertex3f(minx, miny, maxz);
+                glVertex3f(minx, miny, maxz); glVertex3f(minx, miny, minz);
+                // Top face
+                glVertex3f(minx, maxy, minz); glVertex3f(maxx, maxy, minz);
+                glVertex3f(maxx, maxy, minz); glVertex3f(maxx, maxy, maxz);
+                glVertex3f(maxx, maxy, maxz); glVertex3f(minx, maxy, maxz);
+                glVertex3f(minx, maxy, maxz); glVertex3f(minx, maxy, minz);
+                // Vertical edges
+                glVertex3f(minx, miny, minz); glVertex3f(minx, maxy, minz);
+                glVertex3f(maxx, miny, minz); glVertex3f(maxx, maxy, minz);
+                glVertex3f(maxx, miny, maxz); glVertex3f(maxx, maxy, maxz);
+                glVertex3f(minx, miny, maxz); glVertex3f(minx, maxy, maxz);
+                glEnd();
+                // Recursively draw children
+                if (!node->is_leaf) {
+                    for (int i = 0; i < 8; i++) {
+                        draw_octree_node(node->children[i]);
+                    }
+                }
             }
-            for (int iy = -grid_extent; iy <= grid_extent; ++iy) {
-                float y = (float)iy * cell_size;
-                glVertex3f(-grid_extent * cell_size, y, 0.0f);
-                glVertex3f(grid_extent * cell_size, y, 0.0f);
-            }
-            glEnd();
-            // Draw axes
-            glLineWidth(3.0f);
-            glBegin(GL_LINES);
-            glColor3f(1.0f, 0.0f, 0.0f); glVertex3f(0,0,0); glVertex3f(200,0,0); // X red
-            glColor3f(0.0f, 1.0f, 0.0f); glVertex3f(0,0,0); glVertex3f(0,200,0); // Y green
-            glColor3f(0.0f, 0.0f, 1.0f); glVertex3f(0,0,0); glVertex3f(0,0,200); // Z blue
-            glEnd();
-            glLineWidth(1.0f);
+            draw_octree_node(sim->octree);
         }
 
         // Draw selection/placement plane grid (translucent) after reference grid
@@ -1960,9 +2168,22 @@ int main(int argc, char *argv[]) {
         }
 
         simulator_draw(sim, cam_yaw, cam_pitch);
-        // draw selection highlights (in world coordinates, 3D)
+        
+        // draw selection highlights (camera-facing billboards, drawn on top)
         if (dynarray_size(selection) > 0) {
+            // Disable depth test so circles draw on top of everything
+            glDisable(GL_DEPTH_TEST);
             glColor3f(0.0f, 1.0f, 0.0f);
+            
+            // Get camera right and up vectors for billboarding
+            float right_x = cosf(cam_yaw);
+            float right_y = 0.0f;
+            float right_z = -sinf(cam_yaw);
+            
+            float up_x = sinf(cam_yaw) * sinf(cam_pitch);
+            float up_y = cosf(cam_pitch);
+            float up_z = cosf(cam_yaw) * sinf(cam_pitch);
+            
             for (size_t si = 0; si < dynarray_size(selection); ++si) {
                 Node *n = (Node*)dynarray_get(selection, si);
                 if (!n) continue;
@@ -1970,12 +2191,17 @@ int main(int argc, char *argv[]) {
                 glBegin(GL_LINE_LOOP);
                 for (int k = 0; k < 20; ++k) {
                     float theta = 2.0f * 3.14159265f * (float)k / 20.0f;
-                    glVertex3f(n->pos[0] + r * cosf(theta), n->pos[1] + r * sinf(theta), n->pos[2]);
+                    float offset_x = r * (cosf(theta) * right_x + sinf(theta) * up_x);
+                    float offset_y = r * (cosf(theta) * right_y + sinf(theta) * up_y);
+                    float offset_z = r * (cosf(theta) * right_z + sinf(theta) * up_z);
+                    glVertex3f(n->pos[0] + offset_x, n->pos[1] + offset_y, n->pos[2] + offset_z);
                 }
                 glEnd();
             }
+            // Re-enable depth test for subsequent rendering
+            glEnable(GL_DEPTH_TEST);
         }
-        // draw pending-tool-node marker (magenta) if waiting for second endpoint
+        // draw pending-tool-node markers (magenta) if waiting for additional endpoints
         if (pending_tool_node != NULL) {
             glColor3f(1.0f, 0.0f, 1.0f);
             float r = pending_tool_node->radius + 3.0f;
@@ -1983,6 +2209,16 @@ int main(int argc, char *argv[]) {
             for (int k = 0; k < 20; ++k) {
                 float theta = 2.0f * 3.14159265f * (float)k / 20.0f;
                 glVertex2f(pending_tool_node->pos[0] + r * cosf(theta), pending_tool_node->pos[1] + r * sinf(theta));
+            }
+            glEnd();
+        }
+        if (pending_tool_node2 != NULL) {
+            glColor3f(1.0f, 0.0f, 1.0f);
+            float r = pending_tool_node2->radius + 3.0f;
+            glBegin(GL_LINE_LOOP);
+            for (int k = 0; k < 20; ++k) {
+                float theta = 2.0f * 3.14159265f * (float)k / 20.0f;
+                glVertex2f(pending_tool_node2->pos[0] + r * cosf(theta), pending_tool_node2->pos[1] + r * sinf(theta));
             }
             glEnd();
         }
@@ -2020,6 +2256,15 @@ int main(int argc, char *argv[]) {
             glDisable(GL_BLEND);
         }
         
+        // Save 3D projection matrices before switching to 2D
+        GLdouble modelview[16], projection[16];
+        GLint viewport[4];
+        glGetDoublev(GL_MODELVIEW_MATRIX, modelview);
+        glMatrixMode(GL_PROJECTION);
+        glGetDoublev(GL_PROJECTION_MATRIX, projection);
+        glGetIntegerv(GL_VIEWPORT, viewport);
+        glMatrixMode(GL_MODELVIEW);
+        
         glPopMatrix();
 
         // restore projection/modelview
@@ -2037,6 +2282,72 @@ int main(int argc, char *argv[]) {
         glMatrixMode(GL_MODELVIEW);
         glPushMatrix();
         glLoadIdentity();
+
+        // Render node numbers on top of everything using saved 3D matrices
+        for (size_t i = 0; i < dynarray_size(sim->nodes); ++i) {
+            Node *n = (Node*)dynarray_get(sim->nodes, i);
+            if (!n) continue;
+            
+            // Project 3D position to screen coordinates using saved matrices
+            GLdouble win_x, win_y, win_z;
+            GLdouble obj_x = (GLdouble)n->pos[0];
+            GLdouble obj_y = (GLdouble)n->pos[1];
+            GLdouble obj_z = (GLdouble)n->pos[2];
+            
+            // Manual projection (equivalent to gluProject)
+            GLdouble in[4], out[4];
+            in[0] = obj_x; in[1] = obj_y; in[2] = obj_z; in[3] = 1.0;
+            
+            // Transform by modelview matrix
+            out[0] = modelview[0]*in[0] + modelview[4]*in[1] + modelview[8]*in[2] + modelview[12]*in[3];
+            out[1] = modelview[1]*in[0] + modelview[5]*in[1] + modelview[9]*in[2] + modelview[13]*in[3];
+            out[2] = modelview[2]*in[0] + modelview[6]*in[1] + modelview[10]*in[2] + modelview[14]*in[3];
+            out[3] = modelview[3]*in[0] + modelview[7]*in[1] + modelview[11]*in[2] + modelview[15]*in[3];
+            
+            // Transform by projection matrix
+            in[0] = out[0]; in[1] = out[1]; in[2] = out[2]; in[3] = out[3];
+            out[0] = projection[0]*in[0] + projection[4]*in[1] + projection[8]*in[2] + projection[12]*in[3];
+            out[1] = projection[1]*in[0] + projection[5]*in[1] + projection[9]*in[2] + projection[13]*in[3];
+            out[2] = projection[2]*in[0] + projection[6]*in[1] + projection[10]*in[2] + projection[14]*in[3];
+            out[3] = projection[3]*in[0] + projection[7]*in[1] + projection[11]*in[2] + projection[15]*in[3];
+            
+            if (out[3] == 0.0) continue; // Behind camera
+            
+            // Perspective divide
+            out[0] /= out[3];
+            out[1] /= out[3];
+            out[2] /= out[3];
+            
+            // Map to window coordinates
+            win_x = viewport[0] + (1.0 + out[0]) * viewport[2] / 2.0;
+            win_y = viewport[1] + (1.0 + out[1]) * viewport[3] / 2.0;
+            
+            int screen_x = (int)win_x;
+            int screen_y = (int)(viewport[3] - win_y); // Flip Y for screen coordinates
+            
+            // Skip if out of screen bounds or behind camera
+            if (screen_x < 0 || screen_x >= win_w || screen_y < 0 || screen_y >= win_h) continue;
+            if (out[2] < -1.0 || out[2] > 1.0) continue;
+            
+            // Render text: white for anchored, black for non-anchored
+            char node_text[16];
+            snprintf(node_text, sizeof(node_text), "%d", n->idx);
+            
+            int text_w = 0, text_h = 0;
+            if (menu_measure_text(node_text, &text_w, &text_h) == 0) {
+                // Center text on node
+                int tx = screen_x - text_w / 2;
+                int ty = screen_y - text_h / 2;
+                
+                Color text_color;
+                if (n->anchored) {
+                    text_color = (Color){255, 255, 255, 255}; // White
+                } else {
+                    text_color = (Color){0, 0, 0, 255}; // Black
+                }
+                menu_draw_text_at(node_text, tx, ty, text_color);
+            }
+        }
 
         // Render menu UI (draw all registered menus)
         for (size_t mi = 0; mi < menus->size; ++mi) {

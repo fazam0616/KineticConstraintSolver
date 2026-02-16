@@ -5,6 +5,7 @@
 #include <stdio.h>
 
 #define MAX_OCTREE_DEPTH 8
+#define MAX_CHILD_COUNT 1
 
 // Helper: get which octant (0-7) a point belongs to
 int octree_get_octant(const float center[3], const float point[3]) {
@@ -58,6 +59,7 @@ OctreeNode* octree_create(float min_x, float min_y, float min_z,
     node->is_leaf = 1;
     node->node_entries = dynarray_create(16);
     node->triangle_indices = dynarray_create(8);
+    node->constraint_indices = dynarray_create(8);
     
     // Initialize children to NULL
     for (int i = 0; i < 8; ++i) {
@@ -81,6 +83,7 @@ void octree_free(OctreeNode *node) {
     // Free dynamic arrays (elements are just ints, no need to free individually)
     if (node->node_entries) dynarray_free(node->node_entries, free);
     if (node->triangle_indices) dynarray_free(node->triangle_indices, NULL);
+    if (node->constraint_indices) dynarray_free(node->constraint_indices, NULL);
     
     free(node);
 }
@@ -118,6 +121,7 @@ static void octree_subdivide(OctreeNode *node) {
         child->is_leaf = 1;
         child->node_entries = dynarray_create(16);
         child->triangle_indices = dynarray_create(8);
+        child->constraint_indices = dynarray_create(8);
         
         node->children[i] = child;
     }
@@ -164,7 +168,7 @@ void octree_insert_node(OctreeNode *root, int node_idx, float pos[3]) {
         dynarray_append(root->node_entries, entry);
         
         // Subdivide if we have too many nodes and haven't reached max depth
-        if (dynarray_size(root->node_entries) > 8 && root->depth < MAX_OCTREE_DEPTH) {
+        if (dynarray_size(root->node_entries) > MAX_CHILD_COUNT && root->depth < MAX_OCTREE_DEPTH) {
             octree_subdivide(root);
         }
         return;
@@ -369,10 +373,129 @@ void octree_clear(OctreeNode *root) {
         root->triangle_indices->size = 0;
     }
     
-    // Recursively clear children
+    if (root->constraint_indices) {
+        for (size_t i = 0; i < dynarray_size(root->constraint_indices); ++i) {
+            free(dynarray_get(root->constraint_indices, i));
+        }
+        root->constraint_indices->size = 0;
+    }
+    
+    // Recursively clear children but preserve tree structure
     for (int i = 0; i < 8; ++i) {
         if (root->children[i]) {
             octree_clear(root->children[i]);
         }
     }
 }
+
+// Insert a constraint into the ancestor node containing both endpoints
+void octree_insert_constraint(OctreeNode *root, int constraint_idx,
+                             float pos_a[3], float pos_b[3]) {
+    if (!root) return;
+    
+    // Check if both points are in bounds
+    if (!aabb_contains_point(&root->bounds, pos_a) || 
+        !aabb_contains_point(&root->bounds, pos_b)) {
+        return;
+    }
+    
+    // If leaf, store here
+    if (root->is_leaf) {
+        int *idx = (int*)malloc(sizeof(int));
+        *idx = constraint_idx;
+        dynarray_append(root->constraint_indices, idx);
+        // NOTE: Do NOT trigger subdivision for constraints because we cannot
+        // redistribute them (no position data stored). Constraints are inserted
+        // after nodes/triangles have already established the tree structure.
+        return;
+    }
+    
+    // Find which child contains both points (if any)
+    float center[3] = {
+        (root->bounds.min[0] + root->bounds.max[0]) * 0.5f,
+        (root->bounds.min[1] + root->bounds.max[1]) * 0.5f,
+        (root->bounds.min[2] + root->bounds.max[2]) * 0.5f
+    };
+    
+    int octant_a = octree_get_octant(center, pos_a);
+    int octant_b = octree_get_octant(center, pos_b);
+    
+    // If both endpoints in same octant, recurse
+    if (octant_a == octant_b && root->children[octant_a]) {
+        octree_insert_constraint(root->children[octant_a], constraint_idx, pos_a, pos_b);
+    } else {
+        // Endpoints in different octants, store at this level
+        int *idx = (int*)malloc(sizeof(int));
+        *idx = constraint_idx;
+        dynarray_append(root->constraint_indices, idx);
+    }
+}
+
+// Helper: recursively collect constraints from node and all children
+static void collect_constraints_recursive(OctreeNode *node, DynArray *results) {
+    if (!node) return;
+    
+    // Add constraints at this level
+    if (node->constraint_indices) {
+        for (size_t i = 0; i < dynarray_size(node->constraint_indices); ++i) {
+            int *idx_ptr = (int*)dynarray_get(node->constraint_indices, i);
+            if (idx_ptr) {
+                int *copy = (int*)malloc(sizeof(int));
+                *copy = *idx_ptr;
+                dynarray_append(results, copy);
+            }
+        }
+    }
+    
+    // Recurse to all children
+    if (!node->is_leaf) {
+        for (int i = 0; i < 8; ++i) {
+            if (node->children[i]) {
+                collect_constraints_recursive(node->children[i], results);
+            }
+        }
+    }
+}
+
+// Query constraints in region containing both points
+DynArray* octree_query_constraints(OctreeNode *root, float pos_a[3], float pos_b[3]) {
+    DynArray *result = dynarray_create(16);
+    if (!root) return result;
+    
+    // Check if both points are in bounds
+    if (!aabb_contains_point(&root->bounds, pos_a) || 
+        !aabb_contains_point(&root->bounds, pos_b)) {
+        return result;
+    }
+    
+    // Traverse down to find the ancestor node
+    OctreeNode *current = root;
+    while (!current->is_leaf) {
+        float center[3] = {
+            (current->bounds.min[0] + current->bounds.max[0]) * 0.5f,
+            (current->bounds.min[1] + current->bounds.max[1]) * 0.5f,
+            (current->bounds.min[2] + current->bounds.max[2]) * 0.5f
+        };
+        
+        int octant_a = octree_get_octant(center, pos_a);
+        int octant_b = octree_get_octant(center, pos_b);
+        
+        // If in different octants, this is the common ancestor
+        if (octant_a != octant_b) {
+            break;
+        }
+        
+        // Otherwise descend to the common child
+        if (current->children[octant_a]) {
+            current = current->children[octant_a];
+        } else {
+            break;
+        }
+    }
+    
+    // Collect constraints from this node AND all its children recursively
+    collect_constraints_recursive(current, result);
+    
+    return result;
+}
+
