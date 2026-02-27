@@ -894,35 +894,35 @@ static int screen_to_world_plane(int screen_x, int screen_y, int win_w, int win_
                               world_x, world_y, world_z);
 }
 
-void draw_octree_node(OctreeNode *node) {
-    if (!node) return;
-    // Draw wireframe cube for this node's bounds
-    float minx = node->bounds.min[0], miny = node->bounds.min[1], minz = node->bounds.min[2];
-    float maxx = node->bounds.max[0], maxy = node->bounds.max[1], maxz = node->bounds.max[2];
-    glBegin(GL_LINES);
-    // Bottom face
-    glVertex3f(minx, miny, minz); glVertex3f(maxx, miny, minz);
-    glVertex3f(maxx, miny, minz); glVertex3f(maxx, miny, maxz);
-    glVertex3f(maxx, miny, maxz); glVertex3f(minx, miny, maxz);
-    glVertex3f(minx, miny, maxz); glVertex3f(minx, miny, minz);
-    // Top face
-    glVertex3f(minx, maxy, minz); glVertex3f(maxx, maxy, minz);
-    glVertex3f(maxx, maxy, minz); glVertex3f(maxx, maxy, maxz);
-    glVertex3f(maxx, maxy, maxz); glVertex3f(minx, maxy, maxz);
-    glVertex3f(minx, maxy, maxz); glVertex3f(minx, maxy, minz);
-    // Vertical edges
-    glVertex3f(minx, miny, minz); glVertex3f(minx, maxy, minz);
-    glVertex3f(maxx, miny, minz); glVertex3f(maxx, maxy, minz);
-    glVertex3f(maxx, miny, maxz); glVertex3f(maxx, maxy, maxz);
-    glVertex3f(minx, miny, maxz); glVertex3f(minx, maxy, maxz);
-    glEnd();
-    // Recursively draw children
-    if (!node->is_leaf) {
-        for (int i = 0; i < 8; i++) {
-            draw_octree_node(node->children[i]);
-        }
-    }
-}
+// void draw_octree_node(OctreeNode *node) {
+//     if (!node) return;
+//     // Draw wireframe cube for this node's bounds
+//     float minx = node->bounds.min[0], miny = node->bounds.min[1], minz = node->bounds.min[2];
+//     float maxx = node->bounds.max[0], maxy = node->bounds.max[1], maxz = node->bounds.max[2];
+//     glBegin(GL_LINES);
+//     // Bottom face
+//     glVertex3f(minx, miny, minz); glVertex3f(maxx, miny, minz);
+//     glVertex3f(maxx, miny, minz); glVertex3f(maxx, miny, maxz);
+//     glVertex3f(maxx, miny, maxz); glVertex3f(minx, miny, maxz);
+//     glVertex3f(minx, miny, maxz); glVertex3f(minx, miny, minz);
+//     // Top face
+//     glVertex3f(minx, maxy, minz); glVertex3f(maxx, maxy, minz);
+//     glVertex3f(maxx, maxy, minz); glVertex3f(maxx, maxy, maxz);
+//     glVertex3f(maxx, maxy, maxz); glVertex3f(minx, maxy, maxz);
+//     glVertex3f(minx, maxy, maxz); glVertex3f(minx, maxy, minz);
+//     // Vertical edges
+//     glVertex3f(minx, miny, minz); glVertex3f(minx, maxy, minz);
+//     glVertex3f(maxx, miny, minz); glVertex3f(maxx, maxy, minz);
+//     glVertex3f(maxx, miny, maxz); glVertex3f(maxx, maxy, maxz);
+//     glVertex3f(minx, miny, maxz); glVertex3f(minx, maxy, maxz);
+//     glEnd();
+//     // Recursively draw children
+//     if (!node->is_leaf) {
+//         for (int i = 0; i < 8; i++) {
+//             draw_octree_node(node->children[i]);
+//         }
+//     }
+// }
 
 int main(int argc, char *argv[]) {
     // parse runtime options
@@ -1966,14 +1966,14 @@ int main(int argc, char *argv[]) {
             simulator_step(sim);
         }
 
-        // Draw octree wireframe in magenta
-        if (show_octree && sim->octree) {
-            glColor3f(1.0f, 0.0f, 1.0f); // Magenta
-            glLineWidth(1.0f);
-            // Recursive function to draw octree node wireframes
+        // // Draw octree wireframe in magenta
+        // if (show_octree && sim->octree) {
+        //     glColor3f(1.0f, 0.0f, 1.0f); // Magenta
+        //     glLineWidth(1.0f);
+        //     // Recursive function to draw octree node wireframes
 
-            draw_octree_node(sim->octree);
-        }
+        //     draw_octree_node(sim->octree);
+        // }
 
         // Draw selection/placement plane grid (translucent) after reference grid
         if (current_tool == TOOL_SELECT || current_tool == TOOL_ADD_NODE || 

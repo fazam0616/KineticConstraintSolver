@@ -4,7 +4,7 @@
 CC = gcc
 
 # Source files
-SRC = main.c Menu.c datastructures.c Node.c Constraint.c Simulator.c Octree.c
+SRC = main.c Menu.c datastructures.c Node.c Constraint.c Simulator.c Octree.c TriangleBVH.c EdgeBVH.c
 
 # Compiler flags
 ## CSparse / SuiteSparse settings
@@ -14,7 +14,7 @@ CSPARSE_INC ?= /usr/include/suitesparse
 CSPARSE_LIB ?= -L/usr/lib/x86_64-linux-gnu -lcxsparse
 
 # Compiler flags (always enable debug jacobian)
-CFLAGS = -Wall -Wextra -g -DDEBUG_JACOBIAN $(if $(CSPARSE_INC),-I$(CSPARSE_INC))
+CFLAGS = -Wall -Wextra -O3 -DDEBUG_JACOBIAN $(if $(CSPARSE_INC),-I$(CSPARSE_INC))
 
 # Linker flags for CSparse (can be a -L... -lcsparse or exact archive path)
 CSPARSE_LDFLAGS = $(CSPARSE_LIB)

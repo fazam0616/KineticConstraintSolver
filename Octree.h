@@ -8,11 +8,7 @@
 typedef struct OctreeNode OctreeNode;
 typedef struct TriangleWall TriangleWall;
 
-// Axis-aligned bounding box
-typedef struct {
-    float min[3];
-    float max[3];
-} AABB;
+#include "AABB.h"
 
 // Node entry that stores both index and position for redistribution
 typedef struct {

@@ -4,7 +4,8 @@
 #include "datastructures.h"
 #include "Node.h"
 #include "Constraint.h"
-#include "Octree.h"
+#include "TriangleBVH.h"
+#include "EdgeBVH.h"
 
 typedef struct Simulator Simulator;
 
@@ -17,7 +18,8 @@ struct Simulator {
     int solver_iters;
     float damping;
     float velocity_blend; // how much to blend projected velocity into previous velocity (0..1)
-    OctreeNode *octree; // spatial acceleration for collision detection
+    TriangleBVH *triangle_bvh; // BVH for triangle walls
+    EdgeBVH *edge_bvh;         // BVH for edges (constraints)
 };
 
 Simulator* simulator_create(float dt);
@@ -28,10 +30,15 @@ void simulator_add_wall(Simulator *s, TriangleWall *w);
 void simulator_step(Simulator *s);
 void simulator_draw(Simulator *s, float cam_yaw, float cam_pitch);
 
-// Find the closest node to a given position within max_distance
-// Returns node index or -1 if none found within range
-// Uses octree for efficient spatial lookup
-int simulator_find_closest_node(Simulator *s, float pos[3], float max_distance);
+
+// Query triangles overlapping an AABB (for node→face queries)
+void simulator_query_triangles(Simulator *s, const AABB *query, DynArray *out_indices);
+
+// Query edges overlapping an AABB (for edge→edge broadphase)
+void simulator_query_edges(Simulator *s, const AABB *query, DynArray *out_indices);
+
+// Self-traverse edge BVH for edge-edge broadphase
+void simulator_edge_bvh_self_traverse(Simulator *s, void (*callback)(int, int, void*), void *userdata);
 
 // Generate a triangular mesh from a polygon defined by a DynArray of Node*
 // - sim: simulator to which new nodes/constraints will be added

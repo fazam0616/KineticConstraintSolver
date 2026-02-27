@@ -224,8 +224,8 @@ Simulator* simulator_create(float dt) {
     s->solver_iters = 100;
     s->damping = 0.01f;
     s->velocity_blend = 0.5f; // blend factor between old velocity and position-derived velocity
-    // Create octree spanning a reasonable world space (can be resized later)
-    s->octree = octree_create(-1000.0f, -1000.0f, -1000.0f, 1000.0f, 1000.0f, 1000.0f, 8);
+    s->triangle_bvh = NULL;
+    s->edge_bvh = NULL;
     return s;
 }
 
@@ -249,6 +249,9 @@ void simulator_free(Simulator *s) {
         if (w) trianglewall_free(w);
     }
     dynarray_free(s->walls, NULL);
+    // free BVHs
+    if (s->triangle_bvh) triangle_bvh_free(s->triangle_bvh);
+    if (s->edge_bvh) edge_bvh_free(s->edge_bvh);
     free(s);
 }
 
@@ -433,6 +436,112 @@ static int constraint_constraint_collision(
     return 0;
 }
 
+// --- Edge-Edge Collision Detection and Resolution using EdgeBVH self-traversal ---
+typedef struct {
+    DynArray *edges;
+    float *collision_forces;
+} EdgeEdgeContext;
+void edge_edge_callback(int idxA, int idxB, void *userdata) {
+    EdgeEdgeContext *ctx = (EdgeEdgeContext*)userdata;
+    DynArray *edges = ctx->edges;
+    float *collision_forces = ctx->collision_forces;
+    Constraint *edgeA = (Constraint*)dynarray_get(edges, idxA);
+    Constraint *edgeB = (Constraint*)dynarray_get(edges, idxB);
+    float DAMP_K = 200.0f;
+    float STIFFNESS = 500.0f;
+    if (!edgeA || !edgeB || !edgeA->node || !edgeA->other || !edgeB->node || !edgeB->other) return;
+    // Skip if constraints share a node as an endpoint
+    if (edgeA->node == edgeB->node || edgeA->node == edgeB->other ||
+        edgeA->other == edgeB->node || edgeA->other == edgeB->other) return;
+    // Only check distance constraints
+    if (edgeA->type != CT_DIST || edgeB->type != CT_DIST) return;
+    float penetration, normal[3], pa[3], pb[3];
+    if (constraint_constraint_collision(edgeA->node, edgeA->other, edgeB->node, edgeB->other, &penetration, normal, pa, pb)) {
+        float dA0 = sqrtf((pa[0]-edgeA->node->pos[0])*(pa[0]-edgeA->node->pos[0]) +
+                            (pa[1]-edgeA->node->pos[1])*(pa[1]-edgeA->node->pos[1]) +
+                            (pa[2]-edgeA->node->pos[2])*(pa[2]-edgeA->node->pos[2]));
+        float dA1 = sqrtf((pa[0]-edgeA->other->pos[0])*(pa[0]-edgeA->other->pos[0]) +
+                            (pa[1]-edgeA->other->pos[1])*(pa[1]-edgeA->other->pos[1]) +
+                            (pa[2]-edgeA->other->pos[2])*(pa[2]-edgeA->other->pos[2]));
+        float lenA = dA0 + dA1;
+        float wA0 = (lenA > 1e-8f) ? (dA1 / lenA) : 0.5f;
+        float wA1 = (lenA > 1e-8f) ? (dA0 / lenA) : 0.5f;
+        float dB0 = sqrtf((pb[0]-edgeB->node->pos[0])*(pb[0]-edgeB->node->pos[0]) +
+                            (pb[1]-edgeB->node->pos[1])*(pb[1]-edgeB->node->pos[1]) +
+                            (pb[2]-edgeB->node->pos[2])*(pb[2]-edgeB->node->pos[2]));
+        float dB1 = sqrtf((pb[0]-edgeB->other->pos[0])*(pb[0]-edgeB->other->pos[0]) +
+                            (pb[1]-edgeB->other->pos[1])*(pb[1]-edgeB->other->pos[1]) +
+                            (pb[2]-edgeB->other->pos[2])*(pb[2]-edgeB->other->pos[2]));
+        float lenB = dB0 + dB1;
+        float wB0 = (lenB > 1e-8f) ? (dB1 / lenB) : 0.5f;
+        float wB1 = (lenB > 1e-8f) ? (dB0 / lenB) : 0.5f;
+        float va[3], vb[3];
+        for (int i = 0; i < 3; ++i) {
+            va[i] = edgeA->node->vel[i] * wA0 + edgeA->other->vel[i] * wA1;
+            vb[i] = edgeB->node->vel[i] * wB0 + edgeB->other->vel[i] * wB1;
+        }
+        float rel_vel[3] = { va[0] - vb[0], va[1] - vb[1], va[2] - vb[2] };
+        float normal_vel = rel_vel[0]*normal[0] + rel_vel[1]*normal[1] + rel_vel[2]*normal[2];
+        float sep_force[3] = {
+            normal[0] * penetration * STIFFNESS,
+            normal[1] * penetration * STIFFNESS,
+            normal[2] * penetration * STIFFNESS
+        };
+        if (normal_vel < 0.0f) {
+            sep_force[0] -= normal[0] * normal_vel * DAMP_K;
+            sep_force[1] -= normal[1] * normal_vel * DAMP_K;
+            sep_force[2] -= normal[2] * normal_vel * DAMP_K;
+        }
+        float tangent[3] = {
+            rel_vel[0] - normal[0] * normal_vel,
+            rel_vel[1] - normal[1] * normal_vel,
+            rel_vel[2] - normal[2] * normal_vel
+        };
+        float tangent_len = sqrtf(tangent[0]*tangent[0] + tangent[1]*tangent[1] + tangent[2]*tangent[2]);
+        float Kt = 150.0f;
+        float fric_mag = (tangent_len > 1e-9f) ? fminf(Kt * tangent_len, 0.5f * sqrtf(sep_force[0]*sep_force[0] + sep_force[1]*sep_force[1] + sep_force[2]*sep_force[2])) : 0.0f;
+        float fric_force[3] = {0,0,0};
+        if (tangent_len > 1e-9f) {
+            fric_force[0] = -(tangent[0] / tangent_len) * fric_mag;
+            fric_force[1] = -(tangent[1] / tangent_len) * fric_mag;
+            fric_force[2] = -(tangent[2] / tangent_len) * fric_mag;
+            sep_force[0] += fric_force[0];
+            sep_force[1] += fric_force[1];
+            sep_force[2] += fric_force[2];
+        }
+        if (!(edgeA->node->anchored || edgeA->node->sim_ignore)) {
+            collision_forces[3*edgeA->node->idx + 0] += sep_force[0] * wA0;
+            collision_forces[3*edgeA->node->idx + 1] += sep_force[1] * wA0;
+            collision_forces[3*edgeA->node->idx + 2] += sep_force[2] * wA0;
+        }
+        if (!(edgeA->other->anchored || edgeA->other->sim_ignore)) {
+            collision_forces[3*edgeA->other->idx + 0] += sep_force[0] * wA1;
+            collision_forces[3*edgeA->other->idx + 1] += sep_force[1] * wA1;
+            collision_forces[3*edgeA->other->idx + 2] += sep_force[2] * wA1;
+        }
+        if (!(edgeB->node->anchored || edgeB->node->sim_ignore)) {
+            collision_forces[3*edgeB->node->idx + 0] -= sep_force[0] * wB0;
+            collision_forces[3*edgeB->node->idx + 1] -= sep_force[1] * wB0;
+            collision_forces[3*edgeB->node->idx + 2] -= sep_force[2] * wB0;
+        }
+        if (!(edgeB->other->anchored || edgeB->other->sim_ignore)) {
+            collision_forces[3*edgeB->other->idx + 0] -= sep_force[0] * wB1;
+            collision_forces[3*edgeB->other->idx + 1] -= sep_force[1] * wB1;
+            collision_forces[3*edgeB->other->idx + 2] -= sep_force[2] * wB1;
+        }
+
+        // printf("Edge-Edge Collision: idxA=%d idxB=%d\n", idxA, idxB);
+        // printf("  Penetration: %.4f\n", penetration);
+        // printf("  Normal: [%.4f %.4f %.4f]\n", normal[0], normal[1], normal[2]);
+        // printf("  Closest points: pa=[%.4f %.4f %.4f], pb=[%.4f %.4f %.4f]\n", pa[0], pa[1], pa[2], pb[0], pb[1], pb[2]);
+        // printf("  Relative velocity: [%.4f %.4f %.4f], normal_vel=%.4f\n", rel_vel[0], rel_vel[1], rel_vel[2], normal_vel);
+        // printf("  Separation force: [%.4f %.4f %.4f]\n", sep_force[0], sep_force[1], sep_force[2]);
+        // printf("  Friction force: [%.4f %.4f %.4f], tangent_len=%.4f\n", fric_force[0], fric_force[1], fric_force[2], tangent_len);
+        // printf("  Final force applied: [%.4f %.4f %.4f]\n", sep_force[0], sep_force[1], sep_force[2]);
+        // printf("------------------------------------------------------------\n");
+    }
+}
+
 // Compute collision forces using octree acceleration structure
 static void compute_triangle_collision_forces(Simulator *s, float *collision_forces) {
     if (!s || !collision_forces) return;
@@ -444,12 +553,11 @@ static void compute_triangle_collision_forces(Simulator *s, float *collision_for
     size_t n_walls = dynarray_size(s->walls);
     if (n_nodes == 0 || n_walls == 0) return;
     
-    // Rebuild octree each frame (simple approach - could be optimized)
-    if (s->octree) {
-        octree_clear(s->octree);
-    }
-
-    // --- Collect all triangle edges into a DynArray ---
+    // --- Build/Refit BVHs if needed (for now, rebuild every frame) ---
+    if (s->triangle_bvh) triangle_bvh_free(s->triangle_bvh);
+    s->triangle_bvh = triangle_bvh_build(s->walls);
+    if (s->edge_bvh) edge_bvh_free(s->edge_bvh);
+    // Collect all triangle edges into a DynArray
     DynArray *edges = dynarray_create(n_walls * 3);
     for (size_t wi = 0; wi < n_walls; ++wi) {
         TriangleWall *w = (TriangleWall*)dynarray_get(s->walls, wi);
@@ -458,55 +566,30 @@ static void compute_triangle_collision_forces(Simulator *s, float *collision_for
             Constraint *edge = w->edges[ei];
             if (edge) dynarray_append(edges, edge);
         }
-        // Insert triangle into octree as before
-        if (w->A && w->B && w->C)
-            octree_insert_triangle(s->octree, (int)wi, w->A->pos, w->B->pos, w->C->pos);
     }
+    s->edge_bvh = edge_bvh_build(edges, 0.03f); // TODO: use actual edge radius
 
-    // // Insert all nodes into octree for spatial queries
-    // for (size_t ni = 0; ni < n_nodes; ++ni) {
-    //     Node *node = (Node*)dynarray_get(s->nodes, ni);
-    //     if (!node) continue;
-    //     octree_insert_node(s->octree, (int)ni, node->pos);
-    // }
-
-    incremental_octree_rebuild(s->octree, s->nodes, 1e-6);
-
-    // --- Register edges in octree sub-cubes ---
-    // For each edge, mark all octree sub-cubes that the edge (line segment) crosses.
-    // Each sub-cube should maintain a list of constraints crossing it.
-    size_t n_edges = dynarray_size(edges);
-    for (size_t ei = 0; ei < n_edges; ++ei) {
-        Constraint *edge = (Constraint*)dynarray_get(edges, ei);
-        if (!edge || !edge->node || !edge->other) continue;
-        // Register edge in all cubes it intersects
-        octree_insert_constraint_all_cubes(s->octree, (int)ei, edge->node->pos, edge->other->pos);
-    }
-    
-    // Check each node against candidate triangles from octree
+    // --- Node→Triangle broadphase using TriangleBVH ---
     for (size_t ni = 0; ni < n_nodes; ++ni) {
         Node *node = (Node*)dynarray_get(s->nodes, ni);
         if (!node) continue;
         if (node->anchored && !node->collide_when_anchored) continue;
         if (!node->collide_with_walls) continue;
-        
-        // Query triangles that could collide with this node
-        DynArray *candidates = octree_query_triangles(s->octree, node->pos);
-        if (!candidates) continue;
-        
+        // Build a small AABB around node (sphere AABB)
+        AABB node_box;
+        for (int d = 0; d < 3; ++d) {
+            node_box.min[d] = node->pos[d] - node->radius;
+            node_box.max[d] = node->pos[d] + node->radius;
+        }
+        DynArray *candidates = dynarray_create(8);
+        triangle_bvh_query(s->triangle_bvh, &node_box, candidates);
+        // printf("Node %zu: found %zu candidate triangles\n", ni, dynarray_size(candidates));
         for (size_t ci = 0; ci < dynarray_size(candidates); ++ci) {
-            int *tri_idx_ptr = (int*)dynarray_get(candidates, ci);
-            if (!tri_idx_ptr) continue;
-            int tri_idx = *tri_idx_ptr;
+            int tri_idx = *(int*)dynarray_get(candidates, ci);
             if (tri_idx < 0 || (size_t)tri_idx >= n_walls) continue;
-            
             TriangleWall *w = (TriangleWall*)dynarray_get(s->walls, tri_idx);
             if (!w) continue;
-            
-            float penetration;
-            float normal[3];
-            float u, v;
-            
+            float penetration, normal[3], u, v;
             if (triangle_check_collision(w, node, &penetration, normal, &u, &v)) {
                 // Compute separation force
                 float sep_force[3] = {
@@ -514,9 +597,6 @@ static void compute_triangle_collision_forces(Simulator *s, float *collision_for
                     normal[1] * penetration * PENETRATION_STIFFNESS,
                     normal[2] * penetration * PENETRATION_STIFFNESS
                 };
-                
-                // Compute relative velocity (node vel relative to triangle)
-                // Triangle velocity is weighted average of vertices
                 float wall_vel[3] = {0, 0, 0};
                 if (!w->A->anchored) {
                     wall_vel[0] += (1.0f - u - v) * w->A->vel[0];
@@ -533,52 +613,39 @@ static void compute_triangle_collision_forces(Simulator *s, float *collision_for
                     wall_vel[1] += v * w->C->vel[1];
                     wall_vel[2] += v * w->C->vel[2];
                 }
-                
                 float rel_vel[3] = {
                     node->vel[0] - wall_vel[0],
                     node->vel[1] - wall_vel[1],
                     node->vel[2] - wall_vel[2]
                 };
-                
                 float normal_vel = rel_vel[0]*normal[0] + rel_vel[1]*normal[1] + rel_vel[2]*normal[2];
-                
-                // Normal damping (only if moving into wall)
                 if (normal_vel < 0.0f) {
                     sep_force[0] -= normal[0] * normal_vel * NORMAL_DAMP_K;
                     sep_force[1] -= normal[1] * normal_vel * NORMAL_DAMP_K;
                     sep_force[2] -= normal[2] * normal_vel * NORMAL_DAMP_K;
                 }
-                
-                // Tangential friction
                 float tangent[3] = {
                     rel_vel[0] - normal[0] * normal_vel,
                     rel_vel[1] - normal[1] * normal_vel,
                     rel_vel[2] - normal[2] * normal_vel
                 };
                 float tangent_len = sqrtf(tangent[0]*tangent[0] + tangent[1]*tangent[1] + tangent[2]*tangent[2]);
-                
                 if (tangent_len > 1e-9f) {
                     float sep_mag = sqrtf(sep_force[0]*sep_force[0] + sep_force[1]*sep_force[1] + sep_force[2]*sep_force[2]);
                     float max_fric = node->friction * sep_mag;
                     float fric_mag = fminf(Kt * tangent_len, max_fric);
-                    
                     float fric_force[3] = {
                         -(tangent[0] / tangent_len) * fric_mag,
                         -(tangent[1] / tangent_len) * fric_mag,
                         -(tangent[2] / tangent_len) * fric_mag
                     };
-                    
                     sep_force[0] += fric_force[0];
                     sep_force[1] += fric_force[1];
                     sep_force[2] += fric_force[2];
                 }
-                
-                // Apply force to node
                 collision_forces[3*ni + 0] += sep_force[0];
                 collision_forces[3*ni + 1] += sep_force[1];
                 collision_forces[3*ni + 2] += sep_force[2];
-                
-                // Apply reaction forces to triangle vertices (distributed by barycentric weights)
                 if (!w->A->anchored) {
                     float weight_a = 1.0f - u - v;
                     collision_forces[3*w->A->idx + 0] -= sep_force[0] * weight_a;
@@ -597,125 +664,12 @@ static void compute_triangle_collision_forces(Simulator *s, float *collision_for
                 }
             }
         }
-        
-        // Free candidate list
         dynarray_free(candidates, free);
     }
 
-    // --- Edge-Edge Collision Detection and Resolution ---
-    // For each edge, query octree for overlapping sub-cubes and check for collisions with other edges in those cubes
-    for (size_t ei = 0; ei < n_edges; ++ei) {
-        Constraint *edgeA = (Constraint*)dynarray_get(edges, ei);
-        if (!edgeA || !edgeA->node || !edgeA->other) continue;
-        // Query octree for candidate edge indices that share sub-cubes with this edge
-        DynArray *edge_candidates = octree_query_constraints(s->octree, edgeA->node->pos, edgeA->other->pos);
-        if (!edge_candidates) continue;
-        for (size_t ci = 0; ci < dynarray_size(edge_candidates); ++ci) {
-            int *edgeB_idx_ptr = (int*)dynarray_get(edge_candidates, ci);
-            if (!edgeB_idx_ptr) continue;
-            int edgeB_idx = *edgeB_idx_ptr;
-            if (edgeB_idx < 0 || (size_t)edgeB_idx >= n_edges) continue;
-            if ((int)ei >= edgeB_idx) continue; // avoid duplicate checks
-            Constraint *edgeB = (Constraint*)dynarray_get(edges, edgeB_idx);
-            if (!edgeB || edgeB == edgeA) continue;
-            // Skip if constraints share a node as an endpoint
-            if (edgeA->node == edgeB->node || edgeA->node == edgeB->other ||
-                edgeA->other == edgeB->node || edgeA->other == edgeB->other) continue;
-            // Only check distance constraints (optional: skip if not CT_DIST)
-            if (edgeA->type != CT_DIST || edgeB->type != CT_DIST) continue;
-            // Check for collision between edgeA and edgeB
-            float penetration, normal[3], pa[3], pb[3];
-            if (constraint_constraint_collision(edgeA->node, edgeA->other, edgeB->node, edgeB->other, &penetration, normal, pa, pb)) {
-                // --- Distribute collision forces to the four involved nodes ---
-                // Compute barycentric weights based on distance from POI and node mass
-                float dA0 = sqrtf((pa[0]-edgeA->node->pos[0])*(pa[0]-edgeA->node->pos[0]) +
-                                 (pa[1]-edgeA->node->pos[1])*(pa[1]-edgeA->node->pos[1]) +
-                                 (pa[2]-edgeA->node->pos[2])*(pa[2]-edgeA->node->pos[2]));
-                float dA1 = sqrtf((pa[0]-edgeA->other->pos[0])*(pa[0]-edgeA->other->pos[0]) +
-                                 (pa[1]-edgeA->other->pos[1])*(pa[1]-edgeA->other->pos[1]) +
-                                 (pa[2]-edgeA->other->pos[2])*(pa[2]-edgeA->other->pos[2]));
-                float lenA = dA0 + dA1;
-                float wA0 = (lenA > 1e-8f) ? (dA1 / lenA) : 0.5f;
-                float wA1 = (lenA > 1e-8f) ? (dA0 / lenA) : 0.5f;
-                float dB0 = sqrtf((pb[0]-edgeB->node->pos[0])*(pb[0]-edgeB->node->pos[0]) +
-                                 (pb[1]-edgeB->node->pos[1])*(pb[1]-edgeB->node->pos[1]) +
-                                 (pb[2]-edgeB->node->pos[2])*(pb[2]-edgeB->node->pos[2]));
-                float dB1 = sqrtf((pb[0]-edgeB->other->pos[0])*(pb[0]-edgeB->other->pos[0]) +
-                                 (pb[1]-edgeB->other->pos[1])*(pb[1]-edgeB->other->pos[1]) +
-                                 (pb[2]-edgeB->other->pos[2])*(pb[2]-edgeB->other->pos[2]));
-                float lenB = dB0 + dB1;
-                float wB0 = (lenB > 1e-8f) ? (dB1 / lenB) : 0.5f;
-                float wB1 = (lenB > 1e-8f) ? (dB0 / lenB) : 0.5f;
-
-                // --- Velocity-based damping and friction ---
-                // Compute velocities at closest points (linear interpolation)
-                float va[3], vb[3];
-                for (int i = 0; i < 3; ++i) {
-                    va[i] = edgeA->node->vel[i] * wA0 + edgeA->other->vel[i] * wA1;
-                    vb[i] = edgeB->node->vel[i] * wB0 + edgeB->other->vel[i] * wB1;
-                }
-                float rel_vel[3] = { va[0] - vb[0], va[1] - vb[1], va[2] - vb[2] };
-                float normal_vel = rel_vel[0]*normal[0] + rel_vel[1]*normal[1] + rel_vel[2]*normal[2];
-
-                // Separation force
-                float sep_force[3] = {
-                    normal[0] * penetration * 500.0f,
-                    normal[1] * penetration * 500.0f,
-                    normal[2] * penetration * 500.0f
-                };
-                // Normal damping (only if moving into collision)
-                if (normal_vel < 0.0f) {
-                    sep_force[0] -= normal[0] * normal_vel * 100.0f;
-                    sep_force[1] -= normal[1] * normal_vel * 100.0f;
-                    sep_force[2] -= normal[2] * normal_vel * 100.0f;
-                }
-                // Tangential friction
-                float tangent[3] = {
-                    rel_vel[0] - normal[0] * normal_vel,
-                    rel_vel[1] - normal[1] * normal_vel,
-                    rel_vel[2] - normal[2] * normal_vel
-                };
-                float tangent_len = sqrtf(tangent[0]*tangent[0] + tangent[1]*tangent[1] + tangent[2]*tangent[2]);
-                float Kt = 150.0f;
-                float fric_mag = (tangent_len > 1e-9f) ? fminf(Kt * tangent_len, 0.5f * sqrtf(sep_force[0]*sep_force[0] + sep_force[1]*sep_force[1] + sep_force[2]*sep_force[2])) : 0.0f;
-                float fric_force[3] = {0,0,0};
-                if (tangent_len > 1e-9f) {
-                    fric_force[0] = -(tangent[0] / tangent_len) * fric_mag;
-                    fric_force[1] = -(tangent[1] / tangent_len) * fric_mag;
-                    fric_force[2] = -(tangent[2] / tangent_len) * fric_mag;
-                    sep_force[0] += fric_force[0];
-                    sep_force[1] += fric_force[1];
-                    sep_force[2] += fric_force[2];
-                }
-
-                // Apply to edgeA nodes
-                if (!(edgeA->node->anchored || edgeA->node->sim_ignore)) {
-                    collision_forces[3*edgeA->node->idx + 0] += sep_force[0] * wA0;
-                    collision_forces[3*edgeA->node->idx + 1] += sep_force[1] * wA0;
-                    collision_forces[3*edgeA->node->idx + 2] += sep_force[2] * wA0;
-                }
-                if (!(edgeA->other->anchored || edgeA->other->sim_ignore)) {
-                    collision_forces[3*edgeA->other->idx + 0] += sep_force[0] * wA1;
-                    collision_forces[3*edgeA->other->idx + 1] += sep_force[1] * wA1;
-                    collision_forces[3*edgeA->other->idx + 2] += sep_force[2] * wA1;
-                }
-                // Apply reaction to edgeB nodes
-                if (!(edgeB->node->anchored || edgeB->node->sim_ignore)) {
-                    collision_forces[3*edgeB->node->idx + 0] -= sep_force[0] * wB0;
-                    collision_forces[3*edgeB->node->idx + 1] -= sep_force[1] * wB0;
-                    collision_forces[3*edgeB->node->idx + 2] -= sep_force[2] * wB0;
-                }
-                if (!(edgeB->other->anchored || edgeB->other->sim_ignore)) {
-                    collision_forces[3*edgeB->other->idx + 0] -= sep_force[0] * wB1;
-                    collision_forces[3*edgeB->other->idx + 1] -= sep_force[1] * wB1;
-                    collision_forces[3*edgeB->other->idx + 2] -= sep_force[2] * wB1;
-                }
-            }
-        }
-        dynarray_free(edge_candidates, free);
-    }
-
-    // Free edge list
+    
+    EdgeEdgeContext ctx = { edges, collision_forces };
+    edge_bvh_self_traverse(s->edge_bvh, edge_edge_callback, &ctx);
     dynarray_free(edges, NULL);
 }
 
@@ -988,24 +942,24 @@ void simulator_draw(Simulator *s, float cam_yaw, float cam_pitch) {
     }
 }
 
-// Find the closest node to a given position within max_distance
-int simulator_find_closest_node(Simulator *s, float pos[3], float max_distance) {
-    if (!s || !s->octree || !s->nodes) return -1;
+// // Find the closest node to a given position within max_distance
+// int simulator_find_closest_node(Simulator *s, float pos[3], float max_distance) {
+//     if (!s || !s->octree || !s->nodes) return -1;
     
-    size_t n_nodes = dynarray_size(s->nodes);
-    if (n_nodes == 0) return -1;
+//     size_t n_nodes = dynarray_size(s->nodes);
+//     if (n_nodes == 0) return -1;
     
-    // Convert DynArray to array of Node pointers
-    Node **node_array = (Node**)malloc(sizeof(Node*) * n_nodes);
-    for (size_t i = 0; i < n_nodes; ++i) {
-        node_array[i] = (Node*)dynarray_get(s->nodes, i);
-    }
+//     // Convert DynArray to array of Node pointers
+//     Node **node_array = (Node**)malloc(sizeof(Node*) * n_nodes);
+//     for (size_t i = 0; i < n_nodes; ++i) {
+//         node_array[i] = (Node*)dynarray_get(s->nodes, i);
+//     }
     
-    int result = octree_find_closest_node(s->octree, node_array, n_nodes, pos, max_distance);
+//     int result = octree_find_closest_node(s->octree, node_array, n_nodes, pos, max_distance);
     
-    free(node_array);
-    return result;
-}
+//     free(node_array);
+//     return result;
+// }
 
 // Triangle struct for mesh output
 typedef struct {
