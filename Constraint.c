@@ -332,9 +332,12 @@ Constraint* springconstraint_create(Node *node, Node *other, float stiffness, fl
 
 
 // Triangle wall (3D boundary)
-TriangleWall* trianglewall_create(Node *A, Node *B, Node *C, float restitution, float friction) {
+TriangleWall* trianglewall_create(Node *A, Node *B, Node *C, float restitution, float friction, Constraint* edge_AB, Constraint* edge_BC, Constraint* edge_CA) {
     TriangleWall *w = (TriangleWall*)malloc(sizeof(TriangleWall));
     w->A = A; w->B = B; w->C = C; w->restitution = restitution; w->friction = friction;
+    w->edges[0] = edge_AB;
+    w->edges[1] = edge_BC;
+    w->edges[2] = edge_CA;
     return w;
 }
 void trianglewall_free(TriangleWall *w) { free(w); }

@@ -50,9 +50,10 @@ typedef struct TriangleWall {
     Node *C;
     float restitution;
     float friction;
+    Constraint* edges[3];
 } TriangleWall;
 
-TriangleWall* trianglewall_create(Node *A, Node *B, Node *C, float restitution, float friction);
+TriangleWall* trianglewall_create(Node *A, Node *B, Node *C, float restitution, float friction, Constraint* edge_AB, Constraint* edge_BC, Constraint* edge_CA);
 void trianglewall_free(TriangleWall *w);
 
 // Refresh internal cached node indices inside constraint implementations.

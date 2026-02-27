@@ -5,7 +5,7 @@
 #include <stdio.h>
 
 #define MAX_OCTREE_DEPTH 8
-#define MAX_CHILD_COUNT 1
+#define MAX_CHILD_COUNT 3
 
 // Helper: get which octant (0-7) a point belongs to
 int octree_get_octant(const float center[3], const float point[3]) {
@@ -40,6 +40,80 @@ int aabb_intersects(const AABB *a, const AABB *b) {
     return !(a->max[0] < b->min[0] || a->min[0] > b->max[0] ||
              a->max[1] < b->min[1] || a->min[1] > b->max[1] ||
              a->max[2] < b->min[2] || a->min[2] > b->max[2]);
+}
+
+// Segment-AABB intersection test (returns 1 if segment ab intersects box)
+static int segment_aabb_intersect(const float a[3], const float b[3], const AABB *box) {
+    float tmin = 0.0f, tmax = 1.0f;
+    for (int i = 0; i < 3; ++i) {
+        float da = b[i] - a[i];
+        if (fabsf(da) < 1e-8f) {
+            if (a[i] < box->min[i] || a[i] > box->max[i]) return 0;
+        } else {
+            float t1 = (box->min[i] - a[i]) / da;
+            float t2 = (box->max[i] - a[i]) / da;
+            float t_enter = fminf(t1, t2);
+            float t_exit = fmaxf(t1, t2);
+            tmin = fmaxf(tmin, t_enter);
+            tmax = fminf(tmax, t_exit);
+            if (tmin > tmax) return 0;
+        }
+    }
+    return tmax >= tmin && tmax >= 0.0f && tmin <= 1.0f;
+}
+
+// Remove a node (by index) from the octree using its previous position
+void octree_remove(OctreeNode *root, int node_idx, float pos[3]) {
+    if (!root) return;
+    // Check if point is in bounds
+    if (!aabb_contains_point(&root->bounds, pos)) {
+        return; // Outside octree bounds
+    }
+    // If leaf, remove from this node
+    if (root->is_leaf) {
+        if (root->node_entries) {
+            for (size_t i = 0; i < dynarray_size(root->node_entries); ++i) {
+                NodeEntry *entry = (NodeEntry*)dynarray_get(root->node_entries, i);
+                if (entry && entry->node_idx == node_idx) {
+                    free(entry);
+                    // Shift remaining entries
+                    for (size_t j = i + 1; j < dynarray_size(root->node_entries); ++j) {
+                        root->node_entries->items[j - 1] = root->node_entries->items[j];
+                    }
+                    root->node_entries->size -= 1;
+                    break;
+                }
+            }
+        }
+        return;
+    }
+    // Not a leaf - find appropriate child
+    float center[3] = {
+        (root->bounds.min[0] + root->bounds.max[0]) * 0.5f,
+        (root->bounds.min[1] + root->bounds.max[1]) * 0.5f,
+        (root->bounds.min[2] + root->bounds.max[2]) * 0.5f
+    };
+    int octant = octree_get_octant(center, pos);
+    if (root->children[octant]) {
+        octree_remove(root->children[octant], node_idx, pos);
+    }
+}
+
+// Register edge in all cubes it intersects
+void octree_insert_constraint_all_cubes(OctreeNode *root, int constraint_idx, float pos_a[3], float pos_b[3]) {
+    if (!root) return;
+    if (!segment_aabb_intersect(pos_a, pos_b, &root->bounds)) return;
+    if (root->is_leaf) {
+        int *idx = (int*)malloc(sizeof(int));
+        *idx = constraint_idx;
+        dynarray_append(root->constraint_indices, idx);
+        return;
+    }
+    for (int i = 0; i < 8; ++i) {
+        if (root->children[i]) {
+            octree_insert_constraint_all_cubes(root->children[i], constraint_idx, pos_a, pos_b);
+        }
+    }
 }
 
 // Create octree node

@@ -894,6 +894,35 @@ static int screen_to_world_plane(int screen_x, int screen_y, int win_w, int win_
                               world_x, world_y, world_z);
 }
 
+void draw_octree_node(OctreeNode *node) {
+    if (!node) return;
+    // Draw wireframe cube for this node's bounds
+    float minx = node->bounds.min[0], miny = node->bounds.min[1], minz = node->bounds.min[2];
+    float maxx = node->bounds.max[0], maxy = node->bounds.max[1], maxz = node->bounds.max[2];
+    glBegin(GL_LINES);
+    // Bottom face
+    glVertex3f(minx, miny, minz); glVertex3f(maxx, miny, minz);
+    glVertex3f(maxx, miny, minz); glVertex3f(maxx, miny, maxz);
+    glVertex3f(maxx, miny, maxz); glVertex3f(minx, miny, maxz);
+    glVertex3f(minx, miny, maxz); glVertex3f(minx, miny, minz);
+    // Top face
+    glVertex3f(minx, maxy, minz); glVertex3f(maxx, maxy, minz);
+    glVertex3f(maxx, maxy, minz); glVertex3f(maxx, maxy, maxz);
+    glVertex3f(maxx, maxy, maxz); glVertex3f(minx, maxy, maxz);
+    glVertex3f(minx, maxy, maxz); glVertex3f(minx, maxy, minz);
+    // Vertical edges
+    glVertex3f(minx, miny, minz); glVertex3f(minx, maxy, minz);
+    glVertex3f(maxx, miny, minz); glVertex3f(maxx, maxy, minz);
+    glVertex3f(maxx, miny, maxz); glVertex3f(maxx, maxy, maxz);
+    glVertex3f(minx, miny, maxz); glVertex3f(minx, maxy, maxz);
+    glEnd();
+    // Recursively draw children
+    if (!node->is_leaf) {
+        for (int i = 0; i < 8; i++) {
+            draw_octree_node(node->children[i]);
+        }
+    }
+}
 
 int main(int argc, char *argv[]) {
     // parse runtime options
@@ -977,7 +1006,7 @@ int main(int argc, char *argv[]) {
     int key_shift = 0, key_ctrl = 0;
 
     // --- Initial scenario: Box in Sleeve ---
-    Simulator *sim = simulator_create(1.0f/20.0f);
+    Simulator *sim = simulator_create(1.0f/30.0f);
     if (override_solver_iters > 0) sim->solver_iters = override_solver_iters;
 
      /* UI menus: registry of menus. We'll dispatch mouse events to each menu in
@@ -1109,216 +1138,6 @@ int main(int argc, char *argv[]) {
         }
     }
     
-    /* COMMENTED OUT OLD SCENE
-    const float offset = 50.0f;
-    const float box_size = 200.0f;
-    const float half = box_size * 0.5f;
-
-    // We'll keep an array of node pointers so we can reference by index like the python snippet
-    Node *nodes_arr[16];
-    int ni = 0;
-
-    // Box corners (friction = 0)
-    nodes_arr[ni] = node_create(-1, 1.0f, -half + offset, -half, 0.0f); nodes_arr[ni]->friction = 0.0f; simulator_add_node(sim, nodes_arr[ni++]);
-    nodes_arr[ni] = node_create(-1, 1.0f,  half + offset, -half, 0.0f); nodes_arr[ni]->friction = 0.0f; simulator_add_node(sim, nodes_arr[ni++]);
-    nodes_arr[ni] = node_create(-1, 1.0f,  half + offset,  half, 0.0f); nodes_arr[ni]->friction = 0.0f; simulator_add_node(sim, nodes_arr[ni++]);
-    nodes_arr[ni] = node_create(-1, 1.0f, -half + offset,  half, 0.0f); nodes_arr[ni]->friction = 0.0f; simulator_add_node(sim, nodes_arr[ni++]);
-
-    // Sleeve top and bottom panels (anchored walls)
-    float sleeve_y = half + 5;
-    float sleeve_length = box_size + 80.0f;
-    float sleeve_left = -sleeve_length * 0.5f;
-    float sleeve_right =  sleeve_length * 0.5f;
-
-    nodes_arr[ni] = node_create(-1, 1.0f, sleeve_left + offset,  sleeve_y, 0.0f); simulator_add_node(sim, nodes_arr[ni++]);
-    nodes_arr[ni] = node_create(-1, 1.0f, sleeve_right + offset, sleeve_y, 0.0f); simulator_add_node(sim, nodes_arr[ni++]);
-    // Create triangle wall for top boundary (A, B, C where C is midpoint offset in z)
-    Node *wtop_c = node_create(-1, 0.0f, 
-        (nodes_arr[4]->pos[0] + nodes_arr[5]->pos[0]) * 0.5f,
-        (nodes_arr[4]->pos[1] + nodes_arr[5]->pos[1]) * 0.5f,
-        10.0f);  // offset in z
-    wtop_c->anchored = true; wtop_c->collide_with_walls = false;
-    simulator_add_node(sim, wtop_c);
-    TriangleWall *wtop = trianglewall_create(nodes_arr[4], nodes_arr[5], wtop_c, 1.0f, 0.0f); 
-    simulator_add_wall(sim, wtop);
-
-    nodes_arr[ni] = node_create(-1, 1.0f, sleeve_left + offset, -sleeve_y, 0.0f); simulator_add_node(sim, nodes_arr[ni++]);
-    nodes_arr[ni] = node_create(-1, 1.0f, sleeve_right + offset,-sleeve_y, 0.0f); simulator_add_node(sim, nodes_arr[ni++]);
-    // Create triangle wall for bottom boundary
-    Node *wbot_c = node_create(-1, 0.0f,
-        (nodes_arr[6]->pos[0] + nodes_arr[7]->pos[0]) * 0.5f,
-        (nodes_arr[6]->pos[1] + nodes_arr[7]->pos[1]) * 0.5f,
-        10.0f);
-    wbot_c->anchored = true; wbot_c->collide_with_walls = false;
-    simulator_add_node(sim, wbot_c);
-    TriangleWall *wbot = trianglewall_create(nodes_arr[6], nodes_arr[7], wbot_c, 1.0f, 0.0f);
-    simulator_add_wall(sim, wbot);
-
-    // Additional support / spacer nodes
-    nodes_arr[ni] = node_create(-1, 1.0f, -box_size + offset, 0.0f, 0.0f); simulator_add_node(sim, nodes_arr[ni++]);
-    nodes_arr[ni] = node_create(-1, 1.0f, -box_size - half,    0.0f, 0.0f); simulator_add_node(sim, nodes_arr[ni++]);
-    // a heavier moving node
-    nodes_arr[ni] = node_create(-1, 50.0f, -box_size - half, 30.0f, 0.0f); simulator_add_node(sim, nodes_arr[ni++]);
-    nodes_arr[ni] = node_create(-1, 1.0f,  half * 1.25f + offset, 0.0f, 0.0f); simulator_add_node(sim, nodes_arr[ni++]);
-    nodes_arr[ni] = node_create(-1, 1.0f,  box_size * 1.5f + offset,  0.0f, 0.0f); simulator_add_node(sim, nodes_arr[ni++]);
-    // give node index 10 an initial leftward velocity
-    if (ni > 10) {
-        nodes_arr[10]->vel[0] = -25.0f; nodes_arr[10]->vel[1] = 0.0f;
-    }
-
-    // Anchor constraints (anchor at current node position)
-    // panels top/bot and two support nodes
-    Constraint *ac;
-    ac = anchorconstraint_create(nodes_arr[4], nodes_arr[4]->pos[0], nodes_arr[4]->pos[1], nodes_arr[4]->pos[2]); simulator_add_constraint(sim, ac);
-    ac = anchorconstraint_create(nodes_arr[5], nodes_arr[5]->pos[0], nodes_arr[5]->pos[1], nodes_arr[5]->pos[2]); simulator_add_constraint(sim, ac);
-    ac = anchorconstraint_create(nodes_arr[6], nodes_arr[6]->pos[0], nodes_arr[6]->pos[1], nodes_arr[6]->pos[2]); simulator_add_constraint(sim, ac);
-    ac = anchorconstraint_create(nodes_arr[7], nodes_arr[7]->pos[0], nodes_arr[7]->pos[1], nodes_arr[7]->pos[2]); simulator_add_constraint(sim, ac);
-    ac = anchorconstraint_create(nodes_arr[9], nodes_arr[9]->pos[0], nodes_arr[9]->pos[1], nodes_arr[9]->pos[2]); simulator_add_constraint(sim, ac);
-    ac = anchorconstraint_create(nodes_arr[12], nodes_arr[12]->pos[0], nodes_arr[12]->pos[1], nodes_arr[12]->pos[2]); simulator_add_constraint(sim, ac);
-
-    // Box structural constraints (edges, diagonals, and some internal links)
-    {
-        simulator_add_constraint(sim, distconstraint_create(nodes_arr[0], nodes_arr[1], -1));
-        simulator_add_constraint(sim, distconstraint_create(nodes_arr[1], nodes_arr[2], -1));
-        simulator_add_constraint(sim, distconstraint_create(nodes_arr[2], nodes_arr[3], -1));
-        simulator_add_constraint(sim, distconstraint_create(nodes_arr[3], nodes_arr[0], -1));
-        simulator_add_constraint(sim, distconstraint_create(nodes_arr[0], nodes_arr[2], -1));
-        simulator_add_constraint(sim, distconstraint_create(nodes_arr[1], nodes_arr[3], -1));
-        simulator_add_constraint(sim, distconstraint_create(nodes_arr[8], nodes_arr[3], -1));
-        simulator_add_constraint(sim, distconstraint_create(nodes_arr[8], nodes_arr[0], -1));
-        simulator_add_constraint(sim, distconstraint_create(nodes_arr[9], nodes_arr[10], -1));
-        simulator_add_constraint(sim, distconstraint_create(nodes_arr[10], nodes_arr[8], -1));
-        float r11_12 = sqrtf((nodes_arr[11]->pos[0]-nodes_arr[12]->pos[0])*(nodes_arr[11]->pos[0]-nodes_arr[12]->pos[0]) + (nodes_arr[11]->pos[1]-nodes_arr[12]->pos[1])*(nodes_arr[11]->pos[1]-nodes_arr[12]->pos[1]));
-        simulator_add_constraint(sim, springconstraint_create(nodes_arr[11], nodes_arr[12], 10.0f, r11_12));
-        simulator_add_constraint(sim, distconstraint_create(nodes_arr[1], nodes_arr[11], -1));
-        simulator_add_constraint(sim, distconstraint_create(nodes_arr[2], nodes_arr[11], -1));
-        simulator_add_constraint(sim, distconstraint_create(nodes_arr[0], nodes_arr[11], -1));
-        simulator_add_constraint(sim, distconstraint_create(nodes_arr[3], nodes_arr[11], -1));
-    }
-
-    // Sleeve inner walls along box top/bottom
-    Node *w1_c = node_create(-1, 0.0f,
-        (nodes_arr[0]->pos[0] + nodes_arr[1]->pos[0]) * 0.5f,
-        (nodes_arr[0]->pos[1] + nodes_arr[1]->pos[1]) * 0.5f,
-        10.0f);
-    w1_c->anchored = true; w1_c->collide_with_walls = false;
-    simulator_add_node(sim, w1_c);
-    TriangleWall *w1 = trianglewall_create(nodes_arr[0], nodes_arr[1], w1_c, 1.0f, 0.0f);
-    simulator_add_wall(sim, w1);
-    Node *w2_c = node_create(-1, 0.0f,
-        (nodes_arr[2]->pos[0] + nodes_arr[3]->pos[0]) * 0.5f,
-        (nodes_arr[2]->pos[1] + nodes_arr[3]->pos[1]) * 0.5f,
-        10.0f);
-    w2_c->anchored = true; w2_c->collide_with_walls = false;
-    simulator_add_node(sim, w2_c);
-    TriangleWall *w2 = trianglewall_create(nodes_arr[2], nodes_arr[3], w2_c, 1.0f, 0.0f);
-    simulator_add_wall(sim, w2);
-    // Create a dense grid of free nodes below the bottom panel and attach
-    // the two bottom anchors to the grid with springs. Grid nodes are
-    // small-radius, and only horizontal/vertical neighbor connections are
-    // created (distance constraints + walls). No diagonals.
-    {
-        const int GRID_COLS = 0;   // pretty dense horizontally
-        const int GRID_ROWS = 0;    // several rows
-        Node *grid[GRID_ROWS][GRID_COLS];
-        const float spacing = 7.0f; // spacing between grid nodes (world units)
-        // center the grid between the two bottom anchors (nodes_arr[6], nodes_arr[7])
-        float anchor_x0 = nodes_arr[6]->pos[0];
-        float anchor_x1 = nodes_arr[7]->pos[0];
-        float grid_center_x = 0.5f * (anchor_x0 + anchor_x1);
-        float grid_start_x = grid_center_x - ((GRID_COLS - 1) * spacing) * 0.5f;
-        // place the grid below the bottom anchor line
-        float grid_start_y = nodes_arr[6]->pos[1] - 28.0f;
-
-        // create nodes
-        for (int r = 0; r < GRID_ROWS; ++r) {
-            for (int c = 0; c < GRID_COLS; ++c) {
-                float x = grid_start_x + c * spacing;
-                float y = grid_start_y - r * spacing;
-                Node *n = node_create(-1, 1.0f, x, y, 0.0f);
-                if (!n) continue;
-                // reduce visual radius so grid looks dense and tidy
-                n->radius = 1.0f;
-                // some default friction for interactions with walls
-                n->friction = 0.5f;
-                simulator_add_node(sim, n);
-                grid[r][c] = n;
-            }
-        }
-
-        // connect neighbors with horizontal and vertical distance constraints + walls
-        for (int r = 0; r < GRID_ROWS; ++r) {
-            for (int c = 0; c < GRID_COLS; ++c) {
-                Node *n = grid[r][c];
-                if (!n) continue;
-                // horizontal neighbor
-                if (c + 1 < GRID_COLS) {
-                    Node *hn = grid[r][c + 1];
-                    if (hn) {
-                        // distance constraint (rest = current distance)
-                        float dx = n->pos[0] - hn->pos[0];
-                        float dy = n->pos[1] - hn->pos[1];
-                        float rest = sqrtf(dx*dx + dy*dy);
-                        Constraint *dc = distconstraint_create(n, hn, rest);
-                        if (dc) simulator_add_constraint(sim, dc);
-                        // also add a wall segment between neighbors so collisions behave
-                        Node *ws_c = node_create(-1, 0.0f,
-                            (n->pos[0] + hn->pos[0]) * 0.5f,
-                            (n->pos[1] + hn->pos[1]) * 0.5f,
-                            10.0f);
-                        ws_c->anchored = true; ws_c->collide_with_walls = false;
-                        simulator_add_node(sim, ws_c);
-                        TriangleWall *ws = trianglewall_create(n, hn, ws_c, 1.0f, 0.0f);
-                        if (ws) simulator_add_wall(sim, ws);
-                    }
-                }
-                // vertical neighbor
-                if (r + 1 < GRID_ROWS) {
-                    Node *vn = grid[r + 1][c];
-                    if (vn) {
-                        float dx = n->pos[0] - vn->pos[0];
-                        float dy = n->pos[1] - vn->pos[1];
-                        float rest = sqrtf(dx*dx + dy*dy);
-                        Constraint *dc = distconstraint_create(n, vn, rest);
-                        if (dc) simulator_add_constraint(sim, dc);
-                        Node *ws_c = node_create(-1, 0.0f,
-                            (n->pos[0] + vn->pos[0]) * 0.5f,
-                            (n->pos[1] + vn->pos[1]) * 0.5f,
-                            10.0f);
-                        ws_c->anchored = true; ws_c->collide_with_walls = false;
-                        simulator_add_node(sim, ws_c);
-                        TriangleWall *ws = trianglewall_create(n, vn, ws_c, 1.0f, 0.0f);
-                        if (ws) simulator_add_wall(sim, ws);
-                    }
-                }
-            }
-        }
-
-        // attach the two bottom anchors to the top row of the grid with springs
-        // (one spring from each anchor to the nearest grid edge). Use a moderate
-        // stiffness so the grid is influenced but still free.
-        float spring_stiff = 5000.0f;
-        if (GRID_COLS > 0 && GRID_ROWS > 0) {
-            Node *left_top = grid[0][0];
-            Node *right_top = grid[0][GRID_COLS - 1];
-            if (left_top) {
-                float dx = left_top->pos[0] - nodes_arr[6]->pos[0];
-                float dy = left_top->pos[1] - nodes_arr[6]->pos[1];
-                float rest = sqrtf(dx*dx + dy*dy);
-                Constraint *s = springconstraint_create(nodes_arr[6], left_top, spring_stiff, rest);
-                if (s) simulator_add_constraint(sim, s);
-            }
-            if (right_top) {
-                float dx = right_top->pos[0] - nodes_arr[7]->pos[0];
-                float dy = right_top->pos[1] - nodes_arr[7]->pos[1];
-                float rest = sqrtf(dx*dx + dy*dy);
-                Constraint *s = springconstraint_create(nodes_arr[7], right_top, spring_stiff, rest);
-                if (s) simulator_add_constraint(sim, s);
-            }
-        }
-    }
-    END OLD SCENE */
-
     // NEW SCENE: Ground + Tetrahedron
     // Position in front of camera (0,0,500), slightly below (y < 0)
     // Camera looks along -Z axis, so objects should be at negative Z
@@ -1340,8 +1159,8 @@ int main(int argc, char *argv[]) {
     simulator_add_node(sim, g4);
     
     // Ground triangle walls
-    TriangleWall *ground1 = trianglewall_create(g1, g2, g3, 1.0f, 0.0f);
-    TriangleWall *ground2 = trianglewall_create(g1, g3, g4, 1.0f, 0.0f);
+    TriangleWall *ground1 = trianglewall_create(g1, g2, g3, 1.0f, 0.0f, NULL, NULL, NULL);
+    TriangleWall *ground2 = trianglewall_create(g1, g3, g4, 1.0f, 0.0f, NULL, NULL, NULL);
     simulator_add_wall(sim, ground1);
     simulator_add_wall(sim, ground2);
     
@@ -1375,18 +1194,23 @@ int main(int argc, char *argv[]) {
     simulator_add_node(sim, t3);
     
     // Distance constraints for all 6 edges of tetrahedron
-    simulator_add_constraint(sim, distconstraint_create(t_bottom, t1, -1));
-    simulator_add_constraint(sim, distconstraint_create(t_bottom, t2, -1));
-    simulator_add_constraint(sim, distconstraint_create(t_bottom, t3, -1));
-    simulator_add_constraint(sim, distconstraint_create(t1, t2, -1));
-    simulator_add_constraint(sim, distconstraint_create(t2, t3, -1));
+    Constraint* t_bottom_tb1 = distconstraint_create(t_bottom, t1, -1);
+    simulator_add_constraint(sim, t_bottom_tb1);
+    Constraint* t_bottom_tb2 = distconstraint_create(t_bottom, t2, -1);
+    simulator_add_constraint(sim, t_bottom_tb2);
+    Constraint* t_bottom_tb3 = distconstraint_create(t_bottom, t3, -1);
+    simulator_add_constraint(sim, t_bottom_tb3);
+    Constraint* t1_t2 = distconstraint_create(t1, t2, -1);
+    simulator_add_constraint(sim, t1_t2);
+    Constraint* t2_t3 = distconstraint_create(t2, t3, -1);
+    simulator_add_constraint(sim, t2_t3);
     simulator_add_constraint(sim, distconstraint_create(t3, t1, -1));
     
     // Triangle walls for all 4 faces of tetrahedron
-    TriangleWall *tet_face1 = trianglewall_create(t1, t2, t3, 1.0f, 0.0f);  // Top face
-    TriangleWall *tet_face2 = trianglewall_create(t_bottom, t2, t1, 1.0f, 0.0f);  // Side 1
-    TriangleWall *tet_face3 = trianglewall_create(t_bottom, t3, t2, 1.0f, 0.0f);  // Side 2
-    TriangleWall *tet_face4 = trianglewall_create(t_bottom, t1, t3, 1.0f, 0.0f);  // Side 3
+    TriangleWall *tet_face1 = trianglewall_create(t1, t2, t3, 1.0f, 0.0f, t1_t2, t2_t3, t_bottom_tb1);  // Top face
+    TriangleWall *tet_face2 = trianglewall_create(t_bottom, t2, t1, 1.0f, 0.0f, t_bottom_tb2, t1_t2, t_bottom_tb1);  // Side 1
+    TriangleWall *tet_face3 = trianglewall_create(t_bottom, t3, t2, 1.0f, 0.0f, t_bottom_tb3, t2_t3, t_bottom_tb2);  // Side 2
+    TriangleWall *tet_face4 = trianglewall_create(t_bottom, t1, t3, 1.0f, 0.0f, t_bottom_tb1, t_bottom_tb3, t1_t2);  // Side 3
     simulator_add_wall(sim, tet_face1);
     simulator_add_wall(sim, tet_face2);
     simulator_add_wall(sim, tet_face3);
@@ -1441,43 +1265,53 @@ int main(int argc, char *argv[]) {
     simulator_add_node(sim, pt3);
     
     // Distance constraints for all edges (3 bottom, 3 top, 3 vertical)
-    simulator_add_constraint(sim, distconstraint_create(pb1, pb2, -1));
-    simulator_add_constraint(sim, distconstraint_create(pb2, pb3, -1));
-    simulator_add_constraint(sim, distconstraint_create(pb3, pb1, -1));
-    simulator_add_constraint(sim, distconstraint_create(pt1, pt2, -1));
-    simulator_add_constraint(sim, distconstraint_create(pt2, pt3, -1));
-    simulator_add_constraint(sim, distconstraint_create(pt3, pt1, -1));
-    simulator_add_constraint(sim, distconstraint_create(pb1, pt1, -1));
-    simulator_add_constraint(sim, distconstraint_create(pb2, pt2, -1));
-    simulator_add_constraint(sim, distconstraint_create(pb3, pt3, -1));
-    
-    // Diagonal constraints for rectangular faces (prevent shearing)
-    simulator_add_constraint(sim, distconstraint_create(pb1, pt2, -1));  // Side 1 diagonal
-    simulator_add_constraint(sim, distconstraint_create(pb2, pt3, -1));  // Side 2 diagonal
-    simulator_add_constraint(sim, distconstraint_create(pb3, pt1, -1));  // Side 3 diagonal
+    Constraint* pb1_pb2 = distconstraint_create(pb1, pb2, -1);
+    simulator_add_constraint(sim, pb1_pb2);
+    Constraint* pb2_pb3 = distconstraint_create(pb2, pb3, -1);
+    simulator_add_constraint(sim, pb2_pb3);
+    Constraint* pb3_pb1 = distconstraint_create(pb3, pb1, -1);
+    simulator_add_constraint(sim, pb3_pb1);
+    Constraint* pt1_pt2 = distconstraint_create(pt1, pt2, -1);
+    simulator_add_constraint(sim, pt1_pt2);
+    Constraint* pt2_pt3 = distconstraint_create(pt2, pt3, -1);
+    simulator_add_constraint(sim, pt2_pt3);
+    Constraint* pt3_pt1 = distconstraint_create(pt3, pt1, -1);
+    simulator_add_constraint(sim, pt3_pt1);
+    Constraint* pb1_pt1 = distconstraint_create(pb1, pt1, -1);
+    simulator_add_constraint(sim, pb1_pt1);
+    Constraint* pb2_pt2 = distconstraint_create(pb2, pt2, -1);
+    simulator_add_constraint(sim, pb2_pt2);
+    Constraint* pb3_pt3 = distconstraint_create(pb3, pt3, -1);
+    simulator_add_constraint(sim, pb3_pt3);
+    Constraint* pb1_pt2 = distconstraint_create(pb1, pt2, -1);
+    simulator_add_constraint(sim, pb1_pt2);
+    Constraint* pb2_pt3 = distconstraint_create(pb2, pt3, -1);
+    simulator_add_constraint(sim, pb2_pt3);
+    Constraint* pb3_pt1 = distconstraint_create(pb3, pt1, -1);
+    simulator_add_constraint(sim, pb3_pt1);
     
     // Triangle walls for bottom and top faces
-    TriangleWall *prism_bottom = trianglewall_create(pb1, pb3, pb2, 1.0f, 0.0f);  // Bottom (clockwise from below)
-    TriangleWall *prism_top = trianglewall_create(pt1, pt2, pt3, 1.0f, 0.0f);  // Top (clockwise from above)
+    TriangleWall *prism_bottom = trianglewall_create(pb1, pb3, pb2, 1.0f, 0.0f, pb1_pb2, pb2_pb3, pb3_pb1);  // Bottom (clockwise from below)
+    TriangleWall *prism_top = trianglewall_create(pt1, pt2, pt3, 1.0f, 0.0f, pt1_pt2, pt2_pt3, pt3_pt1);  // Top (clockwise from above)
     simulator_add_wall(sim, prism_bottom);
     simulator_add_wall(sim, prism_top);
     
     // Rectangular side walls (each split into 2 triangles)
     // Side 1: pb1-pb2-pt2-pt1
-    TriangleWall *prism_side1a = trianglewall_create(pb1, pb2, pt2, 1.0f, 0.0f);
-    TriangleWall *prism_side1b = trianglewall_create(pb1, pt2, pt1, 1.0f, 0.0f);
+    TriangleWall *prism_side1a = trianglewall_create(pb1, pb2, pt2, 1.0f, 0.0f, pb1_pb2, pb2_pt2, pb1_pt2);
+    TriangleWall *prism_side1b = trianglewall_create(pb1, pt2, pt1, 1.0f, 0.0f, pb1_pt2, pt1_pt2, pb1_pt1);
     simulator_add_wall(sim, prism_side1a);
     simulator_add_wall(sim, prism_side1b);
     
     // Side 2: pb2-pb3-pt3-pt2
-    TriangleWall *prism_side2a = trianglewall_create(pb2, pb3, pt3, 1.0f, 0.0f);
-    TriangleWall *prism_side2b = trianglewall_create(pb2, pt3, pt2, 1.0f, 0.0f);
+    TriangleWall *prism_side2a = trianglewall_create(pb2, pb3, pt3, 1.0f, 0.0f, pb2_pb3, pb3_pt3, pb2_pt3);
+    TriangleWall *prism_side2b = trianglewall_create(pb2, pt3, pt2, 1.0f, 0.0f, pb2_pt3, pt2_pt3, pb2_pt2);
     simulator_add_wall(sim, prism_side2a);
     simulator_add_wall(sim, prism_side2b);
     
     // Side 3: pb3-pb1-pt1-pt3
-    TriangleWall *prism_side3a = trianglewall_create(pb3, pb1, pt1, 1.0f, 0.0f);
-    TriangleWall *prism_side3b = trianglewall_create(pb3, pt1, pt3, 1.0f, 0.0f);
+    TriangleWall *prism_side3a = trianglewall_create(pb3, pb1, pt1, 1.0f, 0.0f, pb3_pb1, pb1_pt1, pb3_pt1);
+    TriangleWall *prism_side3b = trianglewall_create(pb3, pt1, pt3, 1.0f, 0.0f, pb3_pt1, pt3_pt1, pb3_pt3);
     simulator_add_wall(sim, prism_side3a);
     simulator_add_wall(sim, prism_side3b);
     
@@ -1503,15 +1337,21 @@ int main(int argc, char *argv[]) {
     simulator_add_node(sim, pend3);
     
     // Distance constraints: anchor to each vertex and between all vertices
-    simulator_add_constraint(sim, distconstraint_create(edge_anchor, pend1, -1));
-    simulator_add_constraint(sim, distconstraint_create(edge_anchor, pend2, -1));
-    simulator_add_constraint(sim, distconstraint_create(edge_anchor, pend3, -1));
-    simulator_add_constraint(sim, distconstraint_create(pend1, pend2, -1));
-    simulator_add_constraint(sim, distconstraint_create(pend2, pend3, -1));
-    simulator_add_constraint(sim, distconstraint_create(pend3, pend1, -1));
+    Constraint* pa1 = distconstraint_create(edge_anchor, pend1, -1);
+    Constraint* pa2 = distconstraint_create(edge_anchor, pend2, -1);
+    Constraint* pa3 = distconstraint_create(edge_anchor, pend3, -1);
+    Constraint* p12 = distconstraint_create(pend1, pend2, -1);
+    Constraint* p23 = distconstraint_create(pend2, pend3, -1);
+    Constraint* p31 = distconstraint_create(pend3, pend1, -1);
+    simulator_add_constraint(sim, pa1);
+    simulator_add_constraint(sim, pa2);
+    simulator_add_constraint(sim, pa3);
+    simulator_add_constraint(sim, p12);
+    simulator_add_constraint(sim, p23);
+    simulator_add_constraint(sim, p31);
     
     // Pendulum triangle as collision surface
-    TriangleWall *pend_wall = trianglewall_create(pend1, pend2, pend3, 1.0f, 0.0f);
+    TriangleWall *pend_wall = trianglewall_create(pend1, pend2, pend3, 1.0f, 0.0f, p12, p23, p31);
     simulator_add_wall(sim, pend_wall);
     
     // Static horizontal triangle (flat on x-z plane) positioned to collide with pendulum
@@ -1527,12 +1367,15 @@ int main(int argc, char *argv[]) {
     simulator_add_node(sim, horiz3);
     
     // Distance constraints for horizontal triangle structure
-    simulator_add_constraint(sim, distconstraint_create(horiz1, horiz2, -1));
-    simulator_add_constraint(sim, distconstraint_create(horiz2, horiz3, -1));
-    simulator_add_constraint(sim, distconstraint_create(horiz3, horiz1, -1));
+    Constraint* h12 = distconstraint_create(horiz1, horiz2, -1);
+    Constraint* h23 = distconstraint_create(horiz2, horiz3, -1);
+    Constraint* h31 = distconstraint_create(horiz3, horiz1, -1);
+    simulator_add_constraint(sim, h12);
+    simulator_add_constraint(sim, h23);
+    simulator_add_constraint(sim, h31);
     
     // Horizontal triangle as collision surface
-    TriangleWall *horiz_wall = trianglewall_create(horiz1, horiz2, horiz3, 1.0f, 0.0f);
+    TriangleWall *horiz_wall = trianglewall_create(horiz1, horiz2, horiz3, 1.0f, 0.0f, h12, h23, h31);
     simulator_add_wall(sim, horiz_wall);
     
     printf("Generated initial scenario with %zu nodes, %zu constraints, %zu walls\n",
@@ -1826,7 +1669,7 @@ int main(int argc, char *argv[]) {
                                             // Third node - create triangle wall
                                             float wf = edata.wall_friction ? (float)(*(edata.wall_friction)) : 1.0f;
                                             float wr = edata.wall_restitution ? (float)(*(edata.wall_restitution)) : 0.0f;
-                                            TriangleWall *w = trianglewall_create(pending_tool_node, pending_tool_node2, found, wf, wr);
+                                            TriangleWall *w = trianglewall_create(pending_tool_node, pending_tool_node2, found, wf, wr, NULL, NULL, NULL);
                                             if (w) simulator_add_wall(sim, w);
                                             // if +Dist toggle is set, add distance constraints for all edges
                                             if (edata.wall_add_dist && edata.wall_add_dist[0]) {
@@ -2128,35 +1971,7 @@ int main(int argc, char *argv[]) {
             glColor3f(1.0f, 0.0f, 1.0f); // Magenta
             glLineWidth(1.0f);
             // Recursive function to draw octree node wireframes
-            void draw_octree_node(OctreeNode *node) {
-                if (!node) return;
-                // Draw wireframe cube for this node's bounds
-                float minx = node->bounds.min[0], miny = node->bounds.min[1], minz = node->bounds.min[2];
-                float maxx = node->bounds.max[0], maxy = node->bounds.max[1], maxz = node->bounds.max[2];
-                glBegin(GL_LINES);
-                // Bottom face
-                glVertex3f(minx, miny, minz); glVertex3f(maxx, miny, minz);
-                glVertex3f(maxx, miny, minz); glVertex3f(maxx, miny, maxz);
-                glVertex3f(maxx, miny, maxz); glVertex3f(minx, miny, maxz);
-                glVertex3f(minx, miny, maxz); glVertex3f(minx, miny, minz);
-                // Top face
-                glVertex3f(minx, maxy, minz); glVertex3f(maxx, maxy, minz);
-                glVertex3f(maxx, maxy, minz); glVertex3f(maxx, maxy, maxz);
-                glVertex3f(maxx, maxy, maxz); glVertex3f(minx, maxy, maxz);
-                glVertex3f(minx, maxy, maxz); glVertex3f(minx, maxy, minz);
-                // Vertical edges
-                glVertex3f(minx, miny, minz); glVertex3f(minx, maxy, minz);
-                glVertex3f(maxx, miny, minz); glVertex3f(maxx, maxy, minz);
-                glVertex3f(maxx, miny, maxz); glVertex3f(maxx, maxy, maxz);
-                glVertex3f(minx, miny, maxz); glVertex3f(minx, maxy, maxz);
-                glEnd();
-                // Recursively draw children
-                if (!node->is_leaf) {
-                    for (int i = 0; i < 8; i++) {
-                        draw_octree_node(node->children[i]);
-                    }
-                }
-            }
+
             draw_octree_node(sim->octree);
         }
 

@@ -9,6 +9,37 @@
 
 #include <cs.h>
 
+// Helper: mark node dirty if Manhattan distance exceeds threshold
+void mark_node_dirty_if_moved(Node *node, float threshold) {
+    float dx = fabsf(node->pos[0] - node->prev_position[0]);
+    float dy = fabsf(node->pos[1] - node->prev_position[1]);
+    float dz = fabsf(node->pos[2] - node->prev_position[2]);
+    float manhattan = dx + dy + dz;
+    if (manhattan > threshold) {
+        node->dirty = true;
+    }
+    // Update prev_position for next check
+    node->prev_position[0] = node->pos[0];
+    node->prev_position[1] = node->pos[1];
+    node->prev_position[2] = node->pos[2];
+}
+
+// Incremental octree rebuild: only update dirty nodes
+void incremental_octree_rebuild(OctreeNode *octree, DynArray *nodes, float threshold) {
+    if (!octree || !nodes) return;
+    for (size_t i = 0; i < dynarray_size(nodes); ++i) {
+        Node *node = (Node*)dynarray_get(nodes, i);
+        if (!node) continue;
+        mark_node_dirty_if_moved(node, threshold);
+        if (node->dirty) {
+            node->dirty = false;
+            // Remove from octree and re-add at new position
+            octree_remove(octree, node->idx, node->prev_position); // Remove using previous position
+            octree_insert_node(octree, node->idx, node->pos);      // Add at new position
+        }
+    }
+}
+
 // Conjugate Gradient solver for symmetric positive-definite dense matrix
 static int cg_solve_dense(size_t n, double *A, double *b, double *x, int max_iter, double tol) {
     // x should be initialized to zeros by caller
@@ -317,6 +348,91 @@ static int triangle_check_collision(TriangleWall *w, Node *node,
     return 1;
 }
 
+
+
+// Check collision between two distance constraints (modeled as cylinders)
+// Returns 1 if collision detected, fills out_penetration, out_normal[3], and closest points on each segment
+static int constraint_constraint_collision(
+    Node *a0, Node *a1, // endpoints of first constraint
+    Node *b0, Node *b1, // endpoints of second constraint
+    float *out_penetration, float out_normal[3],
+    float out_pa[3], float out_pb[3] // closest points on each segment
+) {
+    // Compute segment vectors and lengths
+    float A[3] = {a0->pos[0], a0->pos[1], a0->pos[2]};
+    float B[3] = {a1->pos[0], a1->pos[1], a1->pos[2]};
+    float C[3] = {b0->pos[0], b0->pos[1], b0->pos[2]};
+    float D[3] = {b1->pos[0], b1->pos[1], b1->pos[2]};
+    float u[3] = {B[0]-A[0], B[1]-A[1], B[2]-A[2]};
+    float v[3] = {D[0]-C[0], D[1]-C[1], D[2]-C[2]};
+    float w[3] = {A[0]-C[0], A[1]-C[1], A[2]-C[2]};
+    float len_u = sqrtf(u[0]*u[0] + u[1]*u[1] + u[2]*u[2]);
+    float len_v = sqrtf(v[0]*v[0] + v[1]*v[1] + v[2]*v[2]);
+    if (len_u < 1e-8f || len_v < 1e-8f) return 0; // degenerate
+
+    float ru = 0.01f * len_u;
+    float rv = 0.01f * len_v;
+
+    // Compute closest points between segments (see Real-Time Collision Detection, Christer Ericson)
+    float a = u[0]*u[0] + u[1]*u[1] + u[2]*u[2];
+    float b = u[0]*v[0] + u[1]*v[1] + u[2]*v[2];
+    float c = v[0]*v[0] + v[1]*v[1] + v[2]*v[2];
+    float d = u[0]*w[0] + u[1]*w[1] + u[2]*w[2];
+    float e = v[0]*w[0] + v[1]*w[1] + v[2]*w[2];
+    float D_ = a*c - b*b;
+    float sc, sN, sD = D_;
+    float tc, tN, tD = D_;
+
+    // Default sN = D_, tN = D_
+    if (D_ < 1e-8f) {
+        sN = 0.0f;
+        sD = 1.0f;
+        tN = e;
+        tD = c;
+    } else {
+        sN = (b*e - c*d);
+        tN = (a*e - b*d);
+        if (sN < 0.0f) { sN = 0.0f; tN = e; tD = c; }
+        else if (sN > sD) { sN = sD; tN = e + b; tD = c; }
+    }
+    if (tN < 0.0f) { tN = 0.0f;
+        if (-d < 0.0f) sN = 0.0f;
+        else if (-d > a) sN = sD;
+        else { sN = -d; sD = a; }
+    } else if (tN > tD) { tN = tD;
+        if ((-d + b) < 0.0f) sN = 0.0f;
+        else if ((-d + b) > a) sN = sD;
+        else { sN = (-d + b); sD = a; }
+    }
+    sc = (fabsf(sN) < 1e-8f ? 0.0f : sN / sD);
+    tc = (fabsf(tN) < 1e-8f ? 0.0f : tN / tD);
+
+    // Closest points
+    float pa[3] = {A[0] + sc * u[0], A[1] + sc * u[1], A[2] + sc * u[2]};
+    float pb[3] = {C[0] + tc * v[0], C[1] + tc * v[1], C[2] + tc * v[2]};
+    float dx = pa[0] - pb[0], dy = pa[1] - pb[1], dz = pa[2] - pb[2];
+    float dist = sqrtf(dx*dx + dy*dy + dz*dz);
+
+    float min_dist = ru + rv;
+    if (dist < min_dist) {
+        if (out_penetration) *out_penetration = min_dist - dist;
+        if (out_normal) {
+            float nlen = sqrtf(dx*dx + dy*dy + dz*dz);
+            if (nlen > 1e-8f) {
+                out_normal[0] = dx / nlen;
+                out_normal[1] = dy / nlen;
+                out_normal[2] = dz / nlen;
+            } else {
+                out_normal[0] = 1.0f; out_normal[1] = 0.0f; out_normal[2] = 0.0f;
+            }
+        }
+        if (out_pa) { out_pa[0] = pa[0]; out_pa[1] = pa[1]; out_pa[2] = pa[2]; }
+        if (out_pb) { out_pb[0] = pb[0]; out_pb[1] = pb[1]; out_pb[2] = pb[2]; }
+        return 1;
+    }
+    return 0;
+}
+
 // Compute collision forces using octree acceleration structure
 static void compute_triangle_collision_forces(Simulator *s, float *collision_forces) {
     if (!s || !collision_forces) return;
@@ -332,19 +448,39 @@ static void compute_triangle_collision_forces(Simulator *s, float *collision_for
     if (s->octree) {
         octree_clear(s->octree);
     }
-    
-    // Insert all triangle walls into octree
+
+    // --- Collect all triangle edges into a DynArray ---
+    DynArray *edges = dynarray_create(n_walls * 3);
     for (size_t wi = 0; wi < n_walls; ++wi) {
         TriangleWall *w = (TriangleWall*)dynarray_get(s->walls, wi);
-        if (!w || !w->A || !w->B || !w->C) continue;
-        octree_insert_triangle(s->octree, (int)wi, w->A->pos, w->B->pos, w->C->pos);
+        if (!w) continue;
+        for (int ei = 0; ei < 3; ++ei) {
+            Constraint *edge = w->edges[ei];
+            if (edge) dynarray_append(edges, edge);
+        }
+        // Insert triangle into octree as before
+        if (w->A && w->B && w->C)
+            octree_insert_triangle(s->octree, (int)wi, w->A->pos, w->B->pos, w->C->pos);
     }
-    
-    // Insert all nodes into octree for spatial queries
-    for (size_t ni = 0; ni < n_nodes; ++ni) {
-        Node *node = (Node*)dynarray_get(s->nodes, ni);
-        if (!node) continue;
-        octree_insert_node(s->octree, (int)ni, node->pos);
+
+    // // Insert all nodes into octree for spatial queries
+    // for (size_t ni = 0; ni < n_nodes; ++ni) {
+    //     Node *node = (Node*)dynarray_get(s->nodes, ni);
+    //     if (!node) continue;
+    //     octree_insert_node(s->octree, (int)ni, node->pos);
+    // }
+
+    incremental_octree_rebuild(s->octree, s->nodes, 1e-6);
+
+    // --- Register edges in octree sub-cubes ---
+    // For each edge, mark all octree sub-cubes that the edge (line segment) crosses.
+    // Each sub-cube should maintain a list of constraints crossing it.
+    size_t n_edges = dynarray_size(edges);
+    for (size_t ei = 0; ei < n_edges; ++ei) {
+        Constraint *edge = (Constraint*)dynarray_get(edges, ei);
+        if (!edge || !edge->node || !edge->other) continue;
+        // Register edge in all cubes it intersects
+        octree_insert_constraint_all_cubes(s->octree, (int)ei, edge->node->pos, edge->other->pos);
     }
     
     // Check each node against candidate triangles from octree
@@ -465,6 +601,122 @@ static void compute_triangle_collision_forces(Simulator *s, float *collision_for
         // Free candidate list
         dynarray_free(candidates, free);
     }
+
+    // --- Edge-Edge Collision Detection and Resolution ---
+    // For each edge, query octree for overlapping sub-cubes and check for collisions with other edges in those cubes
+    for (size_t ei = 0; ei < n_edges; ++ei) {
+        Constraint *edgeA = (Constraint*)dynarray_get(edges, ei);
+        if (!edgeA || !edgeA->node || !edgeA->other) continue;
+        // Query octree for candidate edge indices that share sub-cubes with this edge
+        DynArray *edge_candidates = octree_query_constraints(s->octree, edgeA->node->pos, edgeA->other->pos);
+        if (!edge_candidates) continue;
+        for (size_t ci = 0; ci < dynarray_size(edge_candidates); ++ci) {
+            int *edgeB_idx_ptr = (int*)dynarray_get(edge_candidates, ci);
+            if (!edgeB_idx_ptr) continue;
+            int edgeB_idx = *edgeB_idx_ptr;
+            if (edgeB_idx < 0 || (size_t)edgeB_idx >= n_edges) continue;
+            if ((int)ei >= edgeB_idx) continue; // avoid duplicate checks
+            Constraint *edgeB = (Constraint*)dynarray_get(edges, edgeB_idx);
+            if (!edgeB || edgeB == edgeA) continue;
+            // Skip if constraints share a node as an endpoint
+            if (edgeA->node == edgeB->node || edgeA->node == edgeB->other ||
+                edgeA->other == edgeB->node || edgeA->other == edgeB->other) continue;
+            // Only check distance constraints (optional: skip if not CT_DIST)
+            if (edgeA->type != CT_DIST || edgeB->type != CT_DIST) continue;
+            // Check for collision between edgeA and edgeB
+            float penetration, normal[3], pa[3], pb[3];
+            if (constraint_constraint_collision(edgeA->node, edgeA->other, edgeB->node, edgeB->other, &penetration, normal, pa, pb)) {
+                // --- Distribute collision forces to the four involved nodes ---
+                // Compute barycentric weights based on distance from POI and node mass
+                float dA0 = sqrtf((pa[0]-edgeA->node->pos[0])*(pa[0]-edgeA->node->pos[0]) +
+                                 (pa[1]-edgeA->node->pos[1])*(pa[1]-edgeA->node->pos[1]) +
+                                 (pa[2]-edgeA->node->pos[2])*(pa[2]-edgeA->node->pos[2]));
+                float dA1 = sqrtf((pa[0]-edgeA->other->pos[0])*(pa[0]-edgeA->other->pos[0]) +
+                                 (pa[1]-edgeA->other->pos[1])*(pa[1]-edgeA->other->pos[1]) +
+                                 (pa[2]-edgeA->other->pos[2])*(pa[2]-edgeA->other->pos[2]));
+                float lenA = dA0 + dA1;
+                float wA0 = (lenA > 1e-8f) ? (dA1 / lenA) : 0.5f;
+                float wA1 = (lenA > 1e-8f) ? (dA0 / lenA) : 0.5f;
+                float dB0 = sqrtf((pb[0]-edgeB->node->pos[0])*(pb[0]-edgeB->node->pos[0]) +
+                                 (pb[1]-edgeB->node->pos[1])*(pb[1]-edgeB->node->pos[1]) +
+                                 (pb[2]-edgeB->node->pos[2])*(pb[2]-edgeB->node->pos[2]));
+                float dB1 = sqrtf((pb[0]-edgeB->other->pos[0])*(pb[0]-edgeB->other->pos[0]) +
+                                 (pb[1]-edgeB->other->pos[1])*(pb[1]-edgeB->other->pos[1]) +
+                                 (pb[2]-edgeB->other->pos[2])*(pb[2]-edgeB->other->pos[2]));
+                float lenB = dB0 + dB1;
+                float wB0 = (lenB > 1e-8f) ? (dB1 / lenB) : 0.5f;
+                float wB1 = (lenB > 1e-8f) ? (dB0 / lenB) : 0.5f;
+
+                // --- Velocity-based damping and friction ---
+                // Compute velocities at closest points (linear interpolation)
+                float va[3], vb[3];
+                for (int i = 0; i < 3; ++i) {
+                    va[i] = edgeA->node->vel[i] * wA0 + edgeA->other->vel[i] * wA1;
+                    vb[i] = edgeB->node->vel[i] * wB0 + edgeB->other->vel[i] * wB1;
+                }
+                float rel_vel[3] = { va[0] - vb[0], va[1] - vb[1], va[2] - vb[2] };
+                float normal_vel = rel_vel[0]*normal[0] + rel_vel[1]*normal[1] + rel_vel[2]*normal[2];
+
+                // Separation force
+                float sep_force[3] = {
+                    normal[0] * penetration * 500.0f,
+                    normal[1] * penetration * 500.0f,
+                    normal[2] * penetration * 500.0f
+                };
+                // Normal damping (only if moving into collision)
+                if (normal_vel < 0.0f) {
+                    sep_force[0] -= normal[0] * normal_vel * 100.0f;
+                    sep_force[1] -= normal[1] * normal_vel * 100.0f;
+                    sep_force[2] -= normal[2] * normal_vel * 100.0f;
+                }
+                // Tangential friction
+                float tangent[3] = {
+                    rel_vel[0] - normal[0] * normal_vel,
+                    rel_vel[1] - normal[1] * normal_vel,
+                    rel_vel[2] - normal[2] * normal_vel
+                };
+                float tangent_len = sqrtf(tangent[0]*tangent[0] + tangent[1]*tangent[1] + tangent[2]*tangent[2]);
+                float Kt = 150.0f;
+                float fric_mag = (tangent_len > 1e-9f) ? fminf(Kt * tangent_len, 0.5f * sqrtf(sep_force[0]*sep_force[0] + sep_force[1]*sep_force[1] + sep_force[2]*sep_force[2])) : 0.0f;
+                float fric_force[3] = {0,0,0};
+                if (tangent_len > 1e-9f) {
+                    fric_force[0] = -(tangent[0] / tangent_len) * fric_mag;
+                    fric_force[1] = -(tangent[1] / tangent_len) * fric_mag;
+                    fric_force[2] = -(tangent[2] / tangent_len) * fric_mag;
+                    sep_force[0] += fric_force[0];
+                    sep_force[1] += fric_force[1];
+                    sep_force[2] += fric_force[2];
+                }
+
+                // Apply to edgeA nodes
+                if (!(edgeA->node->anchored || edgeA->node->sim_ignore)) {
+                    collision_forces[3*edgeA->node->idx + 0] += sep_force[0] * wA0;
+                    collision_forces[3*edgeA->node->idx + 1] += sep_force[1] * wA0;
+                    collision_forces[3*edgeA->node->idx + 2] += sep_force[2] * wA0;
+                }
+                if (!(edgeA->other->anchored || edgeA->other->sim_ignore)) {
+                    collision_forces[3*edgeA->other->idx + 0] += sep_force[0] * wA1;
+                    collision_forces[3*edgeA->other->idx + 1] += sep_force[1] * wA1;
+                    collision_forces[3*edgeA->other->idx + 2] += sep_force[2] * wA1;
+                }
+                // Apply reaction to edgeB nodes
+                if (!(edgeB->node->anchored || edgeB->node->sim_ignore)) {
+                    collision_forces[3*edgeB->node->idx + 0] -= sep_force[0] * wB0;
+                    collision_forces[3*edgeB->node->idx + 1] -= sep_force[1] * wB0;
+                    collision_forces[3*edgeB->node->idx + 2] -= sep_force[2] * wB0;
+                }
+                if (!(edgeB->other->anchored || edgeB->other->sim_ignore)) {
+                    collision_forces[3*edgeB->other->idx + 0] -= sep_force[0] * wB1;
+                    collision_forces[3*edgeB->other->idx + 1] -= sep_force[1] * wB1;
+                    collision_forces[3*edgeB->other->idx + 2] -= sep_force[2] * wB1;
+                }
+            }
+        }
+        dynarray_free(edge_candidates, free);
+    }
+
+    // Free edge list
+    dynarray_free(edges, NULL);
 }
 
 // Legacy 2D spatial hash collision code (deprecated, kept for reference)

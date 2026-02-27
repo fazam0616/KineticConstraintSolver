@@ -18,6 +18,10 @@ Node* node_create(int idx, float mass, float x, float y, float z) {
     n->friction = 0.5f;
     n->radius = 6.0f;
     n->sim_ignore = false;
+    n->dirty = false;
+    n->prev_position[0] = x;
+    n->prev_position[1] = y;
+    n->prev_position[2] = z;
     return n;
 }
 

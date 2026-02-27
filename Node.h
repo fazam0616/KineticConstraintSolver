@@ -19,6 +19,8 @@ struct Node {
     bool collide_with_walls;
     float friction;
     bool sim_ignore;
+    bool dirty;
+    float prev_position[3];
 };
 
 Node* node_create(int idx, float mass, float x, float y, float z);
