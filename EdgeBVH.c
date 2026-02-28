@@ -149,5 +149,7 @@ void edge_bvh_self_traverse(const EdgeBVH *bvh, void (*callback)(int, int, void*
 }
 
 void edge_bvh_debug_draw(const EdgeBVH *bvh, int depth_limit) {
-    // ...draw AABBs for debugging...
+    if (!bvh || !bvh->root) return;
+    extern void bvh_debug_draw(const BVHNode *root, int depth_limit);
+    bvh_debug_draw(bvh->root, depth_limit);
 }

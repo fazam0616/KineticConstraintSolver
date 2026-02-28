@@ -444,7 +444,7 @@ typedef struct {
 } EdgeEdgeContext;
 
 void edge_edge_callback(int idxA, int idxB, void *userdata) {
-    float DAMP_K = 100.0f;
+    float DAMP_K = 200.0f;
     float PENETRATION_STIFFNESS = 500.0f;
 
     EdgeEdgeContext *ctx = (EdgeEdgeContext*)userdata;

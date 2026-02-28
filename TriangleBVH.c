@@ -144,5 +144,8 @@ void triangle_bvh_query(const TriangleBVH *bvh, const AABB *query, DynArray *out
 }
 
 void triangle_bvh_debug_draw(const TriangleBVH *bvh, int depth_limit) {
-    // ...draw AABBs for debugging...
+    if (!bvh || !bvh->root) return;
+    // Caller should set desired GL color/line width
+    extern void bvh_debug_draw(const BVHNode *root, int depth_limit);
+    bvh_debug_draw(bvh->root, depth_limit);
 }

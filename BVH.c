@@ -1,5 +1,7 @@
 #include "BVH.h"
 #include <stdlib.h>
+// OpenGL immediate-mode calls for debug drawing
+#include <GL/gl.h>
 
 static int aabb_overlap(const AABB *a, const AABB *b) {
     for (int i = 0; i < 3; ++i) {
@@ -70,4 +72,51 @@ static void self_traverse_internal(const BVHNode *a, const BVHNode *b, void (*ca
 void bvh_self_traverse(const BVHNode *root, void (*callback)(void*, void*, void*), void *userdata) {
     if (!root) return;
     self_traverse_internal(root, root, callback, userdata);
+}
+
+// Helper: draw an axis-aligned bounding box as wireframe
+static void draw_aabb_wire(const AABB *b) {
+    // 8 corners
+    float x0 = b->min[0], y0 = b->min[1], z0 = b->min[2];
+    float x1 = b->max[0], y1 = b->max[1], z1 = b->max[2];
+    // bottom face
+    glBegin(GL_LINE_LOOP);
+    glVertex3f(x0,y0,z0);
+    glVertex3f(x1,y0,z0);
+    glVertex3f(x1,y0,z1);
+    glVertex3f(x0,y0,z1);
+    glEnd();
+    // top face
+    glBegin(GL_LINE_LOOP);
+    glVertex3f(x0,y1,z0);
+    glVertex3f(x1,y1,z0);
+    glVertex3f(x1,y1,z1);
+    glVertex3f(x0,y1,z1);
+    glEnd();
+    // vertical edges
+    glBegin(GL_LINES);
+    glVertex3f(x0,y0,z0); glVertex3f(x0,y1,z0);
+    glVertex3f(x1,y0,z0); glVertex3f(x1,y1,z0);
+    glVertex3f(x1,y0,z1); glVertex3f(x1,y1,z1);
+    glVertex3f(x0,y0,z1); glVertex3f(x0,y1,z1);
+    glEnd();
+}
+
+// Recursive BVH draw
+static void bvh_draw_node_recursive(const BVHNode *node, int depth_limit) {
+    if (!node) return;
+    draw_aabb_wire(&node->bounds);
+    if (depth_limit == 0) return;
+    if (!node->is_leaf) {
+        int next = (depth_limit > 0) ? depth_limit - 1 : depth_limit;
+        bvh_draw_node_recursive(node->left, next);
+        bvh_draw_node_recursive(node->right, next);
+    }
+}
+
+void bvh_debug_draw(const BVHNode *root, int depth_limit) {
+    if (!root) return;
+    // GL state: assume caller sets color/line width as desired. Use a thin line by default.
+    glLineWidth(1.0f);
+    bvh_draw_node_recursive(root, depth_limit);
 }

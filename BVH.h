@@ -50,4 +50,7 @@ void bvh_traverse_pairs(const BVHNode *a, const BVHNode *b, void (*callback)(voi
 // Convenience: self-traverse a single tree (pairs within same tree). Callback will be called with each pair (leafA, leafB) where leafA < leafB according to pointer address to avoid duplicates.
 void bvh_self_traverse(const BVHNode *root, void (*callback)(void*, void*, void*), void *userdata);
 
+// Debug draw: render AABB wireframes for BVH nodes. If depth_limit < 0, draw all nodes.
+void bvh_debug_draw(const BVHNode *root, int depth_limit);
+
 #endif // BVH_H
