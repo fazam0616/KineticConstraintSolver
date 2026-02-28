@@ -1,5 +1,5 @@
 #include "Simulator.h"
-#include "Octree.h"
+// #include "Octree.h"
 #include <stdlib.h>
 #include <string.h>
 #include <stdio.h>
@@ -24,21 +24,21 @@ void mark_node_dirty_if_moved(Node *node, float threshold) {
     node->prev_position[2] = node->pos[2];
 }
 
-// Incremental octree rebuild: only update dirty nodes
-void incremental_octree_rebuild(OctreeNode *octree, DynArray *nodes, float threshold) {
-    if (!octree || !nodes) return;
-    for (size_t i = 0; i < dynarray_size(nodes); ++i) {
-        Node *node = (Node*)dynarray_get(nodes, i);
-        if (!node) continue;
-        mark_node_dirty_if_moved(node, threshold);
-        if (node->dirty) {
-            node->dirty = false;
-            // Remove from octree and re-add at new position
-            octree_remove(octree, node->idx, node->prev_position); // Remove using previous position
-            octree_insert_node(octree, node->idx, node->pos);      // Add at new position
-        }
-    }
-}
+// // Incremental octree rebuild: only update dirty nodes
+// void incremental_octree_rebuild(OctreeNode *octree, DynArray *nodes, float threshold) {
+//     if (!octree || !nodes) return;
+//     for (size_t i = 0; i < dynarray_size(nodes); ++i) {
+//         Node *node = (Node*)dynarray_get(nodes, i);
+//         if (!node) continue;
+//         mark_node_dirty_if_moved(node, threshold);
+//         if (node->dirty) {
+//             node->dirty = false;
+//             // Remove from octree and re-add at new position
+//             octree_remove(octree, node->idx, node->prev_position); // Remove using previous position
+//             octree_insert_node(octree, node->idx, node->pos);      // Add at new position
+//         }
+//     }
+// }
 
 // Conjugate Gradient solver for symmetric positive-definite dense matrix
 static int cg_solve_dense(size_t n, double *A, double *b, double *x, int max_iter, double tol) {
@@ -440,110 +440,135 @@ static int constraint_constraint_collision(
 typedef struct {
     DynArray *edges;
     float *collision_forces;
+    float sub_dt;
 } EdgeEdgeContext;
+
 void edge_edge_callback(int idxA, int idxB, void *userdata) {
+    float DAMP_K = 100.0f;
+    float PENETRATION_STIFFNESS = 500.0f;
+
     EdgeEdgeContext *ctx = (EdgeEdgeContext*)userdata;
     DynArray *edges = ctx->edges;
     float *collision_forces = ctx->collision_forces;
     Constraint *edgeA = (Constraint*)dynarray_get(edges, idxA);
     Constraint *edgeB = (Constraint*)dynarray_get(edges, idxB);
-    float DAMP_K = 200.0f;
-    float STIFFNESS = 500.0f;
     if (!edgeA || !edgeB || !edgeA->node || !edgeA->other || !edgeB->node || !edgeB->other) return;
     // Skip if constraints share a node as an endpoint
     if (edgeA->node == edgeB->node || edgeA->node == edgeB->other ||
         edgeA->other == edgeB->node || edgeA->other == edgeB->other) return;
     // Only check distance constraints
     if (edgeA->type != CT_DIST || edgeB->type != CT_DIST) return;
-    float penetration, normal[3], pa[3], pb[3];
-    if (constraint_constraint_collision(edgeA->node, edgeA->other, edgeB->node, edgeB->other, &penetration, normal, pa, pb)) {
-        float dA0 = sqrtf((pa[0]-edgeA->node->pos[0])*(pa[0]-edgeA->node->pos[0]) +
-                            (pa[1]-edgeA->node->pos[1])*(pa[1]-edgeA->node->pos[1]) +
-                            (pa[2]-edgeA->node->pos[2])*(pa[2]-edgeA->node->pos[2]));
-        float dA1 = sqrtf((pa[0]-edgeA->other->pos[0])*(pa[0]-edgeA->other->pos[0]) +
-                            (pa[1]-edgeA->other->pos[1])*(pa[1]-edgeA->other->pos[1]) +
-                            (pa[2]-edgeA->other->pos[2])*(pa[2]-edgeA->other->pos[2]));
-        float lenA = dA0 + dA1;
-        float wA0 = (lenA > 1e-8f) ? (dA1 / lenA) : 0.5f;
-        float wA1 = (lenA > 1e-8f) ? (dA0 / lenA) : 0.5f;
-        float dB0 = sqrtf((pb[0]-edgeB->node->pos[0])*(pb[0]-edgeB->node->pos[0]) +
-                            (pb[1]-edgeB->node->pos[1])*(pb[1]-edgeB->node->pos[1]) +
-                            (pb[2]-edgeB->node->pos[2])*(pb[2]-edgeB->node->pos[2]));
-        float dB1 = sqrtf((pb[0]-edgeB->other->pos[0])*(pb[0]-edgeB->other->pos[0]) +
-                            (pb[1]-edgeB->other->pos[1])*(pb[1]-edgeB->other->pos[1]) +
-                            (pb[2]-edgeB->other->pos[2])*(pb[2]-edgeB->other->pos[2]));
-        float lenB = dB0 + dB1;
-        float wB0 = (lenB > 1e-8f) ? (dB1 / lenB) : 0.5f;
-        float wB1 = (lenB > 1e-8f) ? (dB0 / lenB) : 0.5f;
-        float va[3], vb[3];
-        for (int i = 0; i < 3; ++i) {
-            va[i] = edgeA->node->vel[i] * wA0 + edgeA->other->vel[i] * wA1;
-            vb[i] = edgeB->node->vel[i] * wB0 + edgeB->other->vel[i] * wB1;
-        }
-        float rel_vel[3] = { va[0] - vb[0], va[1] - vb[1], va[2] - vb[2] };
-        float normal_vel = rel_vel[0]*normal[0] + rel_vel[1]*normal[1] + rel_vel[2]*normal[2];
-        float sep_force[3] = {
-            normal[0] * penetration * STIFFNESS,
-            normal[1] * penetration * STIFFNESS,
-            normal[2] * penetration * STIFFNESS
-        };
-        if (normal_vel < 0.0f) {
-            sep_force[0] -= normal[0] * normal_vel * DAMP_K;
-            sep_force[1] -= normal[1] * normal_vel * DAMP_K;
-            sep_force[2] -= normal[2] * normal_vel * DAMP_K;
-        }
-        float tangent[3] = {
-            rel_vel[0] - normal[0] * normal_vel,
-            rel_vel[1] - normal[1] * normal_vel,
-            rel_vel[2] - normal[2] * normal_vel
-        };
-        float tangent_len = sqrtf(tangent[0]*tangent[0] + tangent[1]*tangent[1] + tangent[2]*tangent[2]);
-        float Kt = 150.0f;
-        float fric_mag = (tangent_len > 1e-9f) ? fminf(Kt * tangent_len, 0.5f * sqrtf(sep_force[0]*sep_force[0] + sep_force[1]*sep_force[1] + sep_force[2]*sep_force[2])) : 0.0f;
-        float fric_force[3] = {0,0,0};
-        if (tangent_len > 1e-9f) {
-            fric_force[0] = -(tangent[0] / tangent_len) * fric_mag;
-            fric_force[1] = -(tangent[1] / tangent_len) * fric_mag;
-            fric_force[2] = -(tangent[2] / tangent_len) * fric_mag;
-            sep_force[0] += fric_force[0];
-            sep_force[1] += fric_force[1];
-            sep_force[2] += fric_force[2];
-        }
-        if (!(edgeA->node->anchored || edgeA->node->sim_ignore)) {
-            collision_forces[3*edgeA->node->idx + 0] += sep_force[0] * wA0;
-            collision_forces[3*edgeA->node->idx + 1] += sep_force[1] * wA0;
-            collision_forces[3*edgeA->node->idx + 2] += sep_force[2] * wA0;
-        }
-        if (!(edgeA->other->anchored || edgeA->other->sim_ignore)) {
-            collision_forces[3*edgeA->other->idx + 0] += sep_force[0] * wA1;
-            collision_forces[3*edgeA->other->idx + 1] += sep_force[1] * wA1;
-            collision_forces[3*edgeA->other->idx + 2] += sep_force[2] * wA1;
-        }
-        if (!(edgeB->node->anchored || edgeB->node->sim_ignore)) {
-            collision_forces[3*edgeB->node->idx + 0] -= sep_force[0] * wB0;
-            collision_forces[3*edgeB->node->idx + 1] -= sep_force[1] * wB0;
-            collision_forces[3*edgeB->node->idx + 2] -= sep_force[2] * wB0;
-        }
-        if (!(edgeB->other->anchored || edgeB->other->sim_ignore)) {
-            collision_forces[3*edgeB->other->idx + 0] -= sep_force[0] * wB1;
-            collision_forces[3*edgeB->other->idx + 1] -= sep_force[1] * wB1;
-            collision_forces[3*edgeB->other->idx + 2] -= sep_force[2] * wB1;
-        }
 
-        // printf("Edge-Edge Collision: idxA=%d idxB=%d\n", idxA, idxB);
-        // printf("  Penetration: %.4f\n", penetration);
-        // printf("  Normal: [%.4f %.4f %.4f]\n", normal[0], normal[1], normal[2]);
-        // printf("  Closest points: pa=[%.4f %.4f %.4f], pb=[%.4f %.4f %.4f]\n", pa[0], pa[1], pa[2], pb[0], pb[1], pb[2]);
-        // printf("  Relative velocity: [%.4f %.4f %.4f], normal_vel=%.4f\n", rel_vel[0], rel_vel[1], rel_vel[2], normal_vel);
-        // printf("  Separation force: [%.4f %.4f %.4f]\n", sep_force[0], sep_force[1], sep_force[2]);
-        // printf("  Friction force: [%.4f %.4f %.4f], tangent_len=%.4f\n", fric_force[0], fric_force[1], fric_force[2], tangent_len);
-        // printf("  Final force applied: [%.4f %.4f %.4f]\n", sep_force[0], sep_force[1], sep_force[2]);
-        // printf("------------------------------------------------------------\n");
+    float penetration, normal[3], pa[3], pb[3];
+    if (!constraint_constraint_collision(edgeA->node, edgeA->other, edgeB->node, edgeB->other, &penetration, normal, pa, pb)) {
+        return;
+    }
+
+    // Compute barycentric-like weights along each edge for velocity interpolation
+    float dA0 = sqrtf((pa[0]-edgeA->node->pos[0])*(pa[0]-edgeA->node->pos[0]) +
+                      (pa[1]-edgeA->node->pos[1])*(pa[1]-edgeA->node->pos[1]) +
+                      (pa[2]-edgeA->node->pos[2])*(pa[2]-edgeA->node->pos[2]));
+    float dA1 = sqrtf((pa[0]-edgeA->other->pos[0])*(pa[0]-edgeA->other->pos[0]) +
+                      (pa[1]-edgeA->other->pos[1])*(pa[1]-edgeA->other->pos[1]) +
+                      (pa[2]-edgeA->other->pos[2])*(pa[2]-edgeA->other->pos[2]));
+    float lenA = dA0 + dA1;
+    float wA0 = (lenA > 1e-8f) ? (dA1 / lenA) : 0.5f;
+    float wA1 = (lenA > 1e-8f) ? (dA0 / lenA) : 0.5f;
+
+    float dB0 = sqrtf((pb[0]-edgeB->node->pos[0])*(pb[0]-edgeB->node->pos[0]) +
+                      (pb[1]-edgeB->node->pos[1])*(pb[1]-edgeB->node->pos[1]) +
+                      (pb[2]-edgeB->node->pos[2])*(pb[2]-edgeB->node->pos[2]));
+    float dB1 = sqrtf((pb[0]-edgeB->other->pos[0])*(pb[0]-edgeB->other->pos[0]) +
+                      (pb[1]-edgeB->other->pos[1])*(pb[1]-edgeB->other->pos[1]) +
+                      (pb[2]-edgeB->other->pos[2])*(pb[2]-edgeB->other->pos[2]));
+    float lenB = dB0 + dB1;
+    float wB0 = (lenB > 1e-8f) ? (dB1 / lenB) : 0.5f;
+    float wB1 = (lenB > 1e-8f) ? (dB0 / lenB) : 0.5f;
+
+    // printf("Edge-Edge Collision: idxA=%d idxB=%d\n", idxA, idxB);
+    // printf("  Penetration: %.4f\n", penetration);
+    // printf("  Normal: [%.4f %.4f %.4f]\n", normal[0], normal[1], normal[2]);
+    // printf("  Closest points: pa=[%.4f %.4f %.4f], pb=[%.4f %.4f %.4f]\n", pa[0], pa[1], pa[2], pb[0], pb[1], pb[2]);
+
+    // Interpolated velocities at contact points
+    float va[3], vb[3];
+    for (int i = 0; i < 3; ++i) {
+        va[i] = edgeA->node->vel[i] * wA0 + edgeA->other->vel[i] * wA1;
+        vb[i] = edgeB->node->vel[i] * wB0 + edgeB->other->vel[i] * wB1;
+    }
+
+    float rel_vel[3] = { va[0] - vb[0], va[1] - vb[1], va[2] - vb[2] };
+    float normal_vel = rel_vel[0]*normal[0] + rel_vel[1]*normal[1] + rel_vel[2]*normal[2];
+    // printf("  Relative velocity: [%.4f %.4f %.4f], normal_vel=%.4f\n", rel_vel[0], rel_vel[1], rel_vel[2], normal_vel);
+
+    // Impulse-based resolution to avoid tunneling: compute effective inverse-mass
+    float inv_mA0 = (edgeA->node->anchored || edgeA->node->sim_ignore) ? 0.0f : 1.0f / fmaxf(edgeA->node->mass, 1e-9f);
+    float inv_mA1 = (edgeA->other->anchored || edgeA->other->sim_ignore) ? 0.0f : 1.0f / fmaxf(edgeA->other->mass, 1e-9f);
+    float inv_mB0 = (edgeB->node->anchored || edgeB->node->sim_ignore) ? 0.0f : 1.0f / fmaxf(edgeB->node->mass, 1e-9f);
+    float inv_mB1 = (edgeB->other->anchored || edgeB->other->sim_ignore) ? 0.0f : 1.0f / fmaxf(edgeB->other->mass, 1e-9f);
+
+    float weff = wA0*wA0*inv_mA0 + wA1*wA1*inv_mA1 + wB0*wB0*inv_mB0 + wB1*wB1*inv_mB1;
+    if (weff <= 1e-12f) return;
+
+    // Only resolve contacts that are closing (negative relative normal velocity)
+    // Note: earlier code used normal_vel positive for closing; flip sign accordingly
+    if (normal_vel >= 0.0f) return;
+
+    float restitution = 0.05f; // small restitution to avoid bounciness
+    float J = -(1.0f + restitution) * normal_vel / weff;
+    // clamp impulse magnitude to avoid extreme corrections
+    float maxJ = 1e4f;
+    if (J > maxJ) J = maxJ;
+
+    // Tangential (Coulomb) friction impulse
+    float rel_t[3] = {
+        rel_vel[0] - normal_vel * normal[0],
+        rel_vel[1] - normal_vel * normal[1],
+        rel_vel[2] - normal_vel * normal[2]
+    };
+    float t_len = sqrtf(rel_t[0]*rel_t[0] + rel_t[1]*rel_t[1] + rel_t[2]*rel_t[2]);
+    float jt = 0.0f;
+    float t_dir[3] = {0.0f, 0.0f, 0.0f};
+    if (t_len > 1e-9f) {
+        t_dir[0] = rel_t[0] / t_len;
+        t_dir[1] = rel_t[1] / t_len;
+        t_dir[2] = rel_t[2] / t_len;
+        // desired tangential impulse to remove relative tangential velocity
+        jt = -(rel_vel[0]*t_dir[0] + rel_vel[1]*t_dir[1] + rel_vel[2]*t_dir[2]) / weff;
+    }
+
+    // friction coefficient: average of involved node frictions (fallback 0.5)
+    float mu_sum = 0.0f; int mu_count = 0;
+    if (edgeA->node) { mu_sum += edgeA->node->friction; mu_count++; }
+    if (edgeA->other) { mu_sum += edgeA->other->friction; mu_count++; }
+    if (edgeB->node) { mu_sum += edgeB->node->friction; mu_count++; }
+    if (edgeB->other) { mu_sum += edgeB->other->friction; mu_count++; }
+    float mu = (mu_count > 0) ? (mu_sum / (float)mu_count) : 0.5f;
+
+    // clamp tangential impulse by Coulomb: |jt| <= mu * J
+    float jmax = fabsf(mu * J);
+    if (jt > jmax) jt = jmax;
+    if (jt < -jmax) jt = -jmax;
+
+    // printf("  Impulse J=%.6f jt=%.6f weff=%.6e mu=%.3f\n", J, jt, weff, mu);
+
+    // Apply velocity impulse (normal + tangential) distributed to nodes
+    if (inv_mA0 > 0.0f) {
+        for (int k = 0; k < 3; ++k) edgeA->node->vel[k] += (J * wA0 * inv_mA0) * normal[k] + (jt * wA0 * inv_mA0) * t_dir[k];
+    }
+    if (inv_mA1 > 0.0f) {
+        for (int k = 0; k < 3; ++k) edgeA->other->vel[k] += (J * wA1 * inv_mA1) * normal[k] + (jt * wA1 * inv_mA1) * t_dir[k];
+    }
+    if (inv_mB0 > 0.0f) {
+        for (int k = 0; k < 3; ++k) edgeB->node->vel[k] -= (J * wB0 * inv_mB0) * normal[k] + (jt * wB0 * inv_mB0) * t_dir[k];
+    }
+    if (inv_mB1 > 0.0f) {
+        for (int k = 0; k < 3; ++k) edgeB->other->vel[k] -= (J * wB1 * inv_mB1) * normal[k] + (jt * wB1 * inv_mB1) * t_dir[k];
     }
 }
 
 // Compute collision forces using octree acceleration structure
-static void compute_triangle_collision_forces(Simulator *s, float *collision_forces) {
+static void compute_triangle_collision_forces(Simulator *s, float *collision_forces, float sub_dt) {
     if (!s || !collision_forces) return;
     const float PENETRATION_STIFFNESS = 500.0f;
     const float NORMAL_DAMP_K = 100.0f;
@@ -668,7 +693,7 @@ static void compute_triangle_collision_forces(Simulator *s, float *collision_for
     }
 
     
-    EdgeEdgeContext ctx = { edges, collision_forces };
+        EdgeEdgeContext ctx = { edges, collision_forces, sub_dt };
     edge_bvh_self_traverse(s->edge_bvh, edge_edge_callback, &ctx);
     dynarray_free(edges, NULL);
 }
@@ -706,8 +731,8 @@ void simulator_step(Simulator *s) {
         memset(collision_forces, 0, sizeof(float) * n_nodes * 3);
         memset(external_forces, 0, sizeof(double) * n_nodes * 3);
 
-        // compute collision forces fresh each substep
-        compute_triangle_collision_forces(s, collision_forces);
+        // compute collision forces / impulses fresh each substep
+        compute_triangle_collision_forces(s, collision_forces, sub_dt);
         // printf("Substep %d: computed collision forces\n", sub);
         // 1) accumulate external forces (gravity + collisions) into external_forces
         //    instead of applying them directly to velocities. external_forces

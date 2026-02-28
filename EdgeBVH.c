@@ -14,40 +14,21 @@ static void compute_edge_aabb(const Constraint *e, float capsule_radius, AABB *o
     }
 }
 
-static void aabb_expand(AABB *a, const AABB *b) {
-    for (int i = 0; i < 3; ++i) {
-        if (b->min[i] < a->min[i]) a->min[i] = b->min[i];
-        if (b->max[i] > a->max[i]) a->max[i] = b->max[i];
-    }
-}
-
-static void aabb_init_empty(AABB *a) {
-    for (int i = 0; i < 3; ++i) {
-        a->min[i] = FLT_MAX;
-        a->max[i] = -FLT_MAX;
-    }
-}
-
-static int axis_of_max_extent(const AABB *a) {
-    float ext[3] = {a->max[0]-a->min[0], a->max[1]-a->min[1], a->max[2]-a->min[2]};
-    int axis = 0;
-    if (ext[1] > ext[axis]) axis = 1;
-    if (ext[2] > ext[axis]) axis = 2;
-    return axis;
-}
-
-static int compare_edge_centroid(const void *a, const void *b, void *ctx) {
-    const Constraint **edges = (const Constraint**)ctx;
+static const Constraint **g_edge_ptrs_for_sort = NULL;
+static int compare_edge_centroid_qsort(const void *a, const void *b) {
     int ia = *(const int*)a, ib = *(const int*)b;
-    const Constraint *ea = edges[ia], *eb = edges[ib];
+    const Constraint *ea = g_edge_ptrs_for_sort[ia], *eb = g_edge_ptrs_for_sort[ib];
     float ca = (ea->node->pos[0] + ea->other->pos[0]) * 0.5f;
     float cb = (eb->node->pos[0] + eb->other->pos[0]) * 0.5f;
     return (ca > cb) - (ca < cb);
 }
 
-static EdgeBVHNode *build_node(const Constraint **edges, int *indices, size_t start, size_t end, float capsule_radius) {
-    EdgeBVHNode *node = (EdgeBVHNode*)malloc(sizeof(EdgeBVHNode));
+static BVHNode *build_node(const Constraint **edges, int *indices, size_t start, size_t end, float capsule_radius) {
+    BVHNode *node = (BVHNode*)malloc(sizeof(BVHNode));
     aabb_init_empty(&node->bounds);
+    node->is_leaf = 0;
+    node->left = node->right = NULL;
+    node->leaf_data = NULL;
     for (size_t i = start; i < end; ++i) {
         AABB edge_box;
         compute_edge_aabb(edges[indices[i]], capsule_radius, &edge_box);
@@ -56,16 +37,52 @@ static EdgeBVHNode *build_node(const Constraint **edges, int *indices, size_t st
     size_t n = end - start;
     if (n == 1) {
         node->is_leaf = 1;
-        node->data.leaf.edge_idx = indices[start];
+        int *leaf_idx = (int*)malloc(sizeof(int));
+        *leaf_idx = indices[start];
+        node->leaf_data = leaf_idx;
         return node;
     }
-    int axis = axis_of_max_extent(&node->bounds);
-    qsort_r(indices+start, n, sizeof(int), compare_edge_centroid, (void*)edges);
+    g_edge_ptrs_for_sort = edges;
+    qsort(indices+start, n, sizeof(int), compare_edge_centroid_qsort);
+    g_edge_ptrs_for_sort = NULL;
     size_t mid = start + n/2;
-    node->is_leaf = 0;
-    node->data.children.left = build_node(edges, indices, start, mid, capsule_radius);
-    node->data.children.right = build_node(edges, indices, mid, end, capsule_radius);
+    node->left = build_node(edges, indices, start, mid, capsule_radius);
+    node->right = build_node(edges, indices, mid, end, capsule_radius);
     return node;
+}
+
+// Helper: refit node bounds (top-level to avoid nested functions)
+void edge_refit_node(BVHNode *node, DynArray *edges, float capsule_radius) {
+    if (!node) return;
+    if (node->is_leaf) {
+        int idx = *(int*)node->leaf_data;
+        Constraint *e = (Constraint*)dynarray_get(edges, idx);
+        compute_edge_aabb(e, capsule_radius, &node->bounds);
+        return;
+    }
+    edge_refit_node(node->left, edges, capsule_radius);
+    edge_refit_node(node->right, edges, capsule_radius);
+    aabb_init_empty(&node->bounds);
+    aabb_expand(&node->bounds, &node->left->bounds);
+    aabb_expand(&node->bounds, &node->right->bounds);
+}
+
+// Helper: query traversal
+void edge_query_node(const BVHNode *node, const AABB *query, DynArray *out_indices) {
+    if (!node) return;
+    int overlap = 1;
+    for (int i = 0; i < 3; ++i) {
+        if (node->bounds.max[i] < query->min[i] || node->bounds.min[i] > query->max[i]) { overlap = 0; break; }
+    }
+    if (!overlap) return;
+    if (node->is_leaf) {
+        int *idx = (int*)malloc(sizeof(int));
+        *idx = *(int*)node->leaf_data;
+        dynarray_append(out_indices, idx);
+        return;
+    }
+    edge_query_node(node->left, query, out_indices);
+    edge_query_node(node->right, query, out_indices);
 }
 
 EdgeBVH *edge_bvh_build(DynArray *edges, float capsule_radius) {
@@ -84,58 +101,51 @@ EdgeBVH *edge_bvh_build(DynArray *edges, float capsule_radius) {
     return bvh;
 }
 
-void free_edge_node(EdgeBVHNode *node) {
+void edge_bvh_refit(EdgeBVH *bvh, DynArray *edges, float capsule_radius) {
+    if (!bvh || !bvh->root || !edges) return;
+    // call external static helper
+    extern void edge_refit_node(BVHNode *node, DynArray *edges, float capsule_radius);
+    edge_refit_node(bvh->root, edges, capsule_radius);
+}
+
+void edge_bvh_query(const EdgeBVH *bvh, const AABB *query, DynArray *out_indices) {
+    if (!bvh || !bvh->root || !query || !out_indices) return;
+    extern void edge_query_node(const BVHNode *node, const AABB *query, DynArray *out_indices);
+    edge_query_node(bvh->root, query, out_indices);
+}
+
+static void free_leaf_data_nodes(BVHNode *node) {
     if (!node) return;
-    if (!node->is_leaf) {
-        free_edge_node(node->data.children.left);
-        free_edge_node(node->data.children.right);
+    if (node->is_leaf) {
+        if (node->leaf_data) free(node->leaf_data);
+        node->leaf_data = NULL;
+        return;
     }
-    free(node);
+    free_leaf_data_nodes(node->left);
+    free_leaf_data_nodes(node->right);
 }
 
 void edge_bvh_free(EdgeBVH *bvh) {
     if (!bvh) return;
-    // Helper: recursively free nodes
-    free_edge_node(bvh->root);
+    free_leaf_data_nodes(bvh->root);
+    bvh_free(bvh->root);
     free(bvh->edge_indices);
     free(bvh);
 }
 
-void traverse(const EdgeBVHNode *a, const EdgeBVHNode *b, void (*callback)(int, int, void*), void *userdata) {
-    // Prune if AABBs do not overlap
-    int overlap = 1;
-    for (int i = 0; i < 3; ++i) {
-        if (a->bounds.max[i] < b->bounds.min[i] || a->bounds.min[i] > b->bounds.max[i]) {
-            overlap = 0;
-            break;
-        }
-    }
-    if (!overlap) return;
-    if (a->is_leaf && b->is_leaf) {
-        int idxA = a->data.leaf.edge_idx;
-        int idxB = b->data.leaf.edge_idx;
-        if (idxA < idxB) callback(idxA, idxB, userdata);
-        return;
-    }
-    if (a->is_leaf) {
-        traverse(a, b->data.children.left, callback, userdata);
-        traverse(a, b->data.children.right, callback, userdata);
-    } else if (b->is_leaf) {
-        traverse(a->data.children.left, b, callback, userdata);
-        traverse(a->data.children.right, b, callback, userdata);
-    } else {
-        traverse(a->data.children.left, b->data.children.left, callback, userdata);
-        traverse(a->data.children.left, b->data.children.right, callback, userdata);
-        traverse(a->data.children.right, b->data.children.left, callback, userdata);
-        traverse(a->data.children.right, b->data.children.right, callback, userdata);
-    }
+// Adapter to convert leaf_data (int*) to original callback signature
+typedef struct { void (*cb)(int,int,void*); void *userdata; } EdgeAdapter;
+static void edge_adapter_cb(void *la, void *lb, void *ud) {
+    EdgeAdapter *ad = (EdgeAdapter*)ud;
+    int ia = *(int*)la;
+    int ib = *(int*)lb;
+    if (ia < ib) ad->cb(ia, ib, ad->userdata);
 }
 
 void edge_bvh_self_traverse(const EdgeBVH *bvh, void (*callback)(int, int, void*), void *userdata) {
     if (!bvh || !bvh->root) return;
-    // Helper: recursively traverse pairs
-    
-    traverse(bvh->root, bvh->root, callback, userdata);
+    EdgeAdapter ad = { callback, userdata };
+    bvh_self_traverse(bvh->root, edge_adapter_cb, &ad);
 }
 
 void edge_bvh_debug_draw(const EdgeBVH *bvh, int depth_limit) {

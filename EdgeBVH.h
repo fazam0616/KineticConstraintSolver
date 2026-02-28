@@ -5,26 +5,11 @@
 #include "Constraint.h"
 #include <stddef.h>
 
-#include "AABB.h"
+#include "BVH.h"
 
-// Edge BVH node
-typedef struct EdgeBVHNode {
-    AABB bounds;
-    int is_leaf;
-    union {
-        struct {
-            struct EdgeBVHNode *left;
-            struct EdgeBVHNode *right;
-        } children;
-        struct {
-            int edge_idx; // index into edge array (Constraint*)
-        } leaf;
-    } data;
-} EdgeBVHNode;
-
-// BVH root structure
+// BVH wrapper for edges. Leaves store void* leaf_data that wrappers set to int* indices.
 typedef struct {
-    EdgeBVHNode *root;
+    BVHNode *root;
     size_t n_edges;
     int *edge_indices;
 } EdgeBVH;

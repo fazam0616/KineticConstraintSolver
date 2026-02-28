@@ -1006,7 +1006,7 @@ int main(int argc, char *argv[]) {
     int key_shift = 0, key_ctrl = 0;
 
     // --- Initial scenario: Box in Sleeve ---
-    Simulator *sim = simulator_create(1.0f/30.0f);
+    Simulator *sim = simulator_create(1.0f/40.0f);
     if (override_solver_iters > 0) sim->solver_iters = override_solver_iters;
 
      /* UI menus: registry of menus. We'll dispatch mouse events to each menu in
@@ -1908,11 +1908,11 @@ int main(int argc, char *argv[]) {
         // each selected node toward the current pick position. This does not
         // require the click to have started on the node and remains active until
         // the user disables the toggle.
-    float K_p = edata.drag_strength ? (float)(*(edata.drag_strength)) : 3.0f;  // proportional (stiffness)
-    float K_d = 12.0f;  // derivative (damping) - tune this ratio as needed
-    
-    const float MAX_FORCE = 1e3f;
-    if (mouse_left_down && !mouse_left_down_on_ui && edata.drag_enabled && edata.drag_enabled[0] && edata.drag_strength && sel_filter == SEL_NODE && dynarray_size(selection) > 0) {
+        float K_p = edata.drag_strength ? (float)(*(edata.drag_strength)) : 3.0f;  // proportional (stiffness)
+        float K_d = 12.0f;  // derivative (damping) - tune this ratio as needed
+        
+        const float MAX_FORCE = 1e3f;
+        if (mouse_left_down && !mouse_left_down_on_ui && edata.drag_enabled && edata.drag_enabled[0] && edata.drag_strength && sel_filter == SEL_NODE && dynarray_size(selection) > 0) {
             float K = (float)(*(edata.drag_strength));
             for (size_t si = 0; si < dynarray_size(selection); ++si) {
                 Node *n = (Node*)dynarray_get(selection, si);

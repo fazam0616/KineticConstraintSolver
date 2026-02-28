@@ -8,7 +8,7 @@
 typedef struct OctreeNode OctreeNode;
 typedef struct TriangleWall TriangleWall;
 
-#include "AABB.h"
+#include "BVH.h"
 
 // Node entry that stores both index and position for redistribution
 typedef struct {

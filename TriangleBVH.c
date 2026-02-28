@@ -19,47 +19,27 @@ static void compute_triangle_aabb(const TriangleWall *w, AABB *out_box) {
         out_box->max[i] = maxv;
     }
 }
-
-static void aabb_expand(AABB *a, const AABB *b) {
-    for (int i = 0; i < 3; ++i) {
-        if (b->min[i] < a->min[i]) a->min[i] = b->min[i];
-        if (b->max[i] > a->max[i]) a->max[i] = b->max[i];
-    }
-}
-
-static void aabb_init_empty(AABB *a) {
-    for (int i = 0; i < 3; ++i) {
-        a->min[i] = FLT_MAX;
-        a->max[i] = -FLT_MAX;
-    }
-}
-
 // Median split on largest axis
 typedef struct {
     int *indices;
     size_t count;
 } IndexList;
 
-static int axis_of_max_extent(const AABB *a) {
-    float ext[3] = {a->max[0]-a->min[0], a->max[1]-a->min[1], a->max[2]-a->min[2]};
-    int axis = 0;
-    if (ext[1] > ext[axis]) axis = 1;
-    if (ext[2] > ext[axis]) axis = 2;
-    return axis;
-}
-
-static int compare_tri_centroid(const void *a, const void *b, void *ctx) {
-    const TriangleWall **walls = (const TriangleWall**)ctx;
+static const TriangleWall **g_wall_ptrs_for_sort = NULL;
+static int compare_tri_centroid_qsort(const void *a, const void *b) {
     int ia = *(const int*)a, ib = *(const int*)b;
-    const TriangleWall *wa = walls[ia], *wb = walls[ib];
+    const TriangleWall *wa = g_wall_ptrs_for_sort[ia], *wb = g_wall_ptrs_for_sort[ib];
     float ca = (wa->A->pos[0] + wa->B->pos[0] + wa->C->pos[0]) / 3.0f;
     float cb = (wb->A->pos[0] + wb->B->pos[0] + wb->C->pos[0]) / 3.0f;
     return (ca > cb) - (ca < cb);
 }
 
-static TriangleBVHNode *build_node(const TriangleWall **walls, int *indices, size_t start, size_t end) {
-    TriangleBVHNode *node = (TriangleBVHNode*)malloc(sizeof(TriangleBVHNode));
+static BVHNode *build_node(const TriangleWall **walls, int *indices, size_t start, size_t end) {
+    BVHNode *node = (BVHNode*)malloc(sizeof(BVHNode));
     aabb_init_empty(&node->bounds);
+    node->is_leaf = 0;
+    node->left = node->right = NULL;
+    node->leaf_data = NULL;
     for (size_t i = start; i < end; ++i) {
         AABB tri_box;
         compute_triangle_aabb(walls[indices[i]], &tri_box);
@@ -68,18 +48,52 @@ static TriangleBVHNode *build_node(const TriangleWall **walls, int *indices, siz
     size_t n = end - start;
     if (n == 1) {
         node->is_leaf = 1;
-        node->data.leaf.tri_idx = indices[start];
+        int *leaf_idx = (int*)malloc(sizeof(int));
+        *leaf_idx = indices[start];
+        node->leaf_data = leaf_idx;
         return node;
     }
-    // Median split
-    int axis = axis_of_max_extent(&node->bounds);
-    // Sort indices by centroid along axis
-    qsort_r(indices+start, n, sizeof(int), compare_tri_centroid, (void*)walls);
+    g_wall_ptrs_for_sort = walls;
+    qsort(indices+start, n, sizeof(int), compare_tri_centroid_qsort);
+    g_wall_ptrs_for_sort = NULL;
     size_t mid = start + n/2;
-    node->is_leaf = 0;
-    node->data.children.left = build_node(walls, indices, start, mid);
-    node->data.children.right = build_node(walls, indices, mid, end);
+    node->left = build_node(walls, indices, start, mid);
+    node->right = build_node(walls, indices, mid, end);
     return node;
+}
+
+// Helper: refit node
+void tri_refit_node(BVHNode *node, DynArray *walls) {
+    if (!node) return;
+    if (node->is_leaf) {
+        int idx = *(int*)node->leaf_data;
+        TriangleWall *w = (TriangleWall*)dynarray_get(walls, idx);
+        compute_triangle_aabb(w, &node->bounds);
+        return;
+    }
+    tri_refit_node(node->left, walls);
+    tri_refit_node(node->right, walls);
+    aabb_init_empty(&node->bounds);
+    aabb_expand(&node->bounds, &node->left->bounds);
+    aabb_expand(&node->bounds, &node->right->bounds);
+}
+
+// Helper: query traversal
+void tri_query_node(const BVHNode *node, const AABB *query, DynArray *out_indices) {
+    if (!node) return;
+    int overlap = 1;
+    for (int i = 0; i < 3; ++i) {
+        if (node->bounds.max[i] < query->min[i] || node->bounds.min[i] > query->max[i]) { overlap = 0; break; }
+    }
+    if (!overlap) return;
+    if (node->is_leaf) {
+        int *idx = (int*)malloc(sizeof(int));
+        *idx = *(int*)node->leaf_data;
+        dynarray_append(out_indices, idx);
+        return;
+    }
+    tri_query_node(node->left, query, out_indices);
+    tri_query_node(node->right, query, out_indices);
 }
 
 TriangleBVH *triangle_bvh_build(DynArray *walls) {
@@ -98,62 +112,35 @@ TriangleBVH *triangle_bvh_build(DynArray *walls) {
     return bvh;
 }
 
-void free_node(TriangleBVHNode *node) {
+static void free_leaf_data_nodes(BVHNode *node) {
     if (!node) return;
-    if (!node->is_leaf) {
-        free_node(node->data.children.left);
-        free_node(node->data.children.right);
+    if (node->is_leaf) {
+        if (node->leaf_data) free(node->leaf_data);
+        node->leaf_data = NULL;
+        return;
     }
-    free(node);
+    free_leaf_data_nodes(node->left);
+    free_leaf_data_nodes(node->right);
 }
 
 void triangle_bvh_free(TriangleBVH *bvh) {
     if (!bvh) return;
-    
-    free_node(bvh->root);
+    free_leaf_data_nodes(bvh->root);
+    bvh_free(bvh->root);
     free(bvh->triangle_indices);
     free(bvh);
 }
 
 void triangle_bvh_refit(TriangleBVH *bvh, DynArray *walls) {
     if (!bvh || !bvh->root || !walls) return;
-    void refit_node(TriangleBVHNode *node) {
-        if (node->is_leaf) {
-            TriangleWall *w = (TriangleWall*)dynarray_get(walls, node->data.leaf.tri_idx);
-            compute_triangle_aabb(w, &node->bounds);
-            return;
-        }
-        refit_node(node->data.children.left);
-        refit_node(node->data.children.right);
-        aabb_init_empty(&node->bounds);
-        aabb_expand(&node->bounds, &node->data.children.left->bounds);
-        aabb_expand(&node->bounds, &node->data.children.right->bounds);
-    }
-    refit_node(bvh->root);
+    extern void tri_refit_node(BVHNode *node, DynArray *walls);
+    tri_refit_node(bvh->root, walls);
 }
 
 void triangle_bvh_query(const TriangleBVH *bvh, const AABB *query, DynArray *out_indices) {
     if (!bvh || !bvh->root || !query || !out_indices) return;
-    void query_node(const TriangleBVHNode *node) {
-        // Prune if AABBs do not overlap
-        int overlap = 1;
-        for (int i = 0; i < 3; ++i) {
-            if (node->bounds.max[i] < query->min[i] || node->bounds.min[i] > query->max[i]) {
-                overlap = 0;
-                break;
-            }
-        }
-        if (!overlap) return;
-        if (node->is_leaf) {
-            int *idx = (int*)malloc(sizeof(int));
-            *idx = node->data.leaf.tri_idx;
-            dynarray_append(out_indices, idx);
-            return;
-        }
-        query_node(node->data.children.left);
-        query_node(node->data.children.right);
-    }
-    query_node(bvh->root);
+    extern void tri_query_node(const BVHNode *node, const AABB *query, DynArray *out_indices);
+    tri_query_node(bvh->root, query, out_indices);
 }
 
 void triangle_bvh_debug_draw(const TriangleBVH *bvh, int depth_limit) {

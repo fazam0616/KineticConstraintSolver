@@ -218,13 +218,77 @@ static void dist_dc_triplet(Constraint *self, void *T, int row) {
 
 static void dist_draw(Constraint *self) {
     DistConstraintImpl *d = (DistConstraintImpl*)self;
+    if (!d->base.node || !d->other) return;
+    float x0 = d->base.node->pos[0]; float y0 = d->base.node->pos[1]; float z0 = d->base.node->pos[2];
+    float x1 = d->other->pos[0];    float y1 = d->other->pos[1];    float z1 = d->other->pos[2];
+    float vx = x1 - x0; float vy = y1 - y0; float vz = z1 - z0;
+    float len = sqrtf(vx*vx + vy*vy + vz*vz);
+    if (len <= 1e-6f) return;
+    float radius = 0.03f * len; // ~3% of segment length
+    const int slices = 20;
+
+    // unit axis
+    float ux = vx / len; float uy = vy / len; float uz = vz / len;
+    // pick arbitrary vector not parallel to axis
+    float ax = 0.0f, ay = 0.0f, az = 1.0f;
+    if (fabsf(ux*ax + uy*ay + uz*az) > 0.999f) { ax = 0.0f; ay = 1.0f; az = 0.0f; }
+    // first orthonormal: cross(u, a)
+    float ox = uy*az - uz*ay;
+    float oy = uz*ax - ux*az;
+    float oz = ux*ay - uy*ax;
+    float on = sqrtf(ox*ox + oy*oy + oz*oz);
+    if (on < 1e-6f) { ox = 1.0f; oy = 0.0f; oz = 0.0f; on = 1.0f; }
+    ox /= on; oy /= on; oz /= on;
+    // second orthonormal: cross(u, ortho)
+    float ox2 = uy*oz - uz*oy;
+    float oy2 = uz*ox - ux*oz;
+    float oz2 = ux*oy - uy*ox;
+
+    // Body color (same green), caps slightly brighter for highlight
     glColor3f(0.0f, 0.6f, 0.0f);
-    glLineWidth(3.0f);
-    glBegin(GL_LINES);
-    glVertex3f(d->base.node->pos[0], d->base.node->pos[1], d->base.node->pos[2]);
-    glVertex3f(d->other->pos[0], d->other->pos[1], d->other->pos[2]);
+    // Cylinder side
+    glBegin(GL_TRIANGLE_STRIP);
+    for (int i = 0; i <= slices; ++i) {
+        float theta = (2.0f * (float)M_PI * i) / (float)slices;
+        float c = cosf(theta), s = sinf(theta);
+        float rx = ox * c + ox2 * s;
+        float ry = oy * c + oy2 * s;
+        float rz = oz * c + oz2 * s;
+        // normal for lighting
+        glNormal3f(rx, ry, rz);
+        glVertex3f(x0 + rx * radius, y0 + ry * radius, z0 + rz * radius);
+        glVertex3f(x1 + rx * radius, y1 + ry * radius, z1 + rz * radius);
+    }
     glEnd();
-    glLineWidth(1.0f);
+
+    // Caps (highlighted)
+    glColor3f(0.2f, 0.9f, 0.2f);
+    // start cap
+    glBegin(GL_TRIANGLE_FAN);
+    glNormal3f(-ux, -uy, -uz);
+    glVertex3f(x0, y0, z0);
+    for (int i = 0; i <= slices; ++i) {
+        float theta = (2.0f * (float)M_PI * i) / (float)slices;
+        float c = cosf(theta), s = sinf(theta);
+        float rx = ox * c + ox2 * s;
+        float ry = oy * c + oy2 * s;
+        float rz = oz * c + oz2 * s;
+        glVertex3f(x0 + rx * radius, y0 + ry * radius, z0 + rz * radius);
+    }
+    glEnd();
+    // end cap
+    glBegin(GL_TRIANGLE_FAN);
+    glNormal3f(ux, uy, uz);
+    glVertex3f(x1, y1, z1);
+    for (int i = 0; i <= slices; ++i) {
+        float theta = (2.0f * (float)M_PI * i) / (float)slices;
+        float c = cosf(theta), s = sinf(theta);
+        float rx = ox * c + ox2 * s;
+        float ry = oy * c + oy2 * s;
+        float rz = oz * c + oz2 * s;
+        glVertex3f(x1 + rx * radius, y1 + ry * radius, z1 + rz * radius);
+    }
+    glEnd();
 }
 
 Constraint* distconstraint_create(Node *node, Node *other, float distance) {

@@ -5,28 +5,12 @@
 #include "Node.h"
 #include <stddef.h>
 
-#include "AABB.h"
+#include "BVH.h"
 
-// Triangle BVH node
-typedef struct TriangleBVHNode {
-    AABB bounds;
-    int is_leaf;
-    union {
-        struct {
-            struct TriangleBVHNode *left;
-            struct TriangleBVHNode *right;
-        } children;
-        struct {
-            int tri_idx; // index into triangle wall array
-        } leaf;
-    } data;
-} TriangleBVHNode;
-
-// BVH root structure
+// BVH wrapper for triangles. Leaves store void* leaf_data that wrappers set to int* indices.
 typedef struct {
-    TriangleBVHNode *root;
+    BVHNode *root;
     size_t n_triangles;
-    // Optionally, store triangle indices for refit
     int *triangle_indices;
 } TriangleBVH;
 
