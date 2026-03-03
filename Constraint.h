@@ -60,4 +60,7 @@ void trianglewall_free(TriangleWall *w);
 // Call this after node indices change (for example after deleting nodes).
 void constraint_refresh_indices(DynArray *constraints);
 
+// For CT_ANCHOR: fill ax/ay/az with the anchor world position. Returns 1 on success, 0 otherwise.
+int constraint_get_anchor(Constraint *c, float *ax, float *ay, float *az);
+
 #endif // CONSTRAINT_H

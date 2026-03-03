@@ -5,6 +5,7 @@
 #include <stdio.h>
 #include <stdint.h>
 #include <math.h>
+#include <GL/glew.h>
 #include <GL/gl.h>
 
 #include <cs.h>
@@ -22,6 +23,1341 @@ void mark_node_dirty_if_moved(Node *node, float threshold) {
     node->prev_position[0] = node->pos[0];
     node->prev_position[1] = node->pos[1];
     node->prev_position[2] = node->pos[2];
+}
+
+// Full GPU context owning all shaders and SSBOs for the complete solver pipeline.
+// SSBO binding layout mirrors the compute shaders:
+//  0 positions  1 velocities  2 inv_mass  3 ext_forces  4 node_flags
+//  5 constraints  6 J_cols  7 J_vals  8 A_dense  9 b_vec  10 l_vec
+//  11 collision  12 r_vec  13 p_vec  14 Ap_vec
+typedef struct GPUContext {
+    // ----- programs -----
+    GLuint prog_build_j;       // build Jacobian rows (1 thread/constraint)
+    GLuint prog_build_b;       // build RHS b = -err (1 thread/constraint)
+    GLuint prog_build_A;       // build A = dt^2 J M^-1 J^T (thread per (i,j))
+    GLuint prog_ext_forces;    // gravity + spring external forces (1 thread/node)
+    GLuint prog_cg_solve;      // full CG solver, single workgroup of 512 threads
+    GLuint prog_apply_corr;    // apply corr_f + symplectic-Euler integrate
+    // ----- SSBOs -----
+    GLuint ssbo_positions;     // binding  0 : n x vec4
+    GLuint ssbo_velocities;    // binding  1 : n x vec4
+    GLuint ssbo_inv_mass;      // binding  2 : n x float
+    GLuint ssbo_ext_forces;    // binding  3 : n x vec4  (gravity + springs, GPU-written)
+    GLuint ssbo_node_flags;    // binding  4 : n x uint
+    GLuint ssbo_constraints;   // binding  5 : m_total x 8 int  (non-spring first)
+    GLuint ssbo_J_cols;        // binding  6 : m_sparse x 6 int
+    GLuint ssbo_J_vals;        // binding  7 : m_sparse x 6 float
+    GLuint ssbo_A_dense;       // binding  8 : m_sparse x m_sparse float
+    GLuint ssbo_b_vec;         // binding  9 : m_sparse float
+    GLuint ssbo_l_vec;         // binding 10 : m_sparse float  (CG solution)
+    GLuint ssbo_collision;     // binding 11 : n x vec4  (collision forces, CPU-uploaded)
+    GLuint ssbo_r_vec;         // binding 12 : m_sparse float  (CG temp r)
+    GLuint ssbo_p_vec;         // binding 13 : m_sparse float  (CG temp p)
+    GLuint ssbo_Ap_vec;        // binding 14 : m_sparse float  (CG temp Ap)
+    // ----- sizes filled during scene upload -----
+    int node_count;
+    int m_sparse;   // non-spring constraint count
+    int m_total;    // total constraint count (including springs)
+    int gpu_debug;  // 1 → print CPU vs GPU comparison each first substep
+    // ----- cached uniform locations (set once at init / upload) -----
+    GLint u_ef_n, u_ef_m_sparse, u_ef_m_total, u_ef_gravity;
+    GLint u_bj_m;
+    GLint u_bb_m;
+    GLint u_ba_m, u_ba_dt;
+    GLint u_cg_m, u_cg_max_iter, u_cg_tol;
+    GLint u_ac_n, u_ac_m, u_ac_dt, u_ac_sub_dt, u_ac_N;
+    // ----- collision BVH program + SSBOs (bindings 15-17) -----
+    GLuint prog_collision;         // GPU sphere-triangle collision
+    GLuint ssbo_bvh_nodes;         // binding 15: flat BVH  (10 ints/node, kept for future use)
+    GLuint ssbo_triangles;         // binding 16: (reserved / unused by new shader)
+    GLuint ssbo_wall_indices;      // binding 17: 4 ints/tri [a_idx, b_idx, c_idx, 0]
+    int    n_bvh_nodes;            // number of BVH nodes built
+    int    n_triangles;            // number of triangles
+    int   *cpu_wall_node_indices;  // CPU copy: 3 ints/tri [a_idx, b_idx, c_idx]
+    GLint  u_col_n, u_col_n_tris, u_col_stiffness, u_col_damp, u_col_fr;
+    // ----- edge-edge collision (binding 18) -----
+    GLuint prog_edge_edge;         // GPU edge-edge capsule collision
+    GLuint ssbo_velcorr;           // binding 18: n*3 uint (float-as-uint velocity corrections)
+    GLint  u_ee_n, u_ee_m_total, u_ee_restitution, u_ee_mu;
+    // ----- render programs -----
+    GLuint prog_draw_nodes;        // vert+frag: instanced sphere per node
+    GLuint prog_draw_constraints;  // vert+frag: GL_LINES per constraint
+    GLuint prog_draw_walls;        // vert+frag: GL_TRIANGLES from ssbo_triangles
+    // sphere mesh (unit sphere, used with instancing)
+    GLuint vao_sphere;
+    GLuint vbo_sphere;
+    GLuint ibo_sphere;
+    int    sphere_index_count;
+    // empty VAO for gl_VertexID-only draws (constraints, walls)
+    GLuint vao_empty;
+    // cached draw uniform locations
+    GLint  u_draw_node_mvp;
+    GLint  u_draw_con_mvp;
+    GLint  u_draw_wall_mvp;
+} GPUContext;
+
+// Pack the pointer-based simulator data into contiguous buffers for GPU upload.
+// Non-spring constraints are placed first (indices 0..m_sparse-1); springs follow.
+PackedScene* simulator_pack_scene(Simulator *s) {
+    if (!s) return NULL;
+    PackedScene *p = (PackedScene*)calloc(1, sizeof(PackedScene));
+    int n = (int)dynarray_size(s->nodes);
+    p->node_count = n;
+    if (n > 0) {
+        p->positions  = (float*)malloc(sizeof(float) * n * 3);
+        p->velocities = (float*)malloc(sizeof(float) * n * 3);
+        p->inv_mass   = (float*)malloc(sizeof(float) * n);
+        p->radius     = (float*)malloc(sizeof(float) * n);
+        p->flags      = (unsigned int*)malloc(sizeof(unsigned int) * n);
+        for (int i = 0; i < n; ++i) {
+            Node *nd = (Node*)dynarray_get(s->nodes, i);
+            p->positions[3*i+0]  = nd->pos[0];
+            p->positions[3*i+1]  = nd->pos[1];
+            p->positions[3*i+2]  = nd->pos[2];
+            p->velocities[3*i+0] = nd->vel[0];
+            p->velocities[3*i+1] = nd->vel[1];
+            p->velocities[3*i+2] = nd->vel[2];
+            p->inv_mass[i] = (nd->anchored || nd->mass <= 0.0f) ? 0.0f : 1.0f / nd->mass;
+            p->radius[i]   = nd->radius;
+            unsigned int f = 0;
+            if (nd->anchored)                f |= 1u;
+            if (nd->collide_with_walls)         f |= 2u;
+            if (nd->sim_ignore)                 f |= 4u;
+            if (nd->isGravity)                  f |= 8u;  // bit 3
+            if (nd->collide_when_anchored)      f |= 16u; // bit 4
+            p->flags[i] = f;
+        }
+    }
+
+    int m_all = (int)dynarray_size(s->constraints);
+    p->constraint_count = m_all;
+    // count non-spring constraints
+    int m_sp = 0;
+    for (int i = 0; i < m_all; i++) {
+        Constraint *c = (Constraint*)dynarray_get(s->constraints, i);
+        if (c && c->type != CT_SPRING) m_sp++;
+    }
+    p->m_sparse = m_sp;
+
+    if (m_all > 0) {
+        p->ctype      = (int*)  malloc(sizeof(int)   * m_all);
+        p->a_idx      = (int*)  malloc(sizeof(int)   * m_all);
+        p->b_idx      = (int*)  malloc(sizeof(int)   * m_all);
+        p->rest       = (float*)malloc(sizeof(float) * m_all);
+        p->stiffness  = (float*)malloc(sizeof(float) * m_all);
+        p->anchor_pos = (float*)calloc(m_all * 3, sizeof(float));
+        // pass 0: non-spring; pass 1: spring
+        int dst = 0;
+        for (int pass = 0; pass < 2; pass++) {
+            for (int i = 0; i < m_all; i++) {
+                Constraint *c = (Constraint*)dynarray_get(s->constraints, i);
+                if (!c) continue;
+                int is_spring = (c->type == CT_SPRING);
+                if (pass == 0 &&  is_spring) continue;
+                if (pass == 1 && !is_spring) continue;
+                p->ctype[dst]     = (int)c->type;
+                p->a_idx[dst]     = c->node  ? c->node->idx  : -1;
+                p->b_idx[dst]     = c->other ? c->other->idx : -1;
+                p->rest[dst]      = c->rest_length;
+                p->stiffness[dst] = c->stiffness;
+                float ax = 0, ay = 0, az = 0;
+                constraint_get_anchor(c, &ax, &ay, &az);
+                p->anchor_pos[3*dst+0] = ax;
+                p->anchor_pos[3*dst+1] = ay;
+                p->anchor_pos[3*dst+2] = az;
+                dst++;
+            }
+        }
+    }
+
+    int tcount = (int)dynarray_size(s->walls);
+    p->triangle_count = tcount;
+    if (tcount > 0) {
+        p->triangle_vertices = (float*)malloc(sizeof(float) * tcount * 9);
+        for (int i = 0; i < tcount; ++i) {
+            TriangleWall *w = (TriangleWall*)dynarray_get(s->walls, i);
+            int base = i * 9;
+            p->triangle_vertices[base+0] = w->A->pos[0]; p->triangle_vertices[base+1] = w->A->pos[1]; p->triangle_vertices[base+2] = w->A->pos[2];
+            p->triangle_vertices[base+3] = w->B->pos[0]; p->triangle_vertices[base+4] = w->B->pos[1]; p->triangle_vertices[base+5] = w->B->pos[2];
+            p->triangle_vertices[base+6] = w->C->pos[0]; p->triangle_vertices[base+7] = w->C->pos[1]; p->triangle_vertices[base+8] = w->C->pos[2];
+        }
+    }
+    return p;
+}
+
+void simulator_free_packed_scene(PackedScene *p) {
+    if (!p) return;
+    free(p->positions); free(p->velocities); free(p->inv_mass);
+    free(p->radius);    free(p->flags);
+    free(p->ctype);     free(p->a_idx);      free(p->b_idx);
+    free(p->rest);      free(p->stiffness);  free(p->anchor_pos);
+    free(p->triangle_vertices);
+    free(p);
+}
+
+// ── Flat BVH builder for static triangle walls ──────────────────────────────
+// BVH nodes: 10 ints each  [min.xyz | left | max.xyz | right_or_first_tri | count | pad]
+// Triangles: 12 ints each  [A.xyz  -1 | B.xyz  -1 | C.xyz  -1]
+// The prims array is partitioned in-place; leaf indices refer to the reordered prim array.
+
+static inline int fbits(float f) { int i; memcpy(&i, &f, 4); return i; }
+
+typedef struct { float min[3]; float max[3]; int prim; } BVHPrim;
+typedef struct { int *data; int size; int cap; } IntBuf;
+
+static void ibuf_push10(IntBuf *b,
+                        int v0,int v1,int v2,int v3,int v4,
+                        int v5,int v6,int v7,int v8,int v9) {
+    if (b->size + 10 > b->cap) {
+        b->cap = (b->cap + 10 + 16) * 2;
+        b->data = (int*)realloc(b->data, sizeof(int) * (size_t)b->cap);
+    }
+    b->data[b->size+0]=v0; b->data[b->size+1]=v1; b->data[b->size+2]=v2;
+    b->data[b->size+3]=v3; b->data[b->size+4]=v4; b->data[b->size+5]=v5;
+    b->data[b->size+6]=v6; b->data[b->size+7]=v7; b->data[b->size+8]=v8;
+    b->data[b->size+9]=v9; b->size += 10;
+}
+
+static void bvh_bounds(BVHPrim *pr, int s, int e, float *mn, float *mx) {
+    mn[0]=mn[1]=mn[2]= 1e30f; mx[0]=mx[1]=mx[2]=-1e30f;
+    for (int i=s; i<e; i++)
+        for (int d=0; d<3; d++) {
+            if (pr[i].min[d] < mn[d]) mn[d] = pr[i].min[d];
+            if (pr[i].max[d] > mx[d]) mx[d] = pr[i].max[d];
+        }
+}
+
+// Returns index of the new node in buf (buf has 10 ints per node).
+// After return, buf->data may have been reallocated; always use buf->data[idx*10+k].
+static int bvh_build_rec(BVHPrim *pr, int start, int end, IntBuf *buf) {
+    float mn[3], mx[3];
+    bvh_bounds(pr, start, end, mn, mx);
+    int node_idx = buf->size / 10;
+    ibuf_push10(buf, fbits(mn[0]),fbits(mn[1]),fbits(mn[2]), -1,
+                     fbits(mx[0]),fbits(mx[1]),fbits(mx[2]),  0, 0, 0);
+    int count = end - start;
+    if (count <= 4) {               // leaf
+        buf->data[node_idx*10+3] = -1;      /* left=-1 marks leaf */
+        buf->data[node_idx*10+7] = start;   /* first_tri */
+        buf->data[node_idx*10+8] = count;   /* tri_count */
+        return node_idx;
+    }
+    float ext[3] = { mx[0]-mn[0], mx[1]-mn[1], mx[2]-mn[2] };
+    int axis = (ext[1] > ext[0]) ? 1 : 0;
+    if (ext[2] > ext[axis]) axis = 2;
+    float mid = (mn[axis] + mx[axis]) * 0.5f;
+    int l = start, r = end - 1;
+    while (l <= r) {
+        float cen = (pr[l].min[axis] + pr[l].max[axis]) * 0.5f;
+        if (cen < mid) { l++; }
+        else { BVHPrim tmp = pr[l]; pr[l] = pr[r]; pr[r--] = tmp; }
+    }
+    if (l == start || l == end) l = start + count / 2;
+    int lc = bvh_build_rec(pr, start, l, buf);
+    int rc = bvh_build_rec(pr, l,     end, buf);
+    buf->data[node_idx*10+3] = lc;
+    buf->data[node_idx*10+7] = rc;
+    buf->data[node_idx*10+8] = 0;
+    return node_idx;
+}
+
+// Helper: compile and link a compute shader from file, return program or 0 on error
+static GLuint compile_compute_program_from_file(const char *path) {
+    FILE *f = fopen(path, "rb");
+    if (!f) return 0;
+    fseek(f, 0, SEEK_END); long len = ftell(f); fseek(f, 0, SEEK_SET);
+    char *src = (char*)malloc(len + 1);
+    fread(src, 1, len, f); src[len] = '\0'; fclose(f);
+    GLuint sh = glCreateShader(GL_COMPUTE_SHADER);
+    glShaderSource(sh, 1, (const char**)&src, NULL);
+    glCompileShader(sh);
+    GLint ok = 0; glGetShaderiv(sh, GL_COMPILE_STATUS, &ok);
+    if (!ok) {
+        char log[8192]; GLsizei l = 0; glGetShaderInfoLog(sh, sizeof(log), &l, log);
+        fprintf(stderr, "Compute shader compile error (%s):\n%.*s\n", path, (int)l, log);
+        free(src); glDeleteShader(sh); return 0;
+    }
+    free(src);
+    GLuint prog = glCreateProgram(); glAttachShader(prog, sh); glLinkProgram(prog);
+    GLint link_ok = 0; glGetProgramiv(prog, GL_LINK_STATUS, &link_ok);
+    if (!link_ok) {
+        char log[8192]; GLsizei l = 0; glGetProgramInfoLog(prog, sizeof(log), &l, log);
+        fprintf(stderr, "Compute shader link error (%s):\n%.*s\n", path, (int)l, log);
+        glDeleteShader(sh); glDeleteProgram(prog); return 0;
+    }
+    glDetachShader(prog, sh); glDeleteShader(sh);
+    return prog;
+}
+
+/* Compile a vert+frag render program from two GLSL files. */
+static GLuint compile_render_program_from_files(const char *vert_path, const char *frag_path) {
+    /* read helper (local lambda via inline lambda) */
+    GLuint sh[2] = {0, 0};
+    const char *paths[2] = { vert_path, frag_path };
+    const GLenum types[2] = { GL_VERTEX_SHADER, GL_FRAGMENT_SHADER };
+    for (int i = 0; i < 2; i++) {
+        FILE *f = fopen(paths[i], "rb");
+        if (!f) { fprintf(stderr, "Render shader: cannot open %s\n", paths[i]); goto fail; }
+        fseek(f, 0, SEEK_END); long len = ftell(f); fseek(f, 0, SEEK_SET);
+        char *src = (char*)malloc(len + 1);
+        fread(src, 1, len, f); src[len] = '\0'; fclose(f);
+        sh[i] = glCreateShader(types[i]);
+        glShaderSource(sh[i], 1, (const char**)&src, NULL);
+        glCompileShader(sh[i]);
+        free(src);
+        GLint ok = 0; glGetShaderiv(sh[i], GL_COMPILE_STATUS, &ok);
+        if (!ok) {
+            char log[8192]; GLsizei l = 0; glGetShaderInfoLog(sh[i], sizeof(log), &l, log);
+            fprintf(stderr, "Render shader compile error (%s):\n%.*s\n", paths[i], (int)l, log);
+            goto fail;
+        }
+    }
+    {
+        GLuint prog = glCreateProgram();
+        glAttachShader(prog, sh[0]); glAttachShader(prog, sh[1]);
+        glLinkProgram(prog);
+        glDetachShader(prog, sh[0]); glDetachShader(prog, sh[1]);
+        glDeleteShader(sh[0]); glDeleteShader(sh[1]);
+        GLint link_ok = 0; glGetProgramiv(prog, GL_LINK_STATUS, &link_ok);
+        if (!link_ok) {
+            char log[8192]; GLsizei l = 0; glGetProgramInfoLog(prog, sizeof(log), &l, log);
+            fprintf(stderr, "Render shader link error (%s + %s):\n%.*s\n", vert_path, frag_path, (int)l, log);
+            glDeleteProgram(prog); return 0;
+        }
+        return prog;
+    }
+fail:
+    if (sh[0]) glDeleteShader(sh[0]);
+    if (sh[1]) glDeleteShader(sh[1]);
+    return 0;
+}
+
+/* Column-major 4×4 matrix multiply: out = A * B */
+static void mat4_mul_cm(float *out, const float *A, const float *B) {
+    for (int col = 0; col < 4; col++) {
+        for (int row = 0; row < 4; row++) {
+            float sum = 0.0f;
+            for (int k = 0; k < 4; k++) sum += A[k*4+row] * B[col*4+k];
+            out[col*4+row] = sum;
+        }
+    }
+}
+
+/* Build a UV sphere VAO with the specified slices/stacks.
+   Vertices store xyz = unit outward normal (== position on unit sphere).
+   Attribute location 0 = vec3.
+   Returns index count via *out_index_count. */
+static void build_sphere_vao(int slices, int stacks,
+                              GLuint *out_vao, GLuint *out_vbo, GLuint *out_ibo,
+                              int *out_index_count) {
+    int vert_count = (slices + 1) * (stacks + 1);
+    float *verts = (float*)malloc(sizeof(float) * 3 * vert_count);
+    int v = 0;
+    for (int j = 0; j <= stacks; j++) {
+        float phi = (float)M_PI * ((float)j / (float)stacks); /* 0..PI */
+        float sin_phi = sinf(phi), cos_phi = cosf(phi);
+        for (int i = 0; i <= slices; i++) {
+            float theta = 2.0f * (float)M_PI * ((float)i / (float)slices);
+            verts[v++] = sinf(theta) * sin_phi;
+            verts[v++] = cos_phi;
+            verts[v++] = cosf(theta) * sin_phi;
+        }
+    }
+    int idx_count = slices * stacks * 6;
+    unsigned short *idx = (unsigned short*)malloc(sizeof(unsigned short) * idx_count);
+    int k = 0;
+    for (int j = 0; j < stacks; j++) {
+        for (int i = 0; i < slices; i++) {
+            unsigned short a = (unsigned short)(j * (slices+1) + i);
+            unsigned short b = (unsigned short)(a + slices + 1);
+            idx[k++] = a;   idx[k++] = b;   idx[k++] = a+1;
+            idx[k++] = a+1; idx[k++] = b;   idx[k++] = b+1;
+        }
+    }
+    glGenVertexArrays(1, out_vao);
+    glGenBuffers(1, out_vbo);
+    glGenBuffers(1, out_ibo);
+    glBindVertexArray(*out_vao);
+    glBindBuffer(GL_ARRAY_BUFFER, *out_vbo);
+    glBufferData(GL_ARRAY_BUFFER, sizeof(float)*3*vert_count, verts, GL_STATIC_DRAW);
+    glEnableVertexAttribArray(0);
+    glVertexAttribPointer(0, 3, GL_FLOAT, GL_FALSE, 0, 0);
+    glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, *out_ibo);
+    glBufferData(GL_ELEMENT_ARRAY_BUFFER, sizeof(unsigned short)*idx_count, idx, GL_STATIC_DRAW);
+    glBindVertexArray(0);
+    free(verts); free(idx);
+    *out_index_count = idx_count;
+}
+
+
+// ── GPU lifecycle ─────────────────────────────────────────────────────────────
+
+int simulator_init_gpu(Simulator *s) {
+    if (!s) return -1;
+    GLenum glew_status = glewInit();
+    if (glew_status != GLEW_OK)
+        fprintf(stderr, "GPU: GLEW init failed: %s\n", glewGetErrorString(glew_status));
+
+    GPUContext *ctx = (GPUContext*)calloc(1, sizeof(GPUContext));
+
+    ctx->prog_build_j    = compile_compute_program_from_file("gpu/build_j.comp.glsl");
+    ctx->prog_build_b    = compile_compute_program_from_file("gpu/build_b.comp.glsl");
+    ctx->prog_build_A    = compile_compute_program_from_file("gpu/build_A.comp.glsl");
+    ctx->prog_ext_forces = compile_compute_program_from_file("gpu/ext_forces.comp.glsl");
+    ctx->prog_cg_solve   = compile_compute_program_from_file("gpu/cg_solve.comp.glsl");
+    ctx->prog_apply_corr  = compile_compute_program_from_file("gpu/apply_corr.comp.glsl");
+    ctx->prog_collision   = compile_compute_program_from_file("gpu/collision.comp.glsl");
+    ctx->prog_edge_edge   = compile_compute_program_from_file("gpu/edge_edge.comp.glsl");
+
+    int ok = ctx->prog_build_j && ctx->prog_build_b && ctx->prog_build_A &&
+             ctx->prog_ext_forces && ctx->prog_cg_solve &&
+             ctx->prog_apply_corr && ctx->prog_collision && ctx->prog_edge_edge;
+    if (!ok) fprintf(stderr, "GPU: one or more shaders failed to compile.\n");
+
+    /* Cache uniform locations */
+    ctx->u_ef_n        = glGetUniformLocation(ctx->prog_ext_forces, "u_n");
+    ctx->u_ef_m_sparse = glGetUniformLocation(ctx->prog_ext_forces, "u_m_sparse");
+    ctx->u_ef_m_total  = glGetUniformLocation(ctx->prog_ext_forces, "u_m_total");
+    ctx->u_ef_gravity  = glGetUniformLocation(ctx->prog_ext_forces, "u_gravity");
+    ctx->u_bj_m        = glGetUniformLocation(ctx->prog_build_j,    "u_m");
+    ctx->u_bb_m        = glGetUniformLocation(ctx->prog_build_b,    "u_m");
+    ctx->u_ba_m        = glGetUniformLocation(ctx->prog_build_A,    "u_m");
+    ctx->u_ba_dt       = glGetUniformLocation(ctx->prog_build_A,    "u_dt");
+    ctx->u_cg_m        = glGetUniformLocation(ctx->prog_cg_solve,   "u_m");
+    ctx->u_cg_max_iter = glGetUniformLocation(ctx->prog_cg_solve,   "u_max_iter");
+    ctx->u_cg_tol      = glGetUniformLocation(ctx->prog_cg_solve,   "u_tol");
+    ctx->u_ac_n        = glGetUniformLocation(ctx->prog_apply_corr, "u_n");
+    ctx->u_ac_m        = glGetUniformLocation(ctx->prog_apply_corr, "u_m");
+    ctx->u_ac_dt       = glGetUniformLocation(ctx->prog_apply_corr, "u_dt");
+    ctx->u_ac_sub_dt   = glGetUniformLocation(ctx->prog_apply_corr, "u_sub_dt");
+    ctx->u_ac_N        = glGetUniformLocation(ctx->prog_apply_corr, "u_N");
+    ctx->u_col_n        = glGetUniformLocation(ctx->prog_collision,  "u_n");
+    ctx->u_col_n_tris   = glGetUniformLocation(ctx->prog_collision,  "u_n_tris");
+    ctx->u_col_stiffness= glGetUniformLocation(ctx->prog_collision,  "u_stiffness");
+    ctx->u_col_damp     = glGetUniformLocation(ctx->prog_collision,  "u_damp");
+    ctx->u_col_fr       = glGetUniformLocation(ctx->prog_collision,  "u_friction_kt");
+    ctx->u_ee_n           = glGetUniformLocation(ctx->prog_edge_edge, "u_n");
+    ctx->u_ee_m_total     = glGetUniformLocation(ctx->prog_edge_edge, "u_m_total");
+    ctx->u_ee_restitution = glGetUniformLocation(ctx->prog_edge_edge, "u_restitution");
+    ctx->u_ee_mu          = glGetUniformLocation(ctx->prog_edge_edge, "u_mu");
+
+    GLuint *ss[] = {
+        &ctx->ssbo_positions, &ctx->ssbo_velocities, &ctx->ssbo_inv_mass,
+        &ctx->ssbo_ext_forces, &ctx->ssbo_node_flags, &ctx->ssbo_constraints,
+        &ctx->ssbo_J_cols, &ctx->ssbo_J_vals, &ctx->ssbo_A_dense,
+        &ctx->ssbo_b_vec, &ctx->ssbo_l_vec, &ctx->ssbo_collision,
+        &ctx->ssbo_r_vec, &ctx->ssbo_p_vec, &ctx->ssbo_Ap_vec,
+        &ctx->ssbo_bvh_nodes, &ctx->ssbo_triangles, &ctx->ssbo_wall_indices,
+        &ctx->ssbo_velcorr
+    };
+    for (int i = 0; i < 19; i++) glGenBuffers(1, ss[i]);
+
+    /* Render programs */
+    ctx->prog_draw_nodes       = compile_render_program_from_files(
+                                     "gpu/node_vert.glsl", "gpu/node_frag.glsl");
+    ctx->prog_draw_constraints = compile_render_program_from_files(
+                                     "gpu/constraint_vert.glsl", "gpu/constraint_frag.glsl");
+    ctx->prog_draw_walls       = compile_render_program_from_files(
+                                     "gpu/wall_vert.glsl", "gpu/wall_frag.glsl");
+    if (!ctx->prog_draw_nodes || !ctx->prog_draw_constraints || !ctx->prog_draw_walls)
+        fprintf(stderr, "GPU: one or more render shaders failed to compile.\n");
+
+    ctx->u_draw_node_mvp = glGetUniformLocation(ctx->prog_draw_nodes,       "u_mvp");
+    ctx->u_draw_con_mvp  = glGetUniformLocation(ctx->prog_draw_constraints, "u_mvp");
+    ctx->u_draw_wall_mvp = glGetUniformLocation(ctx->prog_draw_walls,       "u_mvp");
+
+    /* Sphere mesh (16 slices x 8 stacks) for node instanced draw */
+    build_sphere_vao(16, 8,
+                     &ctx->vao_sphere, &ctx->vbo_sphere, &ctx->ibo_sphere,
+                     &ctx->sphere_index_count);
+
+    /* Empty VAO for gl_VertexID-only draws */
+    glGenVertexArrays(1, &ctx->vao_empty);
+
+    s->gpu_ctx = ctx;
+    s->use_gpu = 1;
+    fprintf(stderr, "GPU: initialized (%s).\n", ok ? "all shaders OK" : "SHADER ERRORS");
+    fflush(stderr);
+    return ok ? 0 : -1;
+}
+
+void simulator_free_gpu(Simulator *s) {
+    if (!s || !s->gpu_ctx) { if (s) s->use_gpu = 0; return; }
+    GPUContext *ctx = (GPUContext*)s->gpu_ctx;
+    if (ctx->prog_build_j)    glDeleteProgram(ctx->prog_build_j);
+    if (ctx->prog_build_b)    glDeleteProgram(ctx->prog_build_b);
+    if (ctx->prog_build_A)    glDeleteProgram(ctx->prog_build_A);
+    if (ctx->prog_ext_forces) glDeleteProgram(ctx->prog_ext_forces);
+    if (ctx->prog_cg_solve)   glDeleteProgram(ctx->prog_cg_solve);
+    if (ctx->prog_apply_corr) glDeleteProgram(ctx->prog_apply_corr);
+    if (ctx->prog_collision)  glDeleteProgram(ctx->prog_collision);
+    if (ctx->prog_edge_edge)  glDeleteProgram(ctx->prog_edge_edge);
+    if (ctx->prog_draw_nodes)       glDeleteProgram(ctx->prog_draw_nodes);
+    if (ctx->prog_draw_constraints) glDeleteProgram(ctx->prog_draw_constraints);
+    if (ctx->prog_draw_walls)       glDeleteProgram(ctx->prog_draw_walls);
+    if (ctx->vao_sphere) glDeleteVertexArrays(1, &ctx->vao_sphere);
+    if (ctx->vbo_sphere) glDeleteBuffers(1, &ctx->vbo_sphere);
+    if (ctx->ibo_sphere) glDeleteBuffers(1, &ctx->ibo_sphere);
+    if (ctx->vao_empty)  glDeleteVertexArrays(1, &ctx->vao_empty);
+    free(ctx->cpu_wall_node_indices); ctx->cpu_wall_node_indices = NULL;
+    GLuint bufs[19] = {
+        ctx->ssbo_positions, ctx->ssbo_velocities, ctx->ssbo_inv_mass,
+        ctx->ssbo_ext_forces, ctx->ssbo_node_flags, ctx->ssbo_constraints,
+        ctx->ssbo_J_cols, ctx->ssbo_J_vals, ctx->ssbo_A_dense,
+        ctx->ssbo_b_vec, ctx->ssbo_l_vec, ctx->ssbo_collision,
+        ctx->ssbo_r_vec, ctx->ssbo_p_vec, ctx->ssbo_Ap_vec,
+        ctx->ssbo_bvh_nodes, ctx->ssbo_triangles, ctx->ssbo_wall_indices,
+        ctx->ssbo_velcorr
+    };
+    glDeleteBuffers(19, bufs);
+    free(ctx);
+    s->gpu_ctx = NULL;
+    s->use_gpu = 0;
+}
+
+// Upload static scene data (positions/velocities/inv_mass/flags/constraints) and
+// allocate the dynamic per-substep SSBOs (J, A, b, l, r, p, Ap, collision).
+void simulator_upload_scene_to_gpu(Simulator *s, PackedScene *p) {
+    if (!s || !p || !s->gpu_ctx) return;
+    GPUContext *ctx = (GPUContext*)s->gpu_ctx;
+    int n       = p->node_count;
+    int m       = p->m_sparse;
+    int m_total = p->constraint_count;
+    ctx->node_count = n;
+    ctx->m_sparse   = m;
+    ctx->m_total    = m_total;
+
+#define _BIND(b, ssbo) glBindBufferBase(GL_SHADER_STORAGE_BUFFER, (b), (ssbo))
+
+    if (n > 0) {
+        // Positions/velocities as vec4 arrays
+        float *pos4 = (float*)calloc((size_t)n * 4, sizeof(float));
+        float *vel4 = (float*)calloc((size_t)n * 4, sizeof(float));
+        for (int i = 0; i < n; i++) {
+            pos4[4*i+0]=p->positions[3*i+0]; pos4[4*i+1]=p->positions[3*i+1]; pos4[4*i+2]=p->positions[3*i+2]; pos4[4*i+3]=p->radius[i];
+            vel4[4*i+0]=p->velocities[3*i+0]; vel4[4*i+1]=p->velocities[3*i+1]; vel4[4*i+2]=p->velocities[3*i+2];
+        }
+        glBindBuffer(GL_SHADER_STORAGE_BUFFER, ctx->ssbo_positions);
+        glBufferData(GL_SHADER_STORAGE_BUFFER, sizeof(float)*n*4, pos4, GL_DYNAMIC_DRAW);
+        _BIND(0, ctx->ssbo_positions);
+        glBindBuffer(GL_SHADER_STORAGE_BUFFER, ctx->ssbo_velocities);
+        glBufferData(GL_SHADER_STORAGE_BUFFER, sizeof(float)*n*4, vel4, GL_DYNAMIC_DRAW);
+        _BIND(1, ctx->ssbo_velocities);
+        free(pos4); free(vel4);
+
+        glBindBuffer(GL_SHADER_STORAGE_BUFFER, ctx->ssbo_inv_mass);
+        glBufferData(GL_SHADER_STORAGE_BUFFER, sizeof(float)*n, p->inv_mass, GL_STATIC_DRAW);
+        _BIND(2, ctx->ssbo_inv_mass);
+
+        glBindBuffer(GL_SHADER_STORAGE_BUFFER, ctx->ssbo_ext_forces);
+        glBufferData(GL_SHADER_STORAGE_BUFFER, sizeof(float)*n*4, NULL, GL_DYNAMIC_DRAW);
+        _BIND(3, ctx->ssbo_ext_forces);
+
+        glBindBuffer(GL_SHADER_STORAGE_BUFFER, ctx->ssbo_node_flags);
+        glBufferData(GL_SHADER_STORAGE_BUFFER, sizeof(unsigned int)*n, p->flags, GL_STATIC_DRAW);
+        _BIND(4, ctx->ssbo_node_flags);
+
+        // collision forces: zeroed, CPU writes each substep
+        float *zeros = (float*)calloc((size_t)n*4, sizeof(float));
+        glBindBuffer(GL_SHADER_STORAGE_BUFFER, ctx->ssbo_collision);
+        glBufferData(GL_SHADER_STORAGE_BUFFER, sizeof(float)*n*4, zeros, GL_DYNAMIC_DRAW);
+        _BIND(11, ctx->ssbo_collision);
+        free(zeros);
+    }
+
+    // Constraint SSBO: 8 ints per entry (non-spring first, then springs)
+    // Layout: [ctype, a_idx, b_idx, float_rest, float_ax, float_ay, float_az, float_stiffness]
+    if (m_total > 0) {
+        int *con = (int*)malloc(sizeof(int) * m_total * 8);
+        for (int i = 0; i < m_total; i++) {
+            con[i*8+0] = p->ctype[i];
+            con[i*8+1] = p->a_idx[i];
+            con[i*8+2] = p->b_idx[i];
+            float v;
+            v = p->rest[i];            memcpy(&con[i*8+3], &v, 4);
+            v = p->anchor_pos[3*i+0];  memcpy(&con[i*8+4], &v, 4);
+            v = p->anchor_pos[3*i+1];  memcpy(&con[i*8+5], &v, 4);
+            v = p->anchor_pos[3*i+2];  memcpy(&con[i*8+6], &v, 4);
+            v = p->stiffness[i];       memcpy(&con[i*8+7], &v, 4);
+        }
+        glBindBuffer(GL_SHADER_STORAGE_BUFFER, ctx->ssbo_constraints);
+        glBufferData(GL_SHADER_STORAGE_BUFFER, sizeof(int)*m_total*8, con, GL_STATIC_DRAW);
+        _BIND(5, ctx->ssbo_constraints);
+        free(con);
+    }
+
+    // Dynamic per-substep SSBOs (allocated now, filled by compute shaders each substep)
+    if (m > 0) {
+        glBindBuffer(GL_SHADER_STORAGE_BUFFER, ctx->ssbo_J_cols);
+        glBufferData(GL_SHADER_STORAGE_BUFFER, sizeof(int)*m*6, NULL, GL_DYNAMIC_DRAW);
+        _BIND(6, ctx->ssbo_J_cols);
+        glBindBuffer(GL_SHADER_STORAGE_BUFFER, ctx->ssbo_J_vals);
+        glBufferData(GL_SHADER_STORAGE_BUFFER, sizeof(float)*m*6, NULL, GL_DYNAMIC_DRAW);
+        _BIND(7, ctx->ssbo_J_vals);
+        glBindBuffer(GL_SHADER_STORAGE_BUFFER, ctx->ssbo_A_dense);
+        glBufferData(GL_SHADER_STORAGE_BUFFER, sizeof(float)*(size_t)m*m, NULL, GL_DYNAMIC_DRAW);
+        _BIND(8, ctx->ssbo_A_dense);
+        int bindings[] = { 9, 10, 12, 13, 14 };
+        GLuint *vbufs[] = { &ctx->ssbo_b_vec, &ctx->ssbo_l_vec, &ctx->ssbo_r_vec, &ctx->ssbo_p_vec, &ctx->ssbo_Ap_vec };
+        for (int i = 0; i < 5; i++) {
+            glBindBuffer(GL_SHADER_STORAGE_BUFFER, *vbufs[i]);
+            glBufferData(GL_SHADER_STORAGE_BUFFER, sizeof(float)*m, NULL, GL_DYNAMIC_DRAW);
+            _BIND(bindings[i], *vbufs[i]);
+        }
+    }
+#undef _BIND
+
+    /* Build flat BVH for static triangle walls, upload once */
+    {
+        int tcount = p->triangle_count;
+        ctx->n_triangles = tcount;
+        ctx->n_bvh_nodes = 0;
+        if (tcount > 0 && p->triangle_vertices) {
+            const float *tv = p->triangle_vertices;
+            BVHPrim *prims = (BVHPrim*)malloc(sizeof(BVHPrim) * (size_t)tcount);
+            for (int i = 0; i < tcount; i++) {
+                float ax=tv[9*i+0],ay=tv[9*i+1],az=tv[9*i+2];
+                float bx=tv[9*i+3],by=tv[9*i+4],bz=tv[9*i+5];
+                float cx=tv[9*i+6],cy=tv[9*i+7],cz=tv[9*i+8];
+                prims[i].min[0]=fminf(fminf(ax,bx),cx)-0.01f;
+                prims[i].min[1]=fminf(fminf(ay,by),cy)-0.01f;
+                prims[i].min[2]=fminf(fminf(az,bz),cz)-0.01f;
+                prims[i].max[0]=fmaxf(fmaxf(ax,bx),cx)+0.01f;
+                prims[i].max[1]=fmaxf(fmaxf(ay,by),cy)+0.01f;
+                prims[i].max[2]=fmaxf(fmaxf(az,bz),cz)+0.01f;
+                prims[i].prim = i;
+            }
+            IntBuf bvh_buf = {0};
+            bvh_build_rec(prims, 0, tcount, &bvh_buf);
+            ctx->n_bvh_nodes = bvh_buf.size / 10;
+            /* Reorder triangle data to match BVH leaf order */
+            int *tri_data = (int*)malloc(sizeof(int) * 12 * (size_t)tcount);
+            for (int i = 0; i < tcount; i++) {
+                int o = prims[i].prim;
+                float ax=tv[9*o+0],ay=tv[9*o+1],az=tv[9*o+2];
+                float bx=tv[9*o+3],by=tv[9*o+4],bz=tv[9*o+5];
+                float cx=tv[9*o+6],cy=tv[9*o+7],cz=tv[9*o+8];
+                tri_data[12*i+ 0]=fbits(ax); tri_data[12*i+ 1]=fbits(ay); tri_data[12*i+ 2]=fbits(az); tri_data[12*i+ 3]=-1;
+                tri_data[12*i+ 4]=fbits(bx); tri_data[12*i+ 5]=fbits(by); tri_data[12*i+ 6]=fbits(bz); tri_data[12*i+ 7]=-1;
+                tri_data[12*i+ 8]=fbits(cx); tri_data[12*i+ 9]=fbits(cy); tri_data[12*i+10]=fbits(cz); tri_data[12*i+11]=-1;
+            }
+            glBindBuffer(GL_SHADER_STORAGE_BUFFER, ctx->ssbo_bvh_nodes);
+            glBufferData(GL_SHADER_STORAGE_BUFFER, sizeof(int)*(size_t)bvh_buf.size, bvh_buf.data, GL_STATIC_DRAW);
+            glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 15, ctx->ssbo_bvh_nodes);
+            glBindBuffer(GL_SHADER_STORAGE_BUFFER, ctx->ssbo_triangles);
+            glBufferData(GL_SHADER_STORAGE_BUFFER, sizeof(int)*12*(size_t)tcount, tri_data, GL_STATIC_DRAW);
+            glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 16, ctx->ssbo_triangles);
+
+            /* Build wall node index SSBO (binding 17) — reordered same as tri_data */
+            int *widx_data = (int*)malloc(sizeof(int)*4*(size_t)tcount);
+            int *cpuidx    = (int*)malloc(sizeof(int)*3*(size_t)tcount);
+            for (int i = 0; i < tcount; i++) {
+                int o = prims[i].prim;  /* original wall index before BVH sort */
+                TriangleWall *w = (TriangleWall*)dynarray_get(s->walls, o);
+                widx_data[4*i+0] = w->A->idx; widx_data[4*i+1] = w->B->idx;
+                widx_data[4*i+2] = w->C->idx; widx_data[4*i+3] = 0;
+                cpuidx[3*i+0] = w->A->idx; cpuidx[3*i+1] = w->B->idx; cpuidx[3*i+2] = w->C->idx;
+            }
+            free(ctx->cpu_wall_node_indices);
+            ctx->cpu_wall_node_indices = cpuidx;
+            glBindBuffer(GL_SHADER_STORAGE_BUFFER, ctx->ssbo_wall_indices);
+            glBufferData(GL_SHADER_STORAGE_BUFFER, sizeof(int)*4*(size_t)tcount, widx_data, GL_STATIC_DRAW);
+            glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 17, ctx->ssbo_wall_indices);
+            free(widx_data);
+
+            free(bvh_buf.data); free(tri_data); free(prims);
+            fprintf(stderr, "GPU: BVH built (%d nodes, %d tris).\n", ctx->n_bvh_nodes, tcount);
+        }
+    }
+
+    /* --- ssbo_velcorr (binding 18): edge-edge velocity impulse accumulator --- */
+    if (n > 0) {
+        static const GLuint zero = 0u;
+        glBindBuffer(GL_SHADER_STORAGE_BUFFER, ctx->ssbo_velcorr);
+        glBufferData(GL_SHADER_STORAGE_BUFFER, sizeof(GLuint) * (size_t)n * 3, NULL, GL_DYNAMIC_DRAW);
+        glClearBufferData(GL_SHADER_STORAGE_BUFFER, GL_R32UI, GL_RED_INTEGER, GL_UNSIGNED_INT, &zero);
+        glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 18, ctx->ssbo_velcorr);
+    }
+
+    fprintf(stderr, "GPU: scene uploaded (n=%d, m_sparse=%d, m_total=%d).\n", n, m, m_total);
+    fflush(stderr);
+}
+
+void simulator_enable_gpu(Simulator *s, int enable) {
+    if (!s) return;
+    if (enable) {
+        if (!s->use_gpu) { simulator_init_gpu(s); s->use_gpu = 1; }
+    } else {
+        if (s->use_gpu) { simulator_free_gpu(s); s->use_gpu = 0; }
+    }
+}
+// Check collision between two distance constraints (modeled as cylinders)
+// Returns 1 if collision detected, fills out_penetration, out_normal[3], and closest points on each segment
+static int constraint_constraint_collision(
+    Node *a0, Node *a1, // endpoints of first constraint
+    Node *b0, Node *b1, // endpoints of second constraint
+    float *out_penetration, float out_normal[3],
+    float out_pa[3], float out_pb[3] // closest points on each segment
+) {
+    // Compute segment vectors and lengths
+    float A[3] = {a0->pos[0], a0->pos[1], a0->pos[2]};
+    float B[3] = {a1->pos[0], a1->pos[1], a1->pos[2]};
+    float C[3] = {b0->pos[0], b0->pos[1], b0->pos[2]};
+    float D[3] = {b1->pos[0], b1->pos[1], b1->pos[2]};
+    float u[3] = {B[0]-A[0], B[1]-A[1], B[2]-A[2]};
+    float v[3] = {D[0]-C[0], D[1]-C[1], D[2]-C[2]};
+    float w[3] = {A[0]-C[0], A[1]-C[1], A[2]-C[2]};
+    float len_u = sqrtf(u[0]*u[0] + u[1]*u[1] + u[2]*u[2]);
+    float len_v = sqrtf(v[0]*v[0] + v[1]*v[1] + v[2]*v[2]);
+    if (len_u < 1e-8f || len_v < 1e-8f) return 0; // degenerate
+
+    float ru = 0.01f * len_u;
+    float rv = 0.01f * len_v;
+
+    // Compute closest points between segments (see Real-Time Collision Detection, Christer Ericson)
+    float a = u[0]*u[0] + u[1]*u[1] + u[2]*u[2];
+    float b = u[0]*v[0] + u[1]*v[1] + u[2]*v[2];
+    float c = v[0]*v[0] + v[1]*v[1] + v[2]*v[2];
+    float d = u[0]*w[0] + u[1]*w[1] + u[2]*w[2];
+    float e = v[0]*w[0] + v[1]*w[1] + v[2]*w[2];
+    float D_ = a*c - b*b;
+    float sc, sN, sD = D_;
+    float tc, tN, tD = D_;
+
+    // Default sN = D_, tN = D_
+    if (D_ < 1e-8f) {
+        sN = 0.0f;
+        sD = 1.0f;
+        tN = e;
+        tD = c;
+    } else {
+        sN = (b*e - c*d);
+        tN = (a*e - b*d);
+        if (sN < 0.0f) { sN = 0.0f; tN = e; tD = c; }
+        else if (sN > sD) { sN = sD; tN = e + b; tD = c; }
+    }
+    if (tN < 0.0f) { tN = 0.0f;
+        if (-d < 0.0f) sN = 0.0f;
+        else if (-d > a) sN = sD;
+        else { sN = -d; sD = a; }
+    } else if (tN > tD) { tN = tD;
+        if ((-d + b) < 0.0f) sN = 0.0f;
+        else if ((-d + b) > a) sN = sD;
+        else { sN = (-d + b); sD = a; }
+    }
+    sc = (fabsf(sN) < 1e-8f ? 0.0f : sN / sD);
+    tc = (fabsf(tN) < 1e-8f ? 0.0f : tN / tD);
+
+    // Closest points
+    float pa[3] = {A[0] + sc * u[0], A[1] + sc * u[1], A[2] + sc * u[2]};
+    float pb[3] = {C[0] + tc * v[0], C[1] + tc * v[1], C[2] + tc * v[2]};
+    float dx = pa[0] - pb[0], dy = pa[1] - pb[1], dz = pa[2] - pb[2];
+    float dist = sqrtf(dx*dx + dy*dy + dz*dz);
+
+    float min_dist = ru + rv;
+    if (dist < min_dist) {
+        if (out_penetration) *out_penetration = min_dist - dist;
+        if (out_normal) {
+            float nlen = sqrtf(dx*dx + dy*dy + dz*dz);
+            if (nlen > 1e-8f) {
+                out_normal[0] = dx / nlen;
+                out_normal[1] = dy / nlen;
+                out_normal[2] = dz / nlen;
+            } else {
+                out_normal[0] = 1.0f; out_normal[1] = 0.0f; out_normal[2] = 0.0f;
+            }
+        }
+        if (out_pa) { out_pa[0] = pa[0]; out_pa[1] = pa[1]; out_pa[2] = pa[2]; }
+        if (out_pb) { out_pb[0] = pb[0]; out_pb[1] = pb[1]; out_pb[2] = pb[2]; }
+        return 1;
+    }
+    return 0;
+}
+
+
+// --- Edge-Edge Collision Detection and Resolution using EdgeBVH self-traversal ---
+typedef struct {
+    DynArray *edges;
+    float *collision_forces;
+    float sub_dt;
+} EdgeEdgeContext;
+
+void edge_edge_callback(int idxA, int idxB, void *userdata) {
+    float DAMP_K = 200.0f;
+    float PENETRATION_STIFFNESS = 500.0f;
+
+    EdgeEdgeContext *ctx = (EdgeEdgeContext*)userdata;
+    DynArray *edges = ctx->edges;
+    float *collision_forces = ctx->collision_forces;
+    Constraint *edgeA = (Constraint*)dynarray_get(edges, idxA);
+    Constraint *edgeB = (Constraint*)dynarray_get(edges, idxB);
+    if (!edgeA || !edgeB || !edgeA->node || !edgeA->other || !edgeB->node || !edgeB->other) return;
+    // Skip if constraints share a node as an endpoint
+    if (edgeA->node == edgeB->node || edgeA->node == edgeB->other ||
+        edgeA->other == edgeB->node || edgeA->other == edgeB->other) return;
+    // Only check distance constraints
+    if (edgeA->type != CT_DIST || edgeB->type != CT_DIST) return;
+
+    float penetration, normal[3], pa[3], pb[3];
+    if (!constraint_constraint_collision(edgeA->node, edgeA->other, edgeB->node, edgeB->other, &penetration, normal, pa, pb)) {
+        return;
+    }
+
+    // Compute barycentric-like weights along each edge for velocity interpolation
+    float dA0 = sqrtf((pa[0]-edgeA->node->pos[0])*(pa[0]-edgeA->node->pos[0]) +
+                      (pa[1]-edgeA->node->pos[1])*(pa[1]-edgeA->node->pos[1]) +
+                      (pa[2]-edgeA->node->pos[2])*(pa[2]-edgeA->node->pos[2]));
+    float dA1 = sqrtf((pa[0]-edgeA->other->pos[0])*(pa[0]-edgeA->other->pos[0]) +
+                      (pa[1]-edgeA->other->pos[1])*(pa[1]-edgeA->other->pos[1]) +
+                      (pa[2]-edgeA->other->pos[2])*(pa[2]-edgeA->other->pos[2]));
+    float lenA = dA0 + dA1;
+    float wA0 = (lenA > 1e-8f) ? (dA1 / lenA) : 0.5f;
+    float wA1 = (lenA > 1e-8f) ? (dA0 / lenA) : 0.5f;
+
+    float dB0 = sqrtf((pb[0]-edgeB->node->pos[0])*(pb[0]-edgeB->node->pos[0]) +
+                      (pb[1]-edgeB->node->pos[1])*(pb[1]-edgeB->node->pos[1]) +
+                      (pb[2]-edgeB->node->pos[2])*(pb[2]-edgeB->node->pos[2]));
+    float dB1 = sqrtf((pb[0]-edgeB->other->pos[0])*(pb[0]-edgeB->other->pos[0]) +
+                      (pb[1]-edgeB->other->pos[1])*(pb[1]-edgeB->other->pos[1]) +
+                      (pb[2]-edgeB->other->pos[2])*(pb[2]-edgeB->other->pos[2]));
+    float lenB = dB0 + dB1;
+    float wB0 = (lenB > 1e-8f) ? (dB1 / lenB) : 0.5f;
+    float wB1 = (lenB > 1e-8f) ? (dB0 / lenB) : 0.5f;
+
+    // printf("Edge-Edge Collision: idxA=%d idxB=%d\n", idxA, idxB);
+    // printf("  Penetration: %.4f\n", penetration);
+    // printf("  Normal: [%.4f %.4f %.4f]\n", normal[0], normal[1], normal[2]);
+    // printf("  Closest points: pa=[%.4f %.4f %.4f], pb=[%.4f %.4f %.4f]\n", pa[0], pa[1], pa[2], pb[0], pb[1], pb[2]);
+
+    // Interpolated velocities at contact points
+    float va[3], vb[3];
+    for (int i = 0; i < 3; ++i) {
+        va[i] = edgeA->node->vel[i] * wA0 + edgeA->other->vel[i] * wA1;
+        vb[i] = edgeB->node->vel[i] * wB0 + edgeB->other->vel[i] * wB1;
+    }
+
+    float rel_vel[3] = { va[0] - vb[0], va[1] - vb[1], va[2] - vb[2] };
+    float normal_vel = rel_vel[0]*normal[0] + rel_vel[1]*normal[1] + rel_vel[2]*normal[2];
+    // printf("  Relative velocity: [%.4f %.4f %.4f], normal_vel=%.4f\n", rel_vel[0], rel_vel[1], rel_vel[2], normal_vel);
+
+    // Impulse-based resolution to avoid tunneling: compute effective inverse-mass
+    float inv_mA0 = (edgeA->node->anchored || edgeA->node->sim_ignore) ? 0.0f : 1.0f / fmaxf(edgeA->node->mass, 1e-9f);
+    float inv_mA1 = (edgeA->other->anchored || edgeA->other->sim_ignore) ? 0.0f : 1.0f / fmaxf(edgeA->other->mass, 1e-9f);
+    float inv_mB0 = (edgeB->node->anchored || edgeB->node->sim_ignore) ? 0.0f : 1.0f / fmaxf(edgeB->node->mass, 1e-9f);
+    float inv_mB1 = (edgeB->other->anchored || edgeB->other->sim_ignore) ? 0.0f : 1.0f / fmaxf(edgeB->other->mass, 1e-9f);
+
+    float weff = wA0*wA0*inv_mA0 + wA1*wA1*inv_mA1 + wB0*wB0*inv_mB0 + wB1*wB1*inv_mB1;
+    if (weff <= 1e-12f) return;
+
+    // Only resolve contacts that are closing (negative relative normal velocity)
+    // Note: earlier code used normal_vel positive for closing; flip sign accordingly
+    if (normal_vel >= 0.0f) return;
+
+    float restitution = 0.05f; // small restitution to avoid bounciness
+    float J = -(1.0f + restitution) * normal_vel / weff;
+    // clamp impulse magnitude to avoid extreme corrections
+    float maxJ = 1e4f;
+    if (J > maxJ) J = maxJ;
+
+    // Tangential (Coulomb) friction impulse
+    float rel_t[3] = {
+        rel_vel[0] - normal_vel * normal[0],
+        rel_vel[1] - normal_vel * normal[1],
+        rel_vel[2] - normal_vel * normal[2]
+    };
+    float t_len = sqrtf(rel_t[0]*rel_t[0] + rel_t[1]*rel_t[1] + rel_t[2]*rel_t[2]);
+    float jt = 0.0f;
+    float t_dir[3] = {0.0f, 0.0f, 0.0f};
+    if (t_len > 1e-9f) {
+        t_dir[0] = rel_t[0] / t_len;
+        t_dir[1] = rel_t[1] / t_len;
+        t_dir[2] = rel_t[2] / t_len;
+        // desired tangential impulse to remove relative tangential velocity
+        jt = -(rel_vel[0]*t_dir[0] + rel_vel[1]*t_dir[1] + rel_vel[2]*t_dir[2]) / weff;
+    }
+
+    // friction coefficient: average of involved node frictions (fallback 0.5)
+    float mu_sum = 0.0f; int mu_count = 0;
+    if (edgeA->node) { mu_sum += edgeA->node->friction; mu_count++; }
+    if (edgeA->other) { mu_sum += edgeA->other->friction; mu_count++; }
+    if (edgeB->node) { mu_sum += edgeB->node->friction; mu_count++; }
+    if (edgeB->other) { mu_sum += edgeB->other->friction; mu_count++; }
+    float mu = (mu_count > 0) ? (mu_sum / (float)mu_count) : 0.5f;
+
+    // clamp tangential impulse by Coulomb: |jt| <= mu * J
+    float jmax = fabsf(mu * J);
+    if (jt > jmax) jt = jmax;
+    if (jt < -jmax) jt = -jmax;
+
+    // printf("  Impulse J=%.6f jt=%.6f weff=%.6e mu=%.3f\n", J, jt, weff, mu);
+
+    // Apply velocity impulse (normal + tangential) distributed to nodes
+    if (inv_mA0 > 0.0f) {
+        for (int k = 0; k < 3; ++k) edgeA->node->vel[k] += (J * wA0 * inv_mA0) * normal[k] + (jt * wA0 * inv_mA0) * t_dir[k];
+    }
+    if (inv_mA1 > 0.0f) {
+        for (int k = 0; k < 3; ++k) edgeA->other->vel[k] += (J * wA1 * inv_mA1) * normal[k] + (jt * wA1 * inv_mA1) * t_dir[k];
+    }
+    if (inv_mB0 > 0.0f) {
+        for (int k = 0; k < 3; ++k) edgeB->node->vel[k] -= (J * wB0 * inv_mB0) * normal[k] + (jt * wB0 * inv_mB0) * t_dir[k];
+    }
+    if (inv_mB1 > 0.0f) {
+        for (int k = 0; k < 3; ++k) edgeB->other->vel[k] -= (J * wB1 * inv_mB1) * normal[k] + (jt * wB1 * inv_mB1) * t_dir[k];
+    }
+}
+
+
+
+// Helper: check collision between triangle wall and node (3D point-triangle collision)
+// Returns 1 if collision detected, fills out_penetration, out_normal[3], and barycentric coords
+static int triangle_check_collision(TriangleWall *w, Node *node, 
+                                    float *out_penetration, float out_normal[3],
+                                    float *out_u, float *out_v) {
+    // Get triangle vertices
+    float *a = w->A->pos;
+    float *b = w->B->pos;
+    float *c = w->C->pos;
+    float *p = node->pos;
+    
+    // Compute triangle edges
+    float e1[3] = {b[0] - a[0], b[1] - a[1], b[2] - a[2]};
+    float e2[3] = {c[0] - a[0], c[1] - a[1], c[2] - a[2]};
+    
+    // Compute triangle normal via cross product
+    float normal[3] = {
+        e1[1]*e2[2] - e1[2]*e2[1],
+        e1[2]*e2[0] - e1[0]*e2[2],
+        e1[0]*e2[1] - e1[1]*e2[0]
+    };
+    float normal_len = sqrtf(normal[0]*normal[0] + normal[1]*normal[1] + normal[2]*normal[2]);
+    if (normal_len < 1e-9f) return 0; // degenerate triangle
+    normal[0] /= normal_len; normal[1] /= normal_len; normal[2] /= normal_len;
+    
+    // Project point onto triangle plane
+    float ap[3] = {p[0] - a[0], p[1] - a[1], p[2] - a[2]};
+    float dist_to_plane = ap[0]*normal[0] + ap[1]*normal[1] + ap[2]*normal[2];
+    
+    // Check if point is within radius distance from plane
+    if (fabsf(dist_to_plane) > node->radius) return 0;
+    
+    // Project point onto plane
+    float proj[3] = {
+        p[0] - normal[0] * dist_to_plane,
+        p[1] - normal[1] * dist_to_plane,
+        p[2] - normal[2] * dist_to_plane
+    };
+    
+    // Compute barycentric coordinates of projected point
+    // Using method: solve [e1 e2] * [u v]^T = proj - a
+    float v0[3] = {proj[0] - a[0], proj[1] - a[1], proj[2] - a[2]};
+    
+    float dot00 = e1[0]*e1[0] + e1[1]*e1[1] + e1[2]*e1[2];
+    float dot01 = e1[0]*e2[0] + e1[1]*e2[1] + e1[2]*e2[2];
+    float dot02 = e1[0]*v0[0] + e1[1]*v0[1] + e1[2]*v0[2];
+    float dot11 = e2[0]*e2[0] + e2[1]*e2[1] + e2[2]*e2[2];
+    float dot12 = e2[0]*v0[0] + e2[1]*v0[1] + e2[2]*v0[2];
+    
+    float inv_denom = 1.0f / (dot00 * dot11 - dot01 * dot01);
+    float u = (dot11 * dot02 - dot01 * dot12) * inv_denom;
+    float v = (dot00 * dot12 - dot01 * dot02) * inv_denom;
+    
+    // Check if point is inside triangle
+    if (u < 0.0f || v < 0.0f || (u + v) > 1.0f) return 0;
+    
+    // Collision detected - compute penetration
+    float penetration = node->radius - fabsf(dist_to_plane);
+    if (penetration <= 0.0f) return 0;
+    
+    // Set outputs
+    if (out_penetration) *out_penetration = penetration;
+    if (out_normal) {
+        // Normal points away from triangle toward node
+        if (dist_to_plane < 0.0f) {
+            out_normal[0] = -normal[0];
+            out_normal[1] = -normal[1];
+            out_normal[2] = -normal[2];
+        } else {
+            out_normal[0] = normal[0];
+            out_normal[1] = normal[1];
+            out_normal[2] = normal[2];
+        }
+    }
+    if (out_u) *out_u = u;
+    if (out_v) *out_v = v;
+    
+    return 1;
+}
+
+
+
+// Compute collision forces using octree acceleration structure
+static void compute_triangle_collision_forces(Simulator *s, float *collision_forces, float sub_dt) {
+    if (!s || !collision_forces) return;
+    const float PENETRATION_STIFFNESS = 500.0f;
+    const float NORMAL_DAMP_K = 100.0f;
+    const float Kt = 150.0f;
+    
+    size_t n_nodes = dynarray_size(s->nodes);
+    size_t n_walls = dynarray_size(s->walls);
+    if (n_nodes == 0 || n_walls == 0) return;
+    
+    // --- Build/Refit BVHs if needed (for now, rebuild every frame) ---
+    if (s->triangle_bvh) triangle_bvh_free(s->triangle_bvh);
+    s->triangle_bvh = triangle_bvh_build(s->walls);
+    if (s->edge_bvh) edge_bvh_free(s->edge_bvh);
+    // Collect all triangle edges into a DynArray
+    DynArray *edges = dynarray_create(n_walls * 3);
+    for (size_t wi = 0; wi < n_walls; ++wi) {
+        TriangleWall *w = (TriangleWall*)dynarray_get(s->walls, wi);
+        if (!w) continue;
+        for (int ei = 0; ei < 3; ++ei) {
+            Constraint *edge = w->edges[ei];
+            if (edge) dynarray_append(edges, edge);
+        }
+    }
+    s->edge_bvh = edge_bvh_build(edges, 0.03f); // TODO: use actual edge radius
+
+    // --- Node→Triangle broadphase using TriangleBVH ---
+    for (size_t ni = 0; ni < n_nodes; ++ni) {
+        Node *node = (Node*)dynarray_get(s->nodes, ni);
+        if (!node) continue;
+        if (node->anchored && !node->collide_when_anchored) continue;
+        if (!node->collide_with_walls) continue;
+        // Build a small AABB around node (sphere AABB)
+        AABB node_box;
+        for (int d = 0; d < 3; ++d) {
+            node_box.min[d] = node->pos[d] - node->radius;
+            node_box.max[d] = node->pos[d] + node->radius;
+        }
+        DynArray *candidates = dynarray_create(8);
+        triangle_bvh_query(s->triangle_bvh, &node_box, candidates);
+        // printf("Node %zu: found %zu candidate triangles\n", ni, dynarray_size(candidates));
+        for (size_t ci = 0; ci < dynarray_size(candidates); ++ci) {
+            int tri_idx = *(int*)dynarray_get(candidates, ci);
+            if (tri_idx < 0 || (size_t)tri_idx >= n_walls) continue;
+            TriangleWall *w = (TriangleWall*)dynarray_get(s->walls, tri_idx);
+            if (!w) continue;
+            float penetration, normal[3], u, v;
+            if (triangle_check_collision(w, node, &penetration, normal, &u, &v)) {
+                // Compute separation force
+                float sep_force[3] = {
+                    normal[0] * penetration * PENETRATION_STIFFNESS,
+                    normal[1] * penetration * PENETRATION_STIFFNESS,
+                    normal[2] * penetration * PENETRATION_STIFFNESS
+                };
+                float wall_vel[3] = {0, 0, 0};
+                if (!w->A->anchored) {
+                    wall_vel[0] += (1.0f - u - v) * w->A->vel[0];
+                    wall_vel[1] += (1.0f - u - v) * w->A->vel[1];
+                    wall_vel[2] += (1.0f - u - v) * w->A->vel[2];
+                }
+                if (!w->B->anchored) {
+                    wall_vel[0] += u * w->B->vel[0];
+                    wall_vel[1] += u * w->B->vel[1];
+                    wall_vel[2] += u * w->B->vel[2];
+                }
+                if (!w->C->anchored) {
+                    wall_vel[0] += v * w->C->vel[0];
+                    wall_vel[1] += v * w->C->vel[1];
+                    wall_vel[2] += v * w->C->vel[2];
+                }
+                float rel_vel[3] = {
+                    node->vel[0] - wall_vel[0],
+                    node->vel[1] - wall_vel[1],
+                    node->vel[2] - wall_vel[2]
+                };
+                float normal_vel = rel_vel[0]*normal[0] + rel_vel[1]*normal[1] + rel_vel[2]*normal[2];
+                if (normal_vel < 0.0f) {
+                    sep_force[0] -= normal[0] * normal_vel * NORMAL_DAMP_K;
+                    sep_force[1] -= normal[1] * normal_vel * NORMAL_DAMP_K;
+                    sep_force[2] -= normal[2] * normal_vel * NORMAL_DAMP_K;
+                }
+                float tangent[3] = {
+                    rel_vel[0] - normal[0] * normal_vel,
+                    rel_vel[1] - normal[1] * normal_vel,
+                    rel_vel[2] - normal[2] * normal_vel
+                };
+                float tangent_len = sqrtf(tangent[0]*tangent[0] + tangent[1]*tangent[1] + tangent[2]*tangent[2]);
+                if (tangent_len > 1e-9f) {
+                    float sep_mag = sqrtf(sep_force[0]*sep_force[0] + sep_force[1]*sep_force[1] + sep_force[2]*sep_force[2]);
+                    float max_fric = node->friction * sep_mag;
+                    float fric_mag = fminf(Kt * tangent_len, max_fric);
+                    float fric_force[3] = {
+                        -(tangent[0] / tangent_len) * fric_mag,
+                        -(tangent[1] / tangent_len) * fric_mag,
+                        -(tangent[2] / tangent_len) * fric_mag
+                    };
+                    sep_force[0] += fric_force[0];
+                    sep_force[1] += fric_force[1];
+                    sep_force[2] += fric_force[2];
+                }
+                collision_forces[3*ni + 0] += sep_force[0];
+                collision_forces[3*ni + 1] += sep_force[1];
+                collision_forces[3*ni + 2] += sep_force[2];
+                if (!w->A->anchored) {
+                    float weight_a = 1.0f - u - v;
+                    collision_forces[3*w->A->idx + 0] -= sep_force[0] * weight_a;
+                    collision_forces[3*w->A->idx + 1] -= sep_force[1] * weight_a;
+                    collision_forces[3*w->A->idx + 2] -= sep_force[2] * weight_a;
+                }
+                if (!w->B->anchored) {
+                    collision_forces[3*w->B->idx + 0] -= sep_force[0] * u;
+                    collision_forces[3*w->B->idx + 1] -= sep_force[1] * u;
+                    collision_forces[3*w->B->idx + 2] -= sep_force[2] * u;
+                }
+                if (!w->C->anchored) {
+                    collision_forces[3*w->C->idx + 0] -= sep_force[0] * v;
+                    collision_forces[3*w->C->idx + 1] -= sep_force[1] * v;
+                    collision_forces[3*w->C->idx + 2] -= sep_force[2] * v;
+                }
+            }
+        }
+        dynarray_free(candidates, free);
+    }
+
+    
+        EdgeEdgeContext ctx = { edges, collision_forces, sub_dt };
+    edge_bvh_self_traverse(s->edge_bvh, edge_edge_callback, &ctx);
+    dynarray_free(edges, NULL);
+}
+
+
+/* --------------------------------------------------------------------------
+ * gpu_debug_compare: read back GPU J/b/A/l, solve CG on CPU, compare.
+ * Called once per simulator_gpu_step (sub==0) when ctx->gpu_debug is set.
+ * -------------------------------------------------------------------------- */
+static void gpu_debug_compare(GPUContext *ctx, Simulator *s, float sub_dt) {
+    int m = ctx->m_sparse;
+    if (m <= 0) return;
+    fprintf(stderr, "[GPU_DEBUG] sub_dt=%.6f  m_sparse=%d  m_total=%d\n",
+            sub_dt, m, ctx->m_total);
+
+    /* Read GPU b and l vectors */
+    float *b_gpu = (float*)malloc(sizeof(float) * (size_t)m);
+    float *l_gpu = (float*)malloc(sizeof(float) * (size_t)m);
+    float *A_gpu = (float*)malloc(sizeof(float) * (size_t)m * (size_t)m);
+    if (!b_gpu || !l_gpu || !A_gpu) {
+        free(b_gpu); free(l_gpu); free(A_gpu);
+        fprintf(stderr, "[GPU_DEBUG] alloc failed\n");
+        return;
+    }
+
+    glBindBuffer(GL_SHADER_STORAGE_BUFFER, ctx->ssbo_b_vec);
+    glGetBufferSubData(GL_SHADER_STORAGE_BUFFER, 0, sizeof(float)*(size_t)m, b_gpu);
+    glBindBuffer(GL_SHADER_STORAGE_BUFFER, ctx->ssbo_l_vec);
+    glGetBufferSubData(GL_SHADER_STORAGE_BUFFER, 0, sizeof(float)*(size_t)m, l_gpu);
+    glBindBuffer(GL_SHADER_STORAGE_BUFFER, ctx->ssbo_A_dense);
+    glGetBufferSubData(GL_SHADER_STORAGE_BUFFER, 0, sizeof(float)*(size_t)m*(size_t)m, A_gpu);
+
+    /* CPU CG solve using the same A and b from GPU readback */
+    float *l_cpu = (float*)calloc((size_t)m, sizeof(float));
+    float *r     = (float*)malloc(sizeof(float) * (size_t)m);
+    float *p     = (float*)malloc(sizeof(float) * (size_t)m);
+    float *Ap    = (float*)malloc(sizeof(float) * (size_t)m);
+    if (l_cpu && r && p && Ap) {
+        for (int i = 0; i < m; i++) { r[i] = b_gpu[i]; p[i] = r[i]; }
+        float rsold = 0.0f;
+        for (int i = 0; i < m; i++) rsold += r[i]*r[i];
+
+        for (int iter = 0; iter < 200 && rsold > 1e-20f; iter++) {
+            for (int i = 0; i < m; i++) {
+                Ap[i] = 0.0f;
+                for (int j = 0; j < m; j++) Ap[i] += A_gpu[i*m+j] * p[j];
+            }
+            float pAp = 0.0f;
+            for (int i = 0; i < m; i++) pAp += p[i]*Ap[i];
+            if (fabsf(pAp) < 1e-30f) break;
+            float alpha = rsold / pAp;
+            float rsnew = 0.0f;
+            for (int i = 0; i < m; i++) {
+                l_cpu[i] += alpha * p[i];
+                r[i]     -= alpha * Ap[i];
+                rsnew    += r[i]*r[i];
+            }
+            if (rsnew < 1e-20f) break;
+            float beta = rsnew / rsold;
+            for (int i = 0; i < m; i++) p[i] = r[i] + beta*p[i];
+            rsold = rsnew;
+        }
+
+        int print_n = (m < 10) ? m : 10;
+        fprintf(stderr, "[GPU_DEBUG]  idx |    b_gpu    |   l_gpu   |   l_cpu\n");
+        fprintf(stderr, "[GPU_DEBUG] -----+-------------+-----------+----------\n");
+        for (int i = 0; i < print_n; i++) {
+            fprintf(stderr, "[GPU_DEBUG]  %3d | %11.6f | %9.6f | %9.6f\n",
+                    i, b_gpu[i], l_gpu[i], l_cpu[i]);
+        }
+        fprintf(stderr, "[GPU_DEBUG] A diag: ");
+        int diag_n = (m < 5) ? m : 5;
+        for (int i = 0; i < diag_n; i++) fprintf(stderr, "%.4f ", A_gpu[i*m+i]);
+        fprintf(stderr, "\n");
+    }
+
+    free(b_gpu); free(l_gpu); free(A_gpu);
+    free(l_cpu); free(r); free(p); free(Ap);
+}
+
+/* --------------------------------------------------------------------------
+ * simulator_gpu_step: full N-substep GPU pipeline.
+ *   For each substep:
+ *     0. CPU collision → ssbo_collision
+ *     1. ext_forces shader   (gravity + springs)
+ *     2. build_j shader      (Jacobian rows)
+ *     3. build_b shader      (RHS b = -err)
+ *     4. build_A shader      (dense A = dt² J M⁻¹ Jᵀ)
+ *     5. cg_solve shader     (A λ = b, single workgroup)
+ *     6. [optional debug]
+ *     7. apply_corr shader   (corr_f + symplectic Euler integrate)
+ *   Then readback positions/velocities to CPU Node structs.
+ * -------------------------------------------------------------------------- */
+void simulator_gpu_step(Simulator *s) {
+    if (!s || !s->gpu_ctx) return;
+    GPUContext *ctx = (GPUContext*)s->gpu_ctx;
+
+    /* Validate all shaders compiled */
+    if (!ctx->prog_ext_forces || !ctx->prog_build_j || !ctx->prog_build_b ||
+        !ctx->prog_build_A    || !ctx->prog_cg_solve || !ctx->prog_apply_corr) {
+        fprintf(stderr, "[GPU] One or more compute programs not compiled — cannot step\n");
+        return;
+    }
+
+    int n       = ctx->node_count;
+    int m       = ctx->m_sparse;
+    int m_total = ctx->m_total;
+    if (n <= 0) return;
+    if (m > 512) {
+        fprintf(stderr, "[GPU] m_sparse=%d exceeds single-workgroup CG limit (512)\n", m);
+        return;
+    }
+
+    int   N      = (s->solver_iters > 0) ? s->solver_iters : 1;
+    float sub_dt = s->dt / (float)N;
+
+    /* -- Bind all 17 SSBOs once (never change within a frame) -- */
+    glBindBufferBase(GL_SHADER_STORAGE_BUFFER,  0, ctx->ssbo_positions);
+    glBindBufferBase(GL_SHADER_STORAGE_BUFFER,  1, ctx->ssbo_velocities);
+    glBindBufferBase(GL_SHADER_STORAGE_BUFFER,  2, ctx->ssbo_inv_mass);
+    glBindBufferBase(GL_SHADER_STORAGE_BUFFER,  3, ctx->ssbo_ext_forces);
+    glBindBufferBase(GL_SHADER_STORAGE_BUFFER,  4, ctx->ssbo_node_flags);
+    glBindBufferBase(GL_SHADER_STORAGE_BUFFER,  5, ctx->ssbo_constraints);
+    glBindBufferBase(GL_SHADER_STORAGE_BUFFER,  6, ctx->ssbo_J_cols);
+    glBindBufferBase(GL_SHADER_STORAGE_BUFFER,  7, ctx->ssbo_J_vals);
+    glBindBufferBase(GL_SHADER_STORAGE_BUFFER,  8, ctx->ssbo_A_dense);
+    glBindBufferBase(GL_SHADER_STORAGE_BUFFER,  9, ctx->ssbo_b_vec);
+    glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 10, ctx->ssbo_l_vec);
+    glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 11, ctx->ssbo_collision);
+    glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 12, ctx->ssbo_r_vec);
+    glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 13, ctx->ssbo_p_vec);
+    glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 14, ctx->ssbo_Ap_vec);
+    glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 15, ctx->ssbo_bvh_nodes);
+    glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 16, ctx->ssbo_triangles);
+    glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 17, ctx->ssbo_wall_indices);
+    glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 18, ctx->ssbo_velcorr);
+
+    /* -- Set all uniforms once (constant across substeps) -- */
+    int ng = (n + 63) / 64;
+    int mg = (m > 0) ? (m + 63) / 64 : 0;
+    int wg = (m > 0) ? (m + 7)  / 8  : 0;
+
+    if (ctx->prog_collision && ctx->n_triangles > 0) {
+        glUseProgram(ctx->prog_collision);
+        glUniform1i(ctx->u_col_n,         n);
+        glUniform1i(ctx->u_col_n_tris,    ctx->n_triangles);
+        glUniform1f(ctx->u_col_stiffness, 500.0f);
+        glUniform1f(ctx->u_col_damp,      100.0f);
+        glUniform1f(ctx->u_col_fr,          0.4f);  /* μ kinetic: 0=frictionless, 1=very grippy */
+    }
+
+    if (ctx->prog_edge_edge && m_total > 0) {
+        glUseProgram(ctx->prog_edge_edge);
+        glUniform1i(ctx->u_ee_n,           n);
+        glUniform1i(ctx->u_ee_m_total,     m_total);
+        glUniform1f(ctx->u_ee_restitution, 0.05f);
+        glUniform1f(ctx->u_ee_mu,          0.3f);
+    }
+
+    glUseProgram(ctx->prog_ext_forces);
+    glUniform1i(ctx->u_ef_n,        n);
+    glUniform1i(ctx->u_ef_m_sparse, m);
+    glUniform1i(ctx->u_ef_m_total,  m_total);
+    glUniform3f(ctx->u_ef_gravity,  s->gravity[0], s->gravity[1], s->gravity[2]);
+
+    if (m > 0) {
+        glUseProgram(ctx->prog_build_j);
+        glUniform1i(ctx->u_bj_m, m);
+
+        glUseProgram(ctx->prog_build_b);
+        glUniform1i(ctx->u_bb_m, m);
+
+        glUseProgram(ctx->prog_build_A);
+        glUniform1i(ctx->u_ba_m,  m);
+        glUniform1f(ctx->u_ba_dt, sub_dt);
+
+        glUseProgram(ctx->prog_cg_solve);
+        glUniform1i(ctx->u_cg_m,        m);
+        glUniform1i(ctx->u_cg_max_iter, 200);
+        glUniform1f(ctx->u_cg_tol,      1e-12f);
+
+        glUseProgram(ctx->prog_apply_corr);
+        glUniform1i(ctx->u_ac_n,      n);
+        glUniform1i(ctx->u_ac_m,      m);
+        glUniform1f(ctx->u_ac_dt,     s->dt);
+        glUniform1f(ctx->u_ac_sub_dt, sub_dt);
+        glUniform1i(ctx->u_ac_N,      N);
+    }
+
+    for (int sub = 0; sub < N; sub++) {
+
+        /* -- edge-edge capsule collision: writes velocity impulses to velcorr (binding 18) -- */
+        if (ctx->prog_edge_edge && m_total > 0) {
+            int ee_groups = (m_total * m_total + 63) / 64;
+            glUseProgram(ctx->prog_edge_edge);
+            glDispatchCompute((GLuint)ee_groups, 1, 1);
+            /* no barrier yet — apply_corr reads velcorr at the end of the substep */
+        }
+
+        /* -- 0+1. GPU BVH collision + ext_forces (independent → one barrier) -- */
+        if (ctx->prog_collision && ctx->n_triangles > 0) {
+            glUseProgram(ctx->prog_collision);
+            glDispatchCompute((GLuint)ng, 1, 1);
+        }
+        glUseProgram(ctx->prog_ext_forces);
+        glDispatchCompute((GLuint)ng, 1, 1);
+        glMemoryBarrier(GL_SHADER_STORAGE_BARRIER_BIT);  /* covers both 0 and 1 */
+
+        if (m > 0) {
+            /* -- 2. Build J -- */
+            glUseProgram(ctx->prog_build_j);
+            glDispatchCompute((GLuint)mg, 1, 1);
+            glMemoryBarrier(GL_SHADER_STORAGE_BARRIER_BIT);
+
+            /* -- 3. Build b -- */
+            glUseProgram(ctx->prog_build_b);
+            glDispatchCompute((GLuint)mg, 1, 1);
+            glMemoryBarrier(GL_SHADER_STORAGE_BARRIER_BIT);
+
+            /* -- 4. Build A -- */
+            glUseProgram(ctx->prog_build_A);
+            glDispatchCompute((GLuint)wg, (GLuint)wg, 1);
+            glMemoryBarrier(GL_SHADER_STORAGE_BARRIER_BIT);
+
+            /* -- 5. CG solve -- */
+            glUseProgram(ctx->prog_cg_solve);
+            glDispatchCompute(1, 1, 1);
+            glMemoryBarrier(GL_SHADER_STORAGE_BARRIER_BIT);
+
+            /* -- 6. Optional debug comparison (first substep only) -- */
+            if (ctx->gpu_debug && sub == 0) {
+                gpu_debug_compare(ctx, s, sub_dt);
+            }
+
+            /* -- 7. Apply corrections + integrate -- */
+            glUseProgram(ctx->prog_apply_corr);
+            glDispatchCompute((GLuint)ng, 1, 1);
+            glMemoryBarrier(GL_SHADER_STORAGE_BARRIER_BIT);
+        }
+
+    } /* end substep loop */
 }
 
 // // Incremental octree rebuild: only update dirty nodes
@@ -271,438 +1607,20 @@ void simulator_add_wall(Simulator *s, TriangleWall *w) {
     dynarray_append(s->walls, w);
 }
 
-// Helper: check collision between triangle wall and node (3D point-triangle collision)
-// Returns 1 if collision detected, fills out_penetration, out_normal[3], and barycentric coords
-static int triangle_check_collision(TriangleWall *w, Node *node, 
-                                    float *out_penetration, float out_normal[3],
-                                    float *out_u, float *out_v) {
-    // Get triangle vertices
-    float *a = w->A->pos;
-    float *b = w->B->pos;
-    float *c = w->C->pos;
-    float *p = node->pos;
-    
-    // Compute triangle edges
-    float e1[3] = {b[0] - a[0], b[1] - a[1], b[2] - a[2]};
-    float e2[3] = {c[0] - a[0], c[1] - a[1], c[2] - a[2]};
-    
-    // Compute triangle normal via cross product
-    float normal[3] = {
-        e1[1]*e2[2] - e1[2]*e2[1],
-        e1[2]*e2[0] - e1[0]*e2[2],
-        e1[0]*e2[1] - e1[1]*e2[0]
-    };
-    float normal_len = sqrtf(normal[0]*normal[0] + normal[1]*normal[1] + normal[2]*normal[2]);
-    if (normal_len < 1e-9f) return 0; // degenerate triangle
-    normal[0] /= normal_len; normal[1] /= normal_len; normal[2] /= normal_len;
-    
-    // Project point onto triangle plane
-    float ap[3] = {p[0] - a[0], p[1] - a[1], p[2] - a[2]};
-    float dist_to_plane = ap[0]*normal[0] + ap[1]*normal[1] + ap[2]*normal[2];
-    
-    // Check if point is within radius distance from plane
-    if (fabsf(dist_to_plane) > node->radius) return 0;
-    
-    // Project point onto plane
-    float proj[3] = {
-        p[0] - normal[0] * dist_to_plane,
-        p[1] - normal[1] * dist_to_plane,
-        p[2] - normal[2] * dist_to_plane
-    };
-    
-    // Compute barycentric coordinates of projected point
-    // Using method: solve [e1 e2] * [u v]^T = proj - a
-    float v0[3] = {proj[0] - a[0], proj[1] - a[1], proj[2] - a[2]};
-    
-    float dot00 = e1[0]*e1[0] + e1[1]*e1[1] + e1[2]*e1[2];
-    float dot01 = e1[0]*e2[0] + e1[1]*e2[1] + e1[2]*e2[2];
-    float dot02 = e1[0]*v0[0] + e1[1]*v0[1] + e1[2]*v0[2];
-    float dot11 = e2[0]*e2[0] + e2[1]*e2[1] + e2[2]*e2[2];
-    float dot12 = e2[0]*v0[0] + e2[1]*v0[1] + e2[2]*v0[2];
-    
-    float inv_denom = 1.0f / (dot00 * dot11 - dot01 * dot01);
-    float u = (dot11 * dot02 - dot01 * dot12) * inv_denom;
-    float v = (dot00 * dot12 - dot01 * dot02) * inv_denom;
-    
-    // Check if point is inside triangle
-    if (u < 0.0f || v < 0.0f || (u + v) > 1.0f) return 0;
-    
-    // Collision detected - compute penetration
-    float penetration = node->radius - fabsf(dist_to_plane);
-    if (penetration <= 0.0f) return 0;
-    
-    // Set outputs
-    if (out_penetration) *out_penetration = penetration;
-    if (out_normal) {
-        // Normal points away from triangle toward node
-        if (dist_to_plane < 0.0f) {
-            out_normal[0] = -normal[0];
-            out_normal[1] = -normal[1];
-            out_normal[2] = -normal[2];
-        } else {
-            out_normal[0] = normal[0];
-            out_normal[1] = normal[1];
-            out_normal[2] = normal[2];
-        }
-    }
-    if (out_u) *out_u = u;
-    if (out_v) *out_v = v;
-    
-    return 1;
-}
 
 
 
-// Check collision between two distance constraints (modeled as cylinders)
-// Returns 1 if collision detected, fills out_penetration, out_normal[3], and closest points on each segment
-static int constraint_constraint_collision(
-    Node *a0, Node *a1, // endpoints of first constraint
-    Node *b0, Node *b1, // endpoints of second constraint
-    float *out_penetration, float out_normal[3],
-    float out_pa[3], float out_pb[3] // closest points on each segment
-) {
-    // Compute segment vectors and lengths
-    float A[3] = {a0->pos[0], a0->pos[1], a0->pos[2]};
-    float B[3] = {a1->pos[0], a1->pos[1], a1->pos[2]};
-    float C[3] = {b0->pos[0], b0->pos[1], b0->pos[2]};
-    float D[3] = {b1->pos[0], b1->pos[1], b1->pos[2]};
-    float u[3] = {B[0]-A[0], B[1]-A[1], B[2]-A[2]};
-    float v[3] = {D[0]-C[0], D[1]-C[1], D[2]-C[2]};
-    float w[3] = {A[0]-C[0], A[1]-C[1], A[2]-C[2]};
-    float len_u = sqrtf(u[0]*u[0] + u[1]*u[1] + u[2]*u[2]);
-    float len_v = sqrtf(v[0]*v[0] + v[1]*v[1] + v[2]*v[2]);
-    if (len_u < 1e-8f || len_v < 1e-8f) return 0; // degenerate
-
-    float ru = 0.01f * len_u;
-    float rv = 0.01f * len_v;
-
-    // Compute closest points between segments (see Real-Time Collision Detection, Christer Ericson)
-    float a = u[0]*u[0] + u[1]*u[1] + u[2]*u[2];
-    float b = u[0]*v[0] + u[1]*v[1] + u[2]*v[2];
-    float c = v[0]*v[0] + v[1]*v[1] + v[2]*v[2];
-    float d = u[0]*w[0] + u[1]*w[1] + u[2]*w[2];
-    float e = v[0]*w[0] + v[1]*w[1] + v[2]*w[2];
-    float D_ = a*c - b*b;
-    float sc, sN, sD = D_;
-    float tc, tN, tD = D_;
-
-    // Default sN = D_, tN = D_
-    if (D_ < 1e-8f) {
-        sN = 0.0f;
-        sD = 1.0f;
-        tN = e;
-        tD = c;
-    } else {
-        sN = (b*e - c*d);
-        tN = (a*e - b*d);
-        if (sN < 0.0f) { sN = 0.0f; tN = e; tD = c; }
-        else if (sN > sD) { sN = sD; tN = e + b; tD = c; }
-    }
-    if (tN < 0.0f) { tN = 0.0f;
-        if (-d < 0.0f) sN = 0.0f;
-        else if (-d > a) sN = sD;
-        else { sN = -d; sD = a; }
-    } else if (tN > tD) { tN = tD;
-        if ((-d + b) < 0.0f) sN = 0.0f;
-        else if ((-d + b) > a) sN = sD;
-        else { sN = (-d + b); sD = a; }
-    }
-    sc = (fabsf(sN) < 1e-8f ? 0.0f : sN / sD);
-    tc = (fabsf(tN) < 1e-8f ? 0.0f : tN / tD);
-
-    // Closest points
-    float pa[3] = {A[0] + sc * u[0], A[1] + sc * u[1], A[2] + sc * u[2]};
-    float pb[3] = {C[0] + tc * v[0], C[1] + tc * v[1], C[2] + tc * v[2]};
-    float dx = pa[0] - pb[0], dy = pa[1] - pb[1], dz = pa[2] - pb[2];
-    float dist = sqrtf(dx*dx + dy*dy + dz*dz);
-
-    float min_dist = ru + rv;
-    if (dist < min_dist) {
-        if (out_penetration) *out_penetration = min_dist - dist;
-        if (out_normal) {
-            float nlen = sqrtf(dx*dx + dy*dy + dz*dz);
-            if (nlen > 1e-8f) {
-                out_normal[0] = dx / nlen;
-                out_normal[1] = dy / nlen;
-                out_normal[2] = dz / nlen;
-            } else {
-                out_normal[0] = 1.0f; out_normal[1] = 0.0f; out_normal[2] = 0.0f;
-            }
-        }
-        if (out_pa) { out_pa[0] = pa[0]; out_pa[1] = pa[1]; out_pa[2] = pa[2]; }
-        if (out_pb) { out_pb[0] = pb[0]; out_pb[1] = pb[1]; out_pb[2] = pb[2]; }
-        return 1;
-    }
-    return 0;
-}
-
-// --- Edge-Edge Collision Detection and Resolution using EdgeBVH self-traversal ---
-typedef struct {
-    DynArray *edges;
-    float *collision_forces;
-    float sub_dt;
-} EdgeEdgeContext;
-
-void edge_edge_callback(int idxA, int idxB, void *userdata) {
-    float DAMP_K = 200.0f;
-    float PENETRATION_STIFFNESS = 500.0f;
-
-    EdgeEdgeContext *ctx = (EdgeEdgeContext*)userdata;
-    DynArray *edges = ctx->edges;
-    float *collision_forces = ctx->collision_forces;
-    Constraint *edgeA = (Constraint*)dynarray_get(edges, idxA);
-    Constraint *edgeB = (Constraint*)dynarray_get(edges, idxB);
-    if (!edgeA || !edgeB || !edgeA->node || !edgeA->other || !edgeB->node || !edgeB->other) return;
-    // Skip if constraints share a node as an endpoint
-    if (edgeA->node == edgeB->node || edgeA->node == edgeB->other ||
-        edgeA->other == edgeB->node || edgeA->other == edgeB->other) return;
-    // Only check distance constraints
-    if (edgeA->type != CT_DIST || edgeB->type != CT_DIST) return;
-
-    float penetration, normal[3], pa[3], pb[3];
-    if (!constraint_constraint_collision(edgeA->node, edgeA->other, edgeB->node, edgeB->other, &penetration, normal, pa, pb)) {
-        return;
-    }
-
-    // Compute barycentric-like weights along each edge for velocity interpolation
-    float dA0 = sqrtf((pa[0]-edgeA->node->pos[0])*(pa[0]-edgeA->node->pos[0]) +
-                      (pa[1]-edgeA->node->pos[1])*(pa[1]-edgeA->node->pos[1]) +
-                      (pa[2]-edgeA->node->pos[2])*(pa[2]-edgeA->node->pos[2]));
-    float dA1 = sqrtf((pa[0]-edgeA->other->pos[0])*(pa[0]-edgeA->other->pos[0]) +
-                      (pa[1]-edgeA->other->pos[1])*(pa[1]-edgeA->other->pos[1]) +
-                      (pa[2]-edgeA->other->pos[2])*(pa[2]-edgeA->other->pos[2]));
-    float lenA = dA0 + dA1;
-    float wA0 = (lenA > 1e-8f) ? (dA1 / lenA) : 0.5f;
-    float wA1 = (lenA > 1e-8f) ? (dA0 / lenA) : 0.5f;
-
-    float dB0 = sqrtf((pb[0]-edgeB->node->pos[0])*(pb[0]-edgeB->node->pos[0]) +
-                      (pb[1]-edgeB->node->pos[1])*(pb[1]-edgeB->node->pos[1]) +
-                      (pb[2]-edgeB->node->pos[2])*(pb[2]-edgeB->node->pos[2]));
-    float dB1 = sqrtf((pb[0]-edgeB->other->pos[0])*(pb[0]-edgeB->other->pos[0]) +
-                      (pb[1]-edgeB->other->pos[1])*(pb[1]-edgeB->other->pos[1]) +
-                      (pb[2]-edgeB->other->pos[2])*(pb[2]-edgeB->other->pos[2]));
-    float lenB = dB0 + dB1;
-    float wB0 = (lenB > 1e-8f) ? (dB1 / lenB) : 0.5f;
-    float wB1 = (lenB > 1e-8f) ? (dB0 / lenB) : 0.5f;
-
-    // printf("Edge-Edge Collision: idxA=%d idxB=%d\n", idxA, idxB);
-    // printf("  Penetration: %.4f\n", penetration);
-    // printf("  Normal: [%.4f %.4f %.4f]\n", normal[0], normal[1], normal[2]);
-    // printf("  Closest points: pa=[%.4f %.4f %.4f], pb=[%.4f %.4f %.4f]\n", pa[0], pa[1], pa[2], pb[0], pb[1], pb[2]);
-
-    // Interpolated velocities at contact points
-    float va[3], vb[3];
-    for (int i = 0; i < 3; ++i) {
-        va[i] = edgeA->node->vel[i] * wA0 + edgeA->other->vel[i] * wA1;
-        vb[i] = edgeB->node->vel[i] * wB0 + edgeB->other->vel[i] * wB1;
-    }
-
-    float rel_vel[3] = { va[0] - vb[0], va[1] - vb[1], va[2] - vb[2] };
-    float normal_vel = rel_vel[0]*normal[0] + rel_vel[1]*normal[1] + rel_vel[2]*normal[2];
-    // printf("  Relative velocity: [%.4f %.4f %.4f], normal_vel=%.4f\n", rel_vel[0], rel_vel[1], rel_vel[2], normal_vel);
-
-    // Impulse-based resolution to avoid tunneling: compute effective inverse-mass
-    float inv_mA0 = (edgeA->node->anchored || edgeA->node->sim_ignore) ? 0.0f : 1.0f / fmaxf(edgeA->node->mass, 1e-9f);
-    float inv_mA1 = (edgeA->other->anchored || edgeA->other->sim_ignore) ? 0.0f : 1.0f / fmaxf(edgeA->other->mass, 1e-9f);
-    float inv_mB0 = (edgeB->node->anchored || edgeB->node->sim_ignore) ? 0.0f : 1.0f / fmaxf(edgeB->node->mass, 1e-9f);
-    float inv_mB1 = (edgeB->other->anchored || edgeB->other->sim_ignore) ? 0.0f : 1.0f / fmaxf(edgeB->other->mass, 1e-9f);
-
-    float weff = wA0*wA0*inv_mA0 + wA1*wA1*inv_mA1 + wB0*wB0*inv_mB0 + wB1*wB1*inv_mB1;
-    if (weff <= 1e-12f) return;
-
-    // Only resolve contacts that are closing (negative relative normal velocity)
-    // Note: earlier code used normal_vel positive for closing; flip sign accordingly
-    if (normal_vel >= 0.0f) return;
-
-    float restitution = 0.05f; // small restitution to avoid bounciness
-    float J = -(1.0f + restitution) * normal_vel / weff;
-    // clamp impulse magnitude to avoid extreme corrections
-    float maxJ = 1e4f;
-    if (J > maxJ) J = maxJ;
-
-    // Tangential (Coulomb) friction impulse
-    float rel_t[3] = {
-        rel_vel[0] - normal_vel * normal[0],
-        rel_vel[1] - normal_vel * normal[1],
-        rel_vel[2] - normal_vel * normal[2]
-    };
-    float t_len = sqrtf(rel_t[0]*rel_t[0] + rel_t[1]*rel_t[1] + rel_t[2]*rel_t[2]);
-    float jt = 0.0f;
-    float t_dir[3] = {0.0f, 0.0f, 0.0f};
-    if (t_len > 1e-9f) {
-        t_dir[0] = rel_t[0] / t_len;
-        t_dir[1] = rel_t[1] / t_len;
-        t_dir[2] = rel_t[2] / t_len;
-        // desired tangential impulse to remove relative tangential velocity
-        jt = -(rel_vel[0]*t_dir[0] + rel_vel[1]*t_dir[1] + rel_vel[2]*t_dir[2]) / weff;
-    }
-
-    // friction coefficient: average of involved node frictions (fallback 0.5)
-    float mu_sum = 0.0f; int mu_count = 0;
-    if (edgeA->node) { mu_sum += edgeA->node->friction; mu_count++; }
-    if (edgeA->other) { mu_sum += edgeA->other->friction; mu_count++; }
-    if (edgeB->node) { mu_sum += edgeB->node->friction; mu_count++; }
-    if (edgeB->other) { mu_sum += edgeB->other->friction; mu_count++; }
-    float mu = (mu_count > 0) ? (mu_sum / (float)mu_count) : 0.5f;
-
-    // clamp tangential impulse by Coulomb: |jt| <= mu * J
-    float jmax = fabsf(mu * J);
-    if (jt > jmax) jt = jmax;
-    if (jt < -jmax) jt = -jmax;
-
-    // printf("  Impulse J=%.6f jt=%.6f weff=%.6e mu=%.3f\n", J, jt, weff, mu);
-
-    // Apply velocity impulse (normal + tangential) distributed to nodes
-    if (inv_mA0 > 0.0f) {
-        for (int k = 0; k < 3; ++k) edgeA->node->vel[k] += (J * wA0 * inv_mA0) * normal[k] + (jt * wA0 * inv_mA0) * t_dir[k];
-    }
-    if (inv_mA1 > 0.0f) {
-        for (int k = 0; k < 3; ++k) edgeA->other->vel[k] += (J * wA1 * inv_mA1) * normal[k] + (jt * wA1 * inv_mA1) * t_dir[k];
-    }
-    if (inv_mB0 > 0.0f) {
-        for (int k = 0; k < 3; ++k) edgeB->node->vel[k] -= (J * wB0 * inv_mB0) * normal[k] + (jt * wB0 * inv_mB0) * t_dir[k];
-    }
-    if (inv_mB1 > 0.0f) {
-        for (int k = 0; k < 3; ++k) edgeB->other->vel[k] -= (J * wB1 * inv_mB1) * normal[k] + (jt * wB1 * inv_mB1) * t_dir[k];
-    }
-}
-
-// Compute collision forces using octree acceleration structure
-static void compute_triangle_collision_forces(Simulator *s, float *collision_forces, float sub_dt) {
-    if (!s || !collision_forces) return;
-    const float PENETRATION_STIFFNESS = 500.0f;
-    const float NORMAL_DAMP_K = 100.0f;
-    const float Kt = 150.0f;
-    
-    size_t n_nodes = dynarray_size(s->nodes);
-    size_t n_walls = dynarray_size(s->walls);
-    if (n_nodes == 0 || n_walls == 0) return;
-    
-    // --- Build/Refit BVHs if needed (for now, rebuild every frame) ---
-    if (s->triangle_bvh) triangle_bvh_free(s->triangle_bvh);
-    s->triangle_bvh = triangle_bvh_build(s->walls);
-    if (s->edge_bvh) edge_bvh_free(s->edge_bvh);
-    // Collect all triangle edges into a DynArray
-    DynArray *edges = dynarray_create(n_walls * 3);
-    for (size_t wi = 0; wi < n_walls; ++wi) {
-        TriangleWall *w = (TriangleWall*)dynarray_get(s->walls, wi);
-        if (!w) continue;
-        for (int ei = 0; ei < 3; ++ei) {
-            Constraint *edge = w->edges[ei];
-            if (edge) dynarray_append(edges, edge);
-        }
-    }
-    s->edge_bvh = edge_bvh_build(edges, 0.03f); // TODO: use actual edge radius
-
-    // --- Node→Triangle broadphase using TriangleBVH ---
-    for (size_t ni = 0; ni < n_nodes; ++ni) {
-        Node *node = (Node*)dynarray_get(s->nodes, ni);
-        if (!node) continue;
-        if (node->anchored && !node->collide_when_anchored) continue;
-        if (!node->collide_with_walls) continue;
-        // Build a small AABB around node (sphere AABB)
-        AABB node_box;
-        for (int d = 0; d < 3; ++d) {
-            node_box.min[d] = node->pos[d] - node->radius;
-            node_box.max[d] = node->pos[d] + node->radius;
-        }
-        DynArray *candidates = dynarray_create(8);
-        triangle_bvh_query(s->triangle_bvh, &node_box, candidates);
-        // printf("Node %zu: found %zu candidate triangles\n", ni, dynarray_size(candidates));
-        for (size_t ci = 0; ci < dynarray_size(candidates); ++ci) {
-            int tri_idx = *(int*)dynarray_get(candidates, ci);
-            if (tri_idx < 0 || (size_t)tri_idx >= n_walls) continue;
-            TriangleWall *w = (TriangleWall*)dynarray_get(s->walls, tri_idx);
-            if (!w) continue;
-            float penetration, normal[3], u, v;
-            if (triangle_check_collision(w, node, &penetration, normal, &u, &v)) {
-                // Compute separation force
-                float sep_force[3] = {
-                    normal[0] * penetration * PENETRATION_STIFFNESS,
-                    normal[1] * penetration * PENETRATION_STIFFNESS,
-                    normal[2] * penetration * PENETRATION_STIFFNESS
-                };
-                float wall_vel[3] = {0, 0, 0};
-                if (!w->A->anchored) {
-                    wall_vel[0] += (1.0f - u - v) * w->A->vel[0];
-                    wall_vel[1] += (1.0f - u - v) * w->A->vel[1];
-                    wall_vel[2] += (1.0f - u - v) * w->A->vel[2];
-                }
-                if (!w->B->anchored) {
-                    wall_vel[0] += u * w->B->vel[0];
-                    wall_vel[1] += u * w->B->vel[1];
-                    wall_vel[2] += u * w->B->vel[2];
-                }
-                if (!w->C->anchored) {
-                    wall_vel[0] += v * w->C->vel[0];
-                    wall_vel[1] += v * w->C->vel[1];
-                    wall_vel[2] += v * w->C->vel[2];
-                }
-                float rel_vel[3] = {
-                    node->vel[0] - wall_vel[0],
-                    node->vel[1] - wall_vel[1],
-                    node->vel[2] - wall_vel[2]
-                };
-                float normal_vel = rel_vel[0]*normal[0] + rel_vel[1]*normal[1] + rel_vel[2]*normal[2];
-                if (normal_vel < 0.0f) {
-                    sep_force[0] -= normal[0] * normal_vel * NORMAL_DAMP_K;
-                    sep_force[1] -= normal[1] * normal_vel * NORMAL_DAMP_K;
-                    sep_force[2] -= normal[2] * normal_vel * NORMAL_DAMP_K;
-                }
-                float tangent[3] = {
-                    rel_vel[0] - normal[0] * normal_vel,
-                    rel_vel[1] - normal[1] * normal_vel,
-                    rel_vel[2] - normal[2] * normal_vel
-                };
-                float tangent_len = sqrtf(tangent[0]*tangent[0] + tangent[1]*tangent[1] + tangent[2]*tangent[2]);
-                if (tangent_len > 1e-9f) {
-                    float sep_mag = sqrtf(sep_force[0]*sep_force[0] + sep_force[1]*sep_force[1] + sep_force[2]*sep_force[2]);
-                    float max_fric = node->friction * sep_mag;
-                    float fric_mag = fminf(Kt * tangent_len, max_fric);
-                    float fric_force[3] = {
-                        -(tangent[0] / tangent_len) * fric_mag,
-                        -(tangent[1] / tangent_len) * fric_mag,
-                        -(tangent[2] / tangent_len) * fric_mag
-                    };
-                    sep_force[0] += fric_force[0];
-                    sep_force[1] += fric_force[1];
-                    sep_force[2] += fric_force[2];
-                }
-                collision_forces[3*ni + 0] += sep_force[0];
-                collision_forces[3*ni + 1] += sep_force[1];
-                collision_forces[3*ni + 2] += sep_force[2];
-                if (!w->A->anchored) {
-                    float weight_a = 1.0f - u - v;
-                    collision_forces[3*w->A->idx + 0] -= sep_force[0] * weight_a;
-                    collision_forces[3*w->A->idx + 1] -= sep_force[1] * weight_a;
-                    collision_forces[3*w->A->idx + 2] -= sep_force[2] * weight_a;
-                }
-                if (!w->B->anchored) {
-                    collision_forces[3*w->B->idx + 0] -= sep_force[0] * u;
-                    collision_forces[3*w->B->idx + 1] -= sep_force[1] * u;
-                    collision_forces[3*w->B->idx + 2] -= sep_force[2] * u;
-                }
-                if (!w->C->anchored) {
-                    collision_forces[3*w->C->idx + 0] -= sep_force[0] * v;
-                    collision_forces[3*w->C->idx + 1] -= sep_force[1] * v;
-                    collision_forces[3*w->C->idx + 2] -= sep_force[2] * v;
-                }
-            }
-        }
-        dynarray_free(candidates, free);
-    }
-
-    
-        EdgeEdgeContext ctx = { edges, collision_forces, sub_dt };
-    edge_bvh_self_traverse(s->edge_bvh, edge_edge_callback, &ctx);
-    dynarray_free(edges, NULL);
-}
 
 // Legacy 2D spatial hash collision code (deprecated, kept for reference)
 // Helper: build spatial hash mapping cell_key -> DynArray of node indices (as int* allocated)
 // Simple spatial hash for two 32-bit integers (ix,iy).
 void simulator_step(Simulator *s) {
     if (!s) return;
+    // If GPU integration is enabled, dispatch GPU step (stubbed currently).
+    if (s->use_gpu) {
+        simulator_gpu_step(s);
+        return;
+    }
     float dt = s->dt;
     size_t n_nodes = dynarray_size(s->nodes);
     const int N = s->solver_iters; // Python reference used 105 substeps
@@ -840,16 +1758,17 @@ void simulator_step(Simulator *s) {
         // reuse l buffer
         memset(l, 0, sizeof(double) * m);
         if (A_sparse && m > 0) {
-            // Try to solve using CSparse direct Cholesky (sparse solver).
-            // cs_cholsol returns non-zero on success (per cs_cholsol_mex usage).
-            int chol_ok = cs_cholsol(1, A_sparse, b);
-            if (chol_ok) {
-                // solution is written into b by cs_cholsol
-                memcpy(l, b, sizeof(double) * m);
-            } else {
-                // fallback to iterative sparse CG if Cholesky fails
-                int cg_ret = cg_solve_sparse((int)m, A_sparse, b, l, (int)(m*10 + 10), 1e-8);
-                (void)cg_ret;
+            {
+                // Try to solve using CSparse direct Cholesky (sparse solver).
+                int chol_ok = cs_cholsol(1, A_sparse, b);
+                if (chol_ok) {
+                    // solution is written into b by cs_cholsol
+                    memcpy(l, b, sizeof(double) * m);
+                } else {
+                    // fallback to iterative sparse CG if Cholesky fails
+                    int cg_ret = cg_solve_sparse((int)m, A_sparse, b, l, (int)(m*10 + 10), 1e-8);
+                    (void)cg_ret;
+                }
             }
         }
 
@@ -922,8 +1841,97 @@ void simulator_step(Simulator *s) {
     if (corr_f) free(corr_f);
 
 }
+
+/* Read back GPU positions + velocities to the CPU Node structs.
+   Call once per render frame (not inside the substep loop) so that
+   UI picking / drag-force code has up-to-date positions. */
+void simulator_sync_positions(Simulator *s) {
+    if (!s || !s->use_gpu || !s->gpu_ctx) return;
+    GPUContext *ctx = (GPUContext*)s->gpu_ctx;
+    int n = ctx->node_count;
+    if (n <= 0) return;
+    size_t pos_bytes = sizeof(float) * (size_t)n * 4;
+    size_t vel_bytes = sizeof(float) * (size_t)n * 4;
+    float *pos4 = (float*)malloc(pos_bytes);
+    float *vel4 = (float*)malloc(vel_bytes);
+    if (pos4 && vel4) {
+        glBindBuffer(GL_SHADER_STORAGE_BUFFER, ctx->ssbo_positions);
+        glGetBufferSubData(GL_SHADER_STORAGE_BUFFER, 0, pos_bytes, pos4);
+        glBindBuffer(GL_SHADER_STORAGE_BUFFER, ctx->ssbo_velocities);
+        glGetBufferSubData(GL_SHADER_STORAGE_BUFFER, 0, vel_bytes, vel4);
+        for (int i = 0; i < n; i++) {
+            Node *nd = (Node*)dynarray_get(s->nodes, i);
+            if (!nd) continue;
+            nd->pos[0] = pos4[4*i];   nd->pos[1] = pos4[4*i+1]; nd->pos[2] = pos4[4*i+2];
+            nd->vel[0] = vel4[4*i];   nd->vel[1] = vel4[4*i+1]; nd->vel[2] = vel4[4*i+2];
+        }
+    }
+    free(pos4);
+    free(vel4);
+}
+
 void simulator_draw(Simulator *s, float cam_yaw, float cam_pitch) {
     if (!s) return;
+
+    /* ── GPU render path ─────────────────────────────────────────────────── */
+    if (s->use_gpu && s->gpu_ctx) {
+        GPUContext *ctx = (GPUContext*)s->gpu_ctx;
+        if (ctx->prog_draw_walls && ctx->prog_draw_constraints && ctx->prog_draw_nodes) {
+
+            /* Build MVP = Projection * ModelView (column-major) */
+            float proj[16], mv[16], mvp[16];
+            glGetFloatv(GL_PROJECTION_MATRIX, proj);
+            glGetFloatv(GL_MODELVIEW_MATRIX,  mv);
+            mat4_mul_cm(mvp, proj, mv);
+
+            /* Disable fixed-function state that would interfere */
+            glPushAttrib(GL_ENABLE_BIT | GL_DEPTH_BUFFER_BIT | GL_COLOR_BUFFER_BIT);
+            glEnable(GL_DEPTH_TEST);
+            glDepthMask(GL_TRUE);
+            glDisable(GL_LIGHTING);
+            glDisable(GL_TEXTURE_2D);
+
+            /* --- Draw walls --- */
+            if (ctx->n_triangles > 0) {
+                glUseProgram(ctx->prog_draw_walls);
+                glUniformMatrix4fv(ctx->u_draw_wall_mvp, 1, GL_FALSE, mvp);
+                glBindBufferBase(GL_SHADER_STORAGE_BUFFER,  0, ctx->ssbo_positions);
+                glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 17, ctx->ssbo_wall_indices);
+                glBindVertexArray(ctx->vao_empty);
+                glDrawArrays(GL_TRIANGLES, 0, ctx->n_triangles * 3);
+                glBindVertexArray(0);
+            }
+
+            /* --- Draw constraints --- */
+            if (ctx->m_total > 0) {
+                glUseProgram(ctx->prog_draw_constraints);
+                glUniformMatrix4fv(ctx->u_draw_con_mvp, 1, GL_FALSE, mvp);
+                glBindBufferBase(GL_SHADER_STORAGE_BUFFER,  0, ctx->ssbo_positions);
+                glBindBufferBase(GL_SHADER_STORAGE_BUFFER,  5, ctx->ssbo_constraints);
+                glBindVertexArray(ctx->vao_empty);
+                glDrawArrays(GL_LINES, 0, ctx->m_total * 2);
+                glBindVertexArray(0);
+            }
+
+            /* --- Draw nodes (instanced spheres) --- */
+            if (ctx->node_count > 0 && ctx->sphere_index_count > 0) {
+                glUseProgram(ctx->prog_draw_nodes);
+                glUniformMatrix4fv(ctx->u_draw_node_mvp, 1, GL_FALSE, mvp);
+                glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 0, ctx->ssbo_positions);
+                glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 4, ctx->ssbo_node_flags);
+                glBindVertexArray(ctx->vao_sphere);
+                glDrawElementsInstanced(GL_TRIANGLES, ctx->sphere_index_count,
+                                        GL_UNSIGNED_SHORT, 0, ctx->node_count);
+                glBindVertexArray(0);
+            }
+
+            glUseProgram(0);
+            glPopAttrib();
+            return; /* skip CPU path */
+        }
+    }
+
+    /* ── CPU / fallback render path ─────────────────────────────────────── */
     // draw constraints
     for (size_t i = 0; i < dynarray_size(s->constraints); ++i) {
         Constraint *c = (Constraint*)dynarray_get(s->constraints, i);
@@ -933,7 +1941,7 @@ void simulator_draw(Simulator *s, float cam_yaw, float cam_pitch) {
     for (size_t i = 0; i < dynarray_size(s->walls); ++i) {
         TriangleWall *w = (TriangleWall*)dynarray_get(s->walls, i);
         if (!w || !w->A || !w->B || !w->C) continue;
-        
+
         // Draw filled white triangle
         glColor3f(1.0f, 1.0f, 1.0f);
         glBegin(GL_TRIANGLES);
@@ -941,7 +1949,7 @@ void simulator_draw(Simulator *s, float cam_yaw, float cam_pitch) {
         glVertex3f(w->B->pos[0], w->B->pos[1], w->B->pos[2]);
         glVertex3f(w->C->pos[0], w->C->pos[1], w->C->pos[2]);
         glEnd();
-        
+
         // Draw black outline
         glColor3f(0.0f, 0.0f, 0.0f);
         glBegin(GL_LINE_LOOP);
@@ -949,7 +1957,7 @@ void simulator_draw(Simulator *s, float cam_yaw, float cam_pitch) {
         glVertex3f(w->B->pos[0], w->B->pos[1], w->B->pos[2]);
         glVertex3f(w->C->pos[0], w->C->pos[1], w->C->pos[2]);
         glEnd();
-        
+
         // draw vertices as small black dots
         glPointSize(4.0f);
         glBegin(GL_POINTS);

@@ -406,6 +406,15 @@ TriangleWall* trianglewall_create(Node *A, Node *B, Node *C, float restitution, 
 }
 void trianglewall_free(TriangleWall *w) { free(w); }
 
+int constraint_get_anchor(Constraint *c, float *ax, float *ay, float *az) {
+    if (!c || c->type != CT_ANCHOR) return 0;
+    AnchorImpl *a = (AnchorImpl*)c;
+    if (ax) *ax = a->anchor_pos[0];
+    if (ay) *ay = a->anchor_pos[1];
+    if (az) *az = a->anchor_pos[2];
+    return 1;
+}
+
 // Note: callers must free pairs appended by dc_sparse.
 
 // Refresh internal cached node indices inside constraint implementations.

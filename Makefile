@@ -4,7 +4,7 @@
 CC = gcc
 
 # Source files
-SRC = main.c Menu.c datastructures.c Node.c Constraint.c Simulator.c Octree.c BVH.c TriangleBVH.c EdgeBVH.c Shader.c
+SRC = main.c Menu.c datastructures.c Node.c Constraint.c Simulator.c Octree.c BVH.c TriangleBVH.c EdgeBVH.c
 
 # Compiler flags
 ## CSparse / SuiteSparse settings
@@ -76,9 +76,12 @@ OUT = simulator
 # SDL2 and OpenGL flags
 # Prefer pkg-config on MSYS2 to avoid sdl2-config returning Linux -lGL.
 ifeq ($(OS),Windows_NT)
-    SDL_CFLAGS  = $(shell pkg-config --cflags sdl2 2>/dev/null || echo "-IC:/msys64/mingw64/include/SDL2 -Dmain=SDL_main")
-    SDL_LDFLAGS = $(shell pkg-config --libs sdl2 2>/dev/null | sed 's/-lGL//g; s/-lGLU//g' || echo "-lmingw32 -mwindows -lSDL2main -lSDL2")
-    override GL_LDFLAGS := -lopengl32
+	SDL_CFLAGS  = $(shell pkg-config --cflags sdl2 2>/dev/null || echo "-IC:/msys64/mingw64/include/SDL2 -Dmain=SDL_main")
+	# Build as console subsystem (no -mwindows) so stdout/stderr are available in terminals
+	# Ensure any -mwindows or Windows-subsystem flags coming from pkg-config are stripped
+	SDL_LDFLAGS = $(shell pkg-config --libs sdl2 2>/dev/null | sed 's/-lGL//g; s/-lGLU//g; s/-mwindows//g; s/-Wl,--subsystem,windows//g' || echo "-lmingw32 -lSDL2main -lSDL2")
+	# Link against GLEW and OpenGL on Windows (MSYS2 MinGW-w64 provides libglew32)
+	override GL_LDFLAGS := -lglew32 -lopengl32
 else
 	SDL_CFLAGS  = $(shell sdl2-config --cflags 2>/dev/null || echo "")
 	SDL_LDFLAGS = $(shell sdl2-config --libs 2>/dev/null || echo "-lSDL2")
@@ -89,7 +92,7 @@ MATH_LDFLAGS = -lm
 
 ## Construct final link flags: remove any -lGL/-lGLU from auto flags, then append the chosen GL_LDFLAGS
 AUTO_LDFLAGS := $(SDL_LDFLAGS) $(TTF_LDFLAGS) $(MATH_LDFLAGS) $(CSPARSE_LDFLAGS)
-FILTERED_LDFLAGS := $(shell echo '$(AUTO_LDFLAGS)' | sed 's/-lGL//g; s/-lGLU//g')
+FILTERED_LDFLAGS := $(shell echo '$(AUTO_LDFLAGS)' | sed 's/-lGL//g; s/-lGLU//g; s/-mwindows//g; s/-Wl,--subsystem,windows//g')
 LINK_LDFLAGS := $(FILTERED_LDFLAGS) $(GL_LDFLAGS)
 
 all:

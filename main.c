@@ -928,6 +928,7 @@ int main(int argc, char *argv[]) {
     // parse runtime options
     int override_solver_iters = 0;
     int run_mesh_test = 0;
+    int want_gpu = 0;
     int mesh_k = 3;
     for (int ai = 1; ai < argc; ++ai) {
         const char *arg = argv[ai];
@@ -940,6 +941,8 @@ int main(int argc, char *argv[]) {
         } else if (strncmp(arg, "--mesh_k=", 9) == 0) {
             int v = atoi(arg + 9);
             if (v > 0) mesh_k = v;
+        } else if (strcmp(arg, "--gpu") == 0) {
+            want_gpu = 1;
         }
     }
     if (SDL_Init(SDL_INIT_VIDEO) < 0) {
@@ -1015,6 +1018,18 @@ int main(int argc, char *argv[]) {
     // --- Initial scenario: Box in Sleeve ---
     Simulator *sim = simulator_create(1.0f/40.0f);
     if (override_solver_iters > 0) sim->solver_iters = override_solver_iters;
+
+    
+
+    // Initialize GPU resources for the simulator (requires valid GL context)
+    if (simulator_init_gpu(sim) == 0) {
+        // mark that GPU resources are available; actual scene upload happens after scene creation
+        sim->use_gpu = 1;
+        fprintf(stderr, "Simulator GPU initialized (resources ready).\n"); fflush(stderr);
+    } else {
+        sim->use_gpu = 0;
+        fprintf(stderr, "Simulator GPU initialization failed — falling back to CPU path.\n");
+    }
 
      /* UI menus: registry of menus. We'll dispatch mouse events to each menu in
          order and stop when one handles the event. This allows stacking UI. */
@@ -1134,7 +1149,7 @@ int main(int argc, char *argv[]) {
         }
         DynArray *tris = simulator_generate_mesh_from_nodes(sim, poly, mesh_k);
         int tcount = tris ? (int)dynarray_size(tris) : 0;
-        printf("Mesh test: octagon with k=%d produced %d triangles and %zu nodes in simulator\n", mesh_k, tcount, dynarray_size(sim->nodes));
+            fprintf(stderr, "Mesh test: octagon with k=%d produced %d triangles and %zu nodes in simulator\n", mesh_k, tcount, dynarray_size(sim->nodes)); fflush(stderr);
         // free temporary polygon nodes (they were not added to sim)
         for (size_t i = 0; i < dynarray_size(poly); ++i) node_free((Node*)dynarray_get(poly, i));
         dynarray_free(poly, NULL);
@@ -1195,95 +1210,95 @@ int main(int argc, char *argv[]) {
     simulator_add_wall(sim, ramp2);
 
     // Generate a soft sphere made of many low-mass surface nodes and a heavier center
-    float sphere_x = (ramp_x0 + ramp_x1) * 0.5f;
-    float sphere_z = (ramp_z0 + ramp_z1) * 0.5f + 10;
-    float sphere_radius = 8.0f;
-    float center_y = ramp_y_top + sphere_radius - 5.0f; // just above ramp
+    // float sphere_x = (ramp_x0 + ramp_x1) * 0.5f;
+    // float sphere_z = (ramp_z0 + ramp_z1) * 0.5f + 10;
+    // float sphere_radius = 8.0f;
+    // float center_y = ramp_y_top + sphere_radius - 5.0f; // just above ramp
 
-    // Parameters for sphere mesh
-    int lat_count = 6;   // number of latitude divisions (including poles)
-    int lon_count = 6;  // number of longitudinal samples per ring
-    float surface_mass = 0.2f;
-    float center_mass = 5.0f;
+    // // Parameters for sphere mesh
+    // int lat_count = 6;   // number of latitude divisions (including poles)
+    // int lon_count = 6;  // number of longitudinal samples per ring
+    // float surface_mass = 0.2f;
+    // float center_mass = 5.0f;
 
-    // Create center structural node
-    Node *sphere_center = node_create(-1, center_mass, sphere_x, center_y, sphere_z);
-    sphere_center->friction = 0.6f;
-    sphere_center->radius = 0.5f; // ensure center node collides with ground and ramp
-    simulator_add_node(sim, sphere_center);
+    // // Create center structural node
+    // Node *sphere_center = node_create(-1, center_mass, sphere_x, center_y, sphere_z);
+    // sphere_center->friction = 0.6f;
+    // sphere_center->radius = 0.5f; // ensure center node collides with ground and ramp
+    // simulator_add_node(sim, sphere_center);
 
-    // Allocate array for surface nodes (including poles)
-    int total_surface = 2 + (lat_count-1) * lon_count; // poles + rings
-    Node **surface_nodes = (Node**)malloc(sizeof(Node*) * total_surface);
-    int idx = 0;
-    // North pole
-    surface_nodes[idx++] = node_create(-1, surface_mass, sphere_x, center_y + sphere_radius, sphere_z);
-    // Rings (exclude poles)
-    for (int i = 1; i < lat_count; ++i) {
-        float phi = (float)i * 3.14159265f / (float)lat_count; // 0..pi
-        float y = center_y + sphere_radius * cosf(phi);
-        float r_xy = sphere_radius * sinf(phi);
-        for (int j = 0; j < lon_count; ++j) {
-            float theta = 2.0f * 3.14159265f * (float)j / (float)lon_count;
-            float x = sphere_x + r_xy * cosf(theta);
-            float z = sphere_z + r_xy * sinf(theta);
-            surface_nodes[idx++] = node_create(-1, surface_mass, x, y, z);
-            surface_nodes[idx-1]->radius = 1.0f; // give surface nodes a radius for better collision with ground and ramp
-        }
-    }
-    // South pole
-    surface_nodes[idx++] = node_create(-1, surface_mass, sphere_x, center_y - sphere_radius, sphere_z);
+    // // Allocate array for surface nodes (including poles)
+    // int total_surface = 2 + (lat_count-1) * lon_count; // poles + rings
+    // Node **surface_nodes = (Node**)malloc(sizeof(Node*) * total_surface);
+    // int idx = 0;
+    // // North pole
+    // surface_nodes[idx++] = node_create(-1, surface_mass, sphere_x, center_y + sphere_radius, sphere_z);
+    // // Rings (exclude poles)
+    // for (int i = 1; i < lat_count; ++i) {
+    //     float phi = (float)i * 3.14159265f / (float)lat_count; // 0..pi
+    //     float y = center_y + sphere_radius * cosf(phi);
+    //     float r_xy = sphere_radius * sinf(phi);
+    //     for (int j = 0; j < lon_count; ++j) {
+    //         float theta = 2.0f * 3.14159265f * (float)j / (float)lon_count;
+    //         float x = sphere_x + r_xy * cosf(theta);
+    //         float z = sphere_z + r_xy * sinf(theta);
+    //         surface_nodes[idx++] = node_create(-1, surface_mass, x, y, z);
+    //         surface_nodes[idx-1]->radius = 1.0f; // give surface nodes a radius for better collision with ground and ramp
+    //     }
+    // }
+    // // South pole
+    // surface_nodes[idx++] = node_create(-1, surface_mass, sphere_x, center_y - sphere_radius, sphere_z);
 
-    // Set friction and add to simulator
-    for (int i = 0; i < total_surface; ++i) {
-        surface_nodes[i]->friction = 0.6f;
-        simulator_add_node(sim, surface_nodes[i]);
-    }
+    // // Set friction and add to simulator
+    // for (int i = 0; i < total_surface; ++i) {
+    //     surface_nodes[i]->friction = 0.6f;
+    //     simulator_add_node(sim, surface_nodes[i]);
+    // }
 
-    // Add distance constraints between neighboring surface nodes (rings and longitudes)
-    // Indexing: 0 = north pole, then rings in order, last = south pole
-    // Connect north pole to first ring
-    int ring_start = 1;
-    for (int j = 0; j < lon_count; ++j) {
-        Constraint *c = distconstraint_create(surface_nodes[0], surface_nodes[ring_start + j], -1);
-        simulator_add_constraint(sim, c);
-    }
-    // Connect rings internally and between rings
-    for (int r = 0; r < lat_count-1; ++r) {
-        int this_ring_start = 1 + r * lon_count;
-        int next_ring_start = this_ring_start + lon_count;
-        // If next_ring_start points to south pole, handle separately
-        int next_is_pole = (r == lat_count-2);
-        for (int j = 0; j < lon_count; ++j) {
-            int a = this_ring_start + j;
-            int b = this_ring_start + ((j+1) % lon_count);
-            // same-ring neighbor
-            Constraint *c1 = distconstraint_create(surface_nodes[a], surface_nodes[b], -1);
-            simulator_add_constraint(sim, c1);
-            // connect to next ring (or south pole)
-            if (next_is_pole) {
-                int south_idx = total_surface - 1;
-                Constraint *c2 = distconstraint_create(surface_nodes[a], surface_nodes[south_idx], -1);
-                simulator_add_constraint(sim, c2);
-            } else {
-                int cidx = next_ring_start + j;
-                Constraint *c2 = distconstraint_create(surface_nodes[a], surface_nodes[cidx], -1);
-                simulator_add_constraint(sim, c2);
-                // also connect to next ring neighbor for triangulation
-                int cidx2 = next_ring_start + ((j+1) % lon_count);
-                Constraint *c3 = distconstraint_create(surface_nodes[a], surface_nodes[cidx2], -1);
-                simulator_add_constraint(sim, c3);
-            }
-        }
-    }
+    // // Add distance constraints between neighboring surface nodes (rings and longitudes)
+    // // Indexing: 0 = north pole, then rings in order, last = south pole
+    // // Connect north pole to first ring
+    // int ring_start = 1;
+    // for (int j = 0; j < lon_count; ++j) {
+    //     Constraint *c = distconstraint_create(surface_nodes[0], surface_nodes[ring_start + j], -1);
+    //     simulator_add_constraint(sim, c);
+    // }
+    // // Connect rings internally and between rings
+    // for (int r = 0; r < lat_count-1; ++r) {
+    //     int this_ring_start = 1 + r * lon_count;
+    //     int next_ring_start = this_ring_start + lon_count;
+    //     // If next_ring_start points to south pole, handle separately
+    //     int next_is_pole = (r == lat_count-2);
+    //     for (int j = 0; j < lon_count; ++j) {
+    //         int a = this_ring_start + j;
+    //         int b = this_ring_start + ((j+1) % lon_count);
+    //         // same-ring neighbor
+    //         Constraint *c1 = distconstraint_create(surface_nodes[a], surface_nodes[b], -1);
+    //         simulator_add_constraint(sim, c1);
+    //         // connect to next ring (or south pole)
+    //         if (next_is_pole) {
+    //             int south_idx = total_surface - 1;
+    //             Constraint *c2 = distconstraint_create(surface_nodes[a], surface_nodes[south_idx], -1);
+    //             simulator_add_constraint(sim, c2);
+    //         } else {
+    //             int cidx = next_ring_start + j;
+    //             Constraint *c2 = distconstraint_create(surface_nodes[a], surface_nodes[cidx], -1);
+    //             simulator_add_constraint(sim, c2);
+    //             // also connect to next ring neighbor for triangulation
+    //             int cidx2 = next_ring_start + ((j+1) % lon_count);
+    //             Constraint *c3 = distconstraint_create(surface_nodes[a], surface_nodes[cidx2], -1);
+    //             simulator_add_constraint(sim, c3);
+    //         }
+    //     }
+    // }
 
-    // Connect all surface nodes radially to center
-    for (int i = 0; i < total_surface; ++i) {
-        Constraint *cr = distconstraint_create(surface_nodes[i], sphere_center, -1);
-        simulator_add_constraint(sim, cr);
-    }
+    // // Connect all surface nodes radially to center
+    // for (int i = 0; i < total_surface; ++i) {
+    //     Constraint *cr = distconstraint_create(surface_nodes[i], sphere_center, -1);
+    //     simulator_add_constraint(sim, cr);
+    // }
 
-    free(surface_nodes);
+    // free(surface_nodes);
     
     // Tetrahedron above ground, pointy end down
     float tet_size = 30.0f;
@@ -1503,10 +1518,31 @@ int main(int argc, char *argv[]) {
     TriangleWall *horiz_wall = trianglewall_create(horiz1, horiz2, horiz3, 1.0f, 0.0f, h12, h23, h31);
     simulator_add_wall(sim, horiz_wall);
     
-    printf("Generated initial scenario with %zu nodes, %zu constraints, %zu walls\n",
-        dynarray_size(sim->nodes), dynarray_size(sim->constraints), dynarray_size(sim->walls));
+    fprintf(stderr, "Generated initial scenario with %zu nodes, %zu constraints, %zu walls\n",
+        dynarray_size(sim->nodes), dynarray_size(sim->constraints), dynarray_size(sim->walls)); fflush(stderr);
 
-    printf("Entering main loop. Close window to exit.\n");
+    fprintf(stderr, "Entering main loop. Close window to exit.\n"); fflush(stderr);
+    // If GPU was initialized earlier, pack the current scene and upload to GPU
+    if (sim->use_gpu) {
+        PackedScene *p = simulator_pack_scene(sim);
+        if (p) {
+            simulator_upload_scene_to_gpu(sim, p);
+            simulator_free_packed_scene(p);
+            if (want_gpu) {
+                // enable GPU stepping even though constraint pipeline is partial
+                simulator_enable_gpu(sim, 1);
+                sim->use_gpu = 1;
+                fprintf(stderr, "Uploaded scene to GPU and enabled GPU stepping (experimental).\n"); fflush(stderr);
+            } else {
+                // keep CPU path active until GPU solver is complete
+                sim->use_gpu = 0;
+                fprintf(stderr, "Uploaded scene to GPU (buffers ready). CPU stepping remains active.\n"); fflush(stderr);
+            }
+        } else {
+            fprintf(stderr, "Failed to pack scene for GPU upload — continuing on CPU.\n");
+            sim->use_gpu = 0;
+        }
+    }
     while (running) {
         while (SDL_PollEvent(&event)) {
             if (event.type == SDL_QUIT) {
