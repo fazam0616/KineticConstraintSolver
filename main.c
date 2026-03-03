@@ -2230,71 +2230,7 @@ int main(int argc, char *argv[]) {
         glPushMatrix();
         glLoadIdentity();
 
-        // Render node numbers on top of everything using saved 3D matrices
-        for (size_t i = 0; i < dynarray_size(sim->nodes); ++i) {
-            Node *n = (Node*)dynarray_get(sim->nodes, i);
-            if (!n) continue;
-            
-            // Project 3D position to screen coordinates using saved matrices
-            GLdouble win_x, win_y, win_z;
-            GLdouble obj_x = (GLdouble)n->pos[0];
-            GLdouble obj_y = (GLdouble)n->pos[1];
-            GLdouble obj_z = (GLdouble)n->pos[2];
-            
-            // Manual projection (equivalent to gluProject)
-            GLdouble in[4], out[4];
-            in[0] = obj_x; in[1] = obj_y; in[2] = obj_z; in[3] = 1.0;
-            
-            // Transform by modelview matrix
-            out[0] = modelview[0]*in[0] + modelview[4]*in[1] + modelview[8]*in[2] + modelview[12]*in[3];
-            out[1] = modelview[1]*in[0] + modelview[5]*in[1] + modelview[9]*in[2] + modelview[13]*in[3];
-            out[2] = modelview[2]*in[0] + modelview[6]*in[1] + modelview[10]*in[2] + modelview[14]*in[3];
-            out[3] = modelview[3]*in[0] + modelview[7]*in[1] + modelview[11]*in[2] + modelview[15]*in[3];
-            
-            // Transform by projection matrix
-            in[0] = out[0]; in[1] = out[1]; in[2] = out[2]; in[3] = out[3];
-            out[0] = projection[0]*in[0] + projection[4]*in[1] + projection[8]*in[2] + projection[12]*in[3];
-            out[1] = projection[1]*in[0] + projection[5]*in[1] + projection[9]*in[2] + projection[13]*in[3];
-            out[2] = projection[2]*in[0] + projection[6]*in[1] + projection[10]*in[2] + projection[14]*in[3];
-            out[3] = projection[3]*in[0] + projection[7]*in[1] + projection[11]*in[2] + projection[15]*in[3];
-            
-            if (out[3] == 0.0) continue; // Behind camera
-            
-            // Perspective divide
-            out[0] /= out[3];
-            out[1] /= out[3];
-            out[2] /= out[3];
-            
-            // Map to window coordinates
-            win_x = viewport[0] + (1.0 + out[0]) * viewport[2] / 2.0;
-            win_y = viewport[1] + (1.0 + out[1]) * viewport[3] / 2.0;
-            
-            int screen_x = (int)win_x;
-            int screen_y = (int)(viewport[3] - win_y); // Flip Y for screen coordinates
-            
-            // Skip if out of screen bounds or behind camera
-            if (screen_x < 0 || screen_x >= win_w || screen_y < 0 || screen_y >= win_h) continue;
-            if (out[2] < -1.0 || out[2] > 1.0) continue;
-            
-            // Render text: white for anchored, black for non-anchored
-            char node_text[16];
-            snprintf(node_text, sizeof(node_text), "%d", n->idx);
-            
-            int text_w = 0, text_h = 0;
-            if (menu_measure_text(node_text, &text_w, &text_h) == 0) {
-                // Center text on node
-                int tx = screen_x - text_w / 2;
-                int ty = screen_y - text_h / 2;
-                
-                Color text_color;
-                if (n->anchored) {
-                    text_color = (Color){255, 255, 255, 255}; // White
-                } else {
-                    text_color = (Color){0, 0, 0, 255}; // Black
-                }
-                menu_draw_text_at(node_text, tx, ty, text_color);
-            }
-        }
+        
 
         // Render menu UI (draw all registered menus)
         for (size_t mi = 0; mi < menus->size; ++mi) {

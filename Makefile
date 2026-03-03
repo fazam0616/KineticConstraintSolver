@@ -4,7 +4,7 @@
 CC = gcc
 
 # Source files
-SRC = main.c Menu.c datastructures.c Node.c Constraint.c Simulator.c Octree.c BVH.c TriangleBVH.c EdgeBVH.c
+SRC = main.c Menu.c datastructures.c Node.c Constraint.c Simulator.c Octree.c BVH.c TriangleBVH.c EdgeBVH.c Shader.c
 
 # Compiler flags
 ## CSparse / SuiteSparse settings
@@ -26,6 +26,14 @@ else ifneq ($(wildcard /mingw64/include/csparse/cs.h),)
 	CSPARSE_LIB ?= -L/mingw64/lib -lcsparse
 else
 	# Link against libcsparse in the repo build directory by default. Override when calling make.
+	# Try common Linux include locations before falling back to the bundled copy
+	ifneq ($(wildcard /usr/include/cs.h),)
+		CSPARSE_INC := /usr/include
+	else ifneq ($(wildcard /usr/include/suitesparse/cs.h),)
+		CSPARSE_INC := /usr/include/suitesparse
+	else ifneq ($(wildcard /usr/include/csparse/cs.h),)
+		CSPARSE_INC := /usr/include/csparse
+	endif
 	CSPARSE_LIB ?= -L./SuiteSparse/CSparse/build -lcsparse
 endif
 
@@ -38,6 +46,21 @@ else ifneq ($(wildcard /mingw64/lib/libsuitesparseconfig.a),)
 	CSPARSE_LIB := /mingw64/lib/libsuitesparseconfig.a
 else ifneq ($(wildcard /mingw64/lib/libsuitesparseconfig.dll.a),)
 	CSPARSE_LIB := /mingw64/lib/libsuitesparseconfig.dll.a
+endif
+
+# Prefer common Linux library filenames/locations when available
+ifneq ($(wildcard /usr/lib/libcxsparse.a),)
+	CSPARSE_LIB := /usr/lib/libcxsparse.a -lsuitesparseconfig
+else ifneq ($(wildcard /usr/lib/libcxsparse.so),)
+	CSPARSE_LIB := -lcxsparse -lsuitesparseconfig
+else ifneq ($(wildcard /usr/lib/x86_64-linux-gnu/libcxsparse.a),)
+	CSPARSE_LIB := /usr/lib/x86_64-linux-gnu/libcxsparse.a -lsuitesparseconfig
+else ifneq ($(wildcard /usr/lib/x86_64-linux-gnu/libcxsparse.so),)
+	CSPARSE_LIB := -lcxsparse -lsuitesparseconfig
+else ifneq ($(wildcard /usr/lib/libsuitesparseconfig.a),)
+	CSPARSE_LIB := /usr/lib/libsuitesparseconfig.a
+else ifneq ($(wildcard /usr/lib/x86_64-linux-gnu/libsuitesparseconfig.a),)
+	CSPARSE_LIB := /usr/lib/x86_64-linux-gnu/libsuitesparseconfig.a
 endif
 
 # Compiler flags (always enable debug jacobian)
@@ -57,9 +80,9 @@ ifeq ($(OS),Windows_NT)
     SDL_LDFLAGS = $(shell pkg-config --libs sdl2 2>/dev/null | sed 's/-lGL//g; s/-lGLU//g' || echo "-lmingw32 -mwindows -lSDL2main -lSDL2")
     override GL_LDFLAGS := -lopengl32
 else
-    SDL_CFLAGS  = $(shell sdl2-config --cflags 2>/dev/null || echo "")
-    SDL_LDFLAGS = $(shell sdl2-config --libs 2>/dev/null || echo "-lSDL2")
-    override GL_LDFLAGS := -lGL
+	SDL_CFLAGS  = $(shell sdl2-config --cflags 2>/dev/null || echo "")
+	SDL_LDFLAGS = $(shell sdl2-config --libs 2>/dev/null || echo "-lSDL2")
+	override GL_LDFLAGS := -lGL -lGLEW
 endif
 TTF_LDFLAGS = -lSDL2_ttf
 MATH_LDFLAGS = -lm
