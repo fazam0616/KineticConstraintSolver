@@ -4,7 +4,7 @@
 CC = gcc
 
 # Source files
-SRC = main.c Menu.c datastructures.c Node.c Constraint.c Simulator.c Octree.c BVH.c TriangleBVH.c EdgeBVH.c
+SRC = main.c Menu.c datastructures.c Node.c Constraint.c Simulator.c Octree.c BVH.c TriangleBVH.c EdgeBVH.c Shader.c
 
 # Compiler flags
 ## CSparse / SuiteSparse settings

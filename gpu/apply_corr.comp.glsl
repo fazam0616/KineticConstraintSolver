@@ -1,11 +1,12 @@
 // apply_corr.comp.glsl
 // One thread per node.
-// 1. Computes corr_f[node_dof] = -dt * (J^T * l)[node_dof]  by scanning all J rows.
+// 1. Reads corr_f[node_dof] = -dt * (J^T λ)[dof]  directly from jt_vec (binding 23).
+//    jt_vec is populated by a cg_zero_v + cg_jt_scatter post-solve pass where
+//    l_vec (λ) is temporarily bound to slot 13 so the scatter shader reads λ.
+//    No M^{-1} scaling is applied in that final scatter, giving raw J^T λ.
 // 2. Reads collision forces from binding 11 (CPU-uploaded per substep).
 // 3. Applies: vel += inv_mass * (corr_f * N + ext_forces + collision_forces) * sub_dt
 // 4. Applies: pos += vel * sub_dt
-//
-// Mirrors the final integration section inside the simulator_step() substep loop.
 #version 430 core
 layout(local_size_x = 64) in;
 
@@ -14,14 +15,11 @@ layout(std430, binding = 1)  buffer   VelSSBO       { vec4  vel4[];        }; //
 layout(std430, binding = 2)  readonly buffer InvMassSSBO { float inv_mass[]; };
 layout(std430, binding = 3)  readonly buffer ExtForceBuf { vec4  ext_forces[]; }; // gravity+springs
 layout(std430, binding = 4)  readonly buffer FlagsSSBO   { uint  node_flags[]; };
-layout(std430, binding = 6)  readonly buffer JColsBuf    { int   J_cols[];   };
-layout(std430, binding = 7)  readonly buffer JValsBuf    { float J_vals[];   };
-layout(std430, binding = 10) readonly buffer LVecBuf     { float l_data[];   };
 layout(std430, binding = 11) readonly buffer CollisionBuf{ vec4  coll_forces[];};// collision (CPU)
 layout(std430, binding = 18)          buffer VelCorrBuf  { uint  velcorr[];    };// edge-edge impulses
+layout(std430, binding = 23) readonly buffer JtVecBuf    { float jt_vec[];    };// 3n J^Tλ
 
 uniform int   u_n;      // node count
-uniform int   u_m;      // m_sparse (number of sparse constraints)
 uniform float u_dt;     // full dt
 uniform float u_sub_dt; // sub timestep = dt / N
 uniform int   u_N;      // number of substeps (solver_iters)
@@ -46,20 +44,14 @@ void main() {
     uint flags = node_flags[i];
     if ((flags & ANCHORED_BIT) != 0u || (flags & SIM_IGNORE_BIT) != 0u) return;
 
-    // --- Compute corr_f for this node by scanning all J rows ---
-    // corr_f[dof] = -dt * sum_c { J_vals[c*6+k] * l[c]  for all k where J_cols[c*6+k] == 3*i+dof }
-    vec3 corr_f = vec3(0.0);
-    for (int c = 0; c < u_m; c++) {
-        float lc = l_data[c];
-        for (int k = 0; k < 6; k++) {
-            int col = J_cols[c*6 + k];
-            if (col < 0) continue;
-            if (col / 3 != i) continue;          // different node
-            int dof = col % 3;                   // 0=x 1=y 2=z
-            corr_f[dof] += J_vals[c*6 + k] * lc;
-        }
-    }
-    corr_f *= -u_dt; // corr_f = -dt * J^T * l  (matches CPU: cs_gaxpy + scale by -dt)
+    // --- Read corr_f directly from jt_vec (J^T λ pre-computed by post-solve scatter) ---
+    // jt_vec[3*i+dof] = (J^T λ)[dof] for this node  (raw, no M^{-1} scaling)
+    uint base_dof = uint(i) * 3u;
+    vec3 corr_f = vec3(
+        jt_vec[base_dof + 0u],
+        jt_vec[base_dof + 1u],
+        jt_vec[base_dof + 2u]);
+    corr_f *= -u_dt; // corr_f = -dt * J^T λ  (matches CPU: cs_gaxpy + scale by -dt)
 
     // --- Accumulate all forces ---
     vec3 ext  = ext_forces[i].xyz;

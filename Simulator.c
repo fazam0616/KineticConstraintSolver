@@ -28,16 +28,27 @@ void mark_node_dirty_if_moved(Node *node, float threshold) {
 // Full GPU context owning all shaders and SSBOs for the complete solver pipeline.
 // SSBO binding layout mirrors the compute shaders:
 //  0 positions  1 velocities  2 inv_mass  3 ext_forces  4 node_flags
-//  5 constraints  6 J_cols  7 J_vals  8 A_dense  9 b_vec  10 l_vec
+//  5 constraints  6 J_cols  7 J_vals  8 A_dense(stub)  9 b_vec  10 l_vec(x)
 //  11 collision  12 r_vec  13 p_vec  14 Ap_vec
+//  23 jt_vec  24 cg_scalars  25 reduce_buf  26 csr_offsets  27 csr_data
 typedef struct GPUContext {
     // ----- programs -----
     GLuint prog_build_j;       // build Jacobian rows (1 thread/constraint)
     GLuint prog_build_b;       // build RHS b = -err (1 thread/constraint)
-    GLuint prog_build_A;       // build A = dt^2 J M^-1 J^T (thread per (i,j))
+    GLuint prog_build_A;       // build A = dt^2 J M^-1 J^T (kept for reference, not dispatched)
     GLuint prog_ext_forces;    // gravity + spring external forces (1 thread/node)
-    GLuint prog_cg_solve;      // full CG solver, single workgroup of 512 threads
+    GLuint prog_cg_solve;      // old dense CG (single WG 512), kept as fallback
     GLuint prog_apply_corr;    // apply corr_f + symplectic-Euler integrate
+    // ----- sparse CG programs (replace build_A + cg_solve) -----
+    GLuint prog_cg_init;       // x=0,r=p=b,partial rr→reduce_buf
+    GLuint prog_cg_zero_v;     // zero jt_vec before each J^T scatter
+    GLuint prog_cg_jt_scatter; // atomic J^T p → jt_vec
+    GLuint prog_cg_minv_scale; // jt_vec *= inv_mass
+    GLuint prog_cg_j_gather;   // Ap = J jt_vec; partial p·Ap → reduce_buf
+    GLuint prog_cg_dot_reduce; // tree-reduce → alpha / beta / rr
+    GLuint prog_cg_update_xr;  // x += α*p; r -= α*Ap; partial r·r → reduce_buf
+    GLuint prog_cg_update_p;   // p = r + β*p
+    GLuint prog_cg_jt_gather;  // CSR J^T gather, one thread per DOF, no atomics
     // ----- SSBOs -----
     GLuint ssbo_positions;     // binding  0 : n x vec4
     GLuint ssbo_velocities;    // binding  1 : n x vec4
@@ -47,13 +58,20 @@ typedef struct GPUContext {
     GLuint ssbo_constraints;   // binding  5 : m_total x 8 int  (non-spring first)
     GLuint ssbo_J_cols;        // binding  6 : m_sparse x 6 int
     GLuint ssbo_J_vals;        // binding  7 : m_sparse x 6 float
-    GLuint ssbo_A_dense;       // binding  8 : m_sparse x m_sparse float
+    GLuint ssbo_A_dense;       // binding  8 : stub (1 float); build_A not dispatched
     GLuint ssbo_b_vec;         // binding  9 : m_sparse float
-    GLuint ssbo_l_vec;         // binding 10 : m_sparse float  (CG solution)
+    GLuint ssbo_l_vec;         // binding 10 : m_sparse float  (CG solution x)
     GLuint ssbo_collision;     // binding 11 : n x vec4  (collision forces, CPU-uploaded)
     GLuint ssbo_r_vec;         // binding 12 : m_sparse float  (CG temp r)
     GLuint ssbo_p_vec;         // binding 13 : m_sparse float  (CG temp p)
     GLuint ssbo_Ap_vec;        // binding 14 : m_sparse float  (CG temp Ap)
+    // ----- sparse CG SSBOs -----
+    GLuint ssbo_jt_vec;        // binding 23 : 3n floats  (J^T p or J^T λ, written by cg_jt_gather)
+    GLuint ssbo_cg_scalars;    // binding 24 : 8 floats [rr,pAp,alpha,beta,...]
+    GLuint ssbo_reduce_buf;    // binding 25 : ceil(m/64) floats
+    GLuint ssbo_csr_offsets;   // binding 26 : (3n+1) ints  [static J^T sparsity CSR]
+    GLuint ssbo_csr_data;      // binding 27 : n_csr_entries×2 ints {c, k_slot}
+    int    n_csr_entries;      // total CSR entries (set at upload)
     // ----- sizes filled during scene upload -----
     int node_count;
     int m_sparse;   // non-spring constraint count
@@ -65,21 +83,85 @@ typedef struct GPUContext {
     GLint u_bb_m;
     GLint u_ba_m, u_ba_dt;
     GLint u_cg_m, u_cg_max_iter, u_cg_tol;
-    GLint u_ac_n, u_ac_m, u_ac_dt, u_ac_sub_dt, u_ac_N;
+    GLint u_ac_n, u_ac_dt, u_ac_sub_dt, u_ac_N;
+    // ----- sparse CG uniform locations -----
+    GLint u_ci_m;                          // cg_init
+    GLint u_czv_n3;                        // cg_zero_v  (= 3*n)
+    GLint u_cjs_m;                         // cg_jt_scatter
+    GLint u_cms_n;                         // cg_minv_scale
+    GLint u_cjg_m, u_cjg_dt;              // cg_j_gather
+    GLint u_cdr_n_partials, u_cdr_mode;    // cg_dot_reduce
+    GLint u_cuxr_m;                        // cg_update_xr
+    GLint u_cup_m;                         // cg_update_p
+    GLint u_cjtg_n3, u_cjtg_src, u_cjtg_apply_minv; // cg_jt_gather
+    // ----- LBVH build programs (parallel, 5 shaders) -----
+    // Old serial single-thread builders replaced by a 3-pass pipeline:
+    //   Pass 1 (morton): compute per-prim AABB + Morton code → scratch slot [7]
+    //   Pass 2 (sort):   bitonic sort of scratch by Morton code (local or 2-pass global)
+    //   Pass 3 (build):  Karras 2012 parallel internal/leaf node construction
+    GLuint prog_lbvh_morton_walls; // Pass 1 walls: SSBO 0+17→22, dispatch ceil(n/64)
+    GLuint prog_lbvh_morton_edges; // Pass 1 edges: SSBO 0+5→21,  dispatch ceil(m/64)
+    GLuint prog_lbvh_sort_walls;   // Pass 2 walls: SSBO 22,       dispatch 1 or ceil(n2/2/64)
+    GLuint prog_lbvh_sort_edges;   // Pass 2 edges: SSBO 21,       dispatch 1 or ceil(n2/2/64)
+    GLuint prog_lbvh_build_walls;  // Pass 3 walls: SSBO 22→15,    dispatch ceil((2n-1)/64)
+    GLuint prog_lbvh_build_edges;  // Pass 3 edges: SSBO 21→20,    dispatch ceil((2n-1)/64)
+    // Uniform locations – Pass 1
+    GLint  u_mw_n_prims, u_mw_scene_min, u_mw_scene_max;   // walls morton
+    GLint  u_me_m_total, u_me_scene_min, u_me_scene_max;   // edges morton
+    // Uniform locations – Pass 2
+    GLint  u_sw_n_prims, u_sw_pass_len, u_sw_sub_step, u_sw_local;  // walls sort
+    GLint  u_se_n_prims, u_se_pass_len, u_se_sub_step, u_se_local;  // edges sort
+    // Uniform locations – Pass 3
+    GLint  u_bw_n_prims;   // walls build
+    GLint  u_be_n_prims;   // edges build
+    // Scene AABB used for Morton normalization (set at upload from wall geometry)
+    float  scene_min[3];
+    float  scene_max[3];
+    int    last_n_edges;  // actual CT_DIST edge count from last substep build
+    // (Keep old names as aliases for any code that still references them)
+    GLuint prog_bvh_walls;         // alias → prog_lbvh_build_walls (unused dispatch)
+    GLuint prog_bvh_edges;         // alias → prog_lbvh_build_edges (unused dispatch)
+    GLint  u_bvh_w_n_tris;         // unused (kept to avoid linker warnings)
+    GLint  u_bvh_e_m_total;        // unused
     // ----- collision BVH program + SSBOs (bindings 15-17) -----
-    GLuint prog_collision;         // GPU sphere-triangle collision
-    GLuint ssbo_bvh_nodes;         // binding 15: flat BVH  (10 ints/node, kept for future use)
-    GLuint ssbo_triangles;         // binding 16: (reserved / unused by new shader)
+    GLuint prog_collision;         // GPU sphere-triangle collision (BVH-traversal)
+    GLuint ssbo_bvh_nodes;         // binding 15: flat wall BVH (10 ints/node, GPU-built)
+    GLuint ssbo_triangles;         // binding 16: (reserved / unused)
     GLuint ssbo_wall_indices;      // binding 17: 4 ints/tri [a_idx, b_idx, c_idx, 0]
-    int    n_bvh_nodes;            // number of BVH nodes built
     int    n_triangles;            // number of triangles
-    int   *cpu_wall_node_indices;  // CPU copy: 3 ints/tri [a_idx, b_idx, c_idx]
     GLint  u_col_n, u_col_n_tris, u_col_stiffness, u_col_damp, u_col_fr;
-    // ----- edge-edge collision (binding 18) -----
-    GLuint prog_edge_edge;         // GPU edge-edge capsule collision
+    // ----- edge-edge collision (bindings 18-21) -----
+    GLuint prog_edge_edge;         // GPU edge-edge capsule collision (BVH-traversal)
     GLuint ssbo_velcorr;           // binding 18: n*3 uint (float-as-uint velocity corrections)
+    GLuint ssbo_edge_bvh;          // binding 20: flat edge BVH (10 ints/node, GPU-built each substep)
+    GLuint ssbo_edge_bvh_scratch;  // binding 21: sorted edge prim list (8 ints/prim)
     GLint  u_ee_n, u_ee_m_total, u_ee_restitution, u_ee_mu;
-    // ----- render programs -----
+    // ----- wall BVH scratch (binding 22) -----
+    GLuint ssbo_wall_bvh_scratch;  // binding 22: sorted wall prim list (8 ints/prim, GPU-built)
+    // ----- indirect dispatch infra (bindings 28-29) -----
+    // prog_lbvh_prepare_edge_dispatch: 1-thread shader, reads escratch atomic counter,
+    // writes {sort_x,1,1, build_x,1,1} into ssbo_indirect_args and n_edges into ssbo_edge_meta.
+    GLuint prog_lbvh_prepare_edge_dispatch;
+    GLint  u_ped_m_total;          // uniform: total constraint count (to find counter offset)
+    GLuint ssbo_indirect_args;     // binding 28: 6 uints = 2× DispatchIndirectCommand
+    GLuint ssbo_edge_meta;         // binding 29: 2 ints [edge n_prims, wall n_prims(unused)]
+    // baked CG dot-reduce program variants (mode baked via #define, removes glUniform from loop)
+    GLuint prog_cg_dot_reduce_init;   // mode=0 (rr0 accumulate)
+    GLuint prog_cg_dot_reduce_alpha;  // mode=1 (pAp → alpha)
+    GLuint prog_cg_dot_reduce_beta;   // mode=2 (rr_new → beta)
+    // baked CG jt_gather variants
+    GLuint prog_cg_jt_gather_inloop;   // u_src=0 u_apply_minv=1  (M⁻¹Jᵀp per CG iter)
+    GLuint prog_cg_jt_gather_postsolve;// u_src=1 u_apply_minv=0  (Jᵀλ post-solve)
+    // uniform locations for baked jt_gather (n3 only — mode/minv baked)
+    GLint  u_cjtg_il_n3;   // inloop variant
+    GLint  u_cjtg_ps_n3;   // postsolve variant
+    /* Persistent coherent readback — eliminates glGetBufferSubData pipeline drain.
+       ssbo_positions and ssbo_velocities are allocated with glBufferStorage so they
+       can be persistently mapped; the CPU reads pos_map/vel_map directly after the
+       readback_fence signals (checked non-blocking in simulator_sync_positions).    */
+    float  *pos_map;          /* persistently-mapped ssbo_positions  (read-only) */
+    float  *vel_map;          /* persistently-mapped ssbo_velocities (read-only) */
+    GLsync  readback_fence;   /* fence planted at end of each simulator_gpu_step  */
     GLuint prog_draw_nodes;        // vert+frag: instanced sphere per node
     GLuint prog_draw_constraints;  // vert+frag: GL_LINES per constraint
     GLuint prog_draw_walls;        // vert+frag: GL_TRIANGLES from ssbo_triangles
@@ -408,10 +490,49 @@ int simulator_init_gpu(Simulator *s) {
     ctx->prog_apply_corr  = compile_compute_program_from_file("gpu/apply_corr.comp.glsl");
     ctx->prog_collision   = compile_compute_program_from_file("gpu/collision.comp.glsl");
     ctx->prog_edge_edge   = compile_compute_program_from_file("gpu/edge_edge.comp.glsl");
+    // Sparse CG shaders
+    ctx->prog_cg_init        = compile_compute_program_from_file("gpu/cg_init.comp.glsl");
+    ctx->prog_cg_zero_v      = compile_compute_program_from_file("gpu/cg_zero_v.comp.glsl");
+    ctx->prog_cg_jt_scatter  = compile_compute_program_from_file("gpu/cg_jt_scatter.comp.glsl");
+    ctx->prog_cg_minv_scale  = compile_compute_program_from_file("gpu/cg_minv_scale.comp.glsl");
+    ctx->prog_cg_j_gather    = compile_compute_program_from_file("gpu/cg_j_gather.comp.glsl");
+    ctx->prog_cg_dot_reduce  = compile_compute_program_from_file("gpu/cg_dot_reduce.comp.glsl");
+    ctx->prog_cg_update_xr   = compile_compute_program_from_file("gpu/cg_update_xr.comp.glsl");
+    ctx->prog_cg_update_p    = compile_compute_program_from_file("gpu/cg_update_p.comp.glsl");
+    ctx->prog_cg_jt_gather   = compile_compute_program_from_file("gpu/cg_jt_gather.comp.glsl");
+    ctx->prog_bvh_walls   = compile_compute_program_from_file("gpu/lbvh_build_walls.comp.glsl");
+    ctx->prog_bvh_edges   = compile_compute_program_from_file("gpu/lbvh_build_edges.comp.glsl");
+    ctx->prog_lbvh_morton_walls = compile_compute_program_from_file("gpu/lbvh_morton_walls.comp.glsl");
+    ctx->prog_lbvh_morton_edges = compile_compute_program_from_file("gpu/lbvh_morton_edges.comp.glsl");
+    ctx->prog_lbvh_sort_walls   = compile_compute_program_from_file("gpu/lbvh_sort_walls.comp.glsl");
+    ctx->prog_lbvh_sort_edges   = compile_compute_program_from_file("gpu/lbvh_sort_edges.comp.glsl");
+    ctx->prog_lbvh_build_walls  = ctx->prog_bvh_walls;
+    ctx->prog_lbvh_build_edges  = ctx->prog_bvh_edges;
+    ctx->prog_lbvh_prepare_edge_dispatch = compile_compute_program_from_file(
+        "gpu/lbvh_prepare_edge_dispatch.comp.glsl");
+    /* Baked CG dot-reduce variants — compile cg_dot_reduce 3 times with different #define */
+    /* We inject a preamble before the shader source.  compile_compute_program_from_file   */
+    /* already reads the file; we use glShaderSource override here via a two-source trick. */
+    /* Simplest portable approach: compile the same file but override uniform with const.  */
+    /* Since cg_dot_reduce uses `uniform int u_mode`, we compile 3 separate programs and   */
+    /* call glUniform once at init time to bake the value in. */
+    ctx->prog_cg_dot_reduce_init  = compile_compute_program_from_file("gpu/cg_dot_reduce.comp.glsl");
+    ctx->prog_cg_dot_reduce_alpha = compile_compute_program_from_file("gpu/cg_dot_reduce.comp.glsl");
+    ctx->prog_cg_dot_reduce_beta  = compile_compute_program_from_file("gpu/cg_dot_reduce.comp.glsl");
+    ctx->prog_cg_jt_gather_inloop    = compile_compute_program_from_file("gpu/cg_jt_gather.comp.glsl");
+    ctx->prog_cg_jt_gather_postsolve = compile_compute_program_from_file("gpu/cg_jt_gather.comp.glsl");
 
     int ok = ctx->prog_build_j && ctx->prog_build_b && ctx->prog_build_A &&
              ctx->prog_ext_forces && ctx->prog_cg_solve &&
-             ctx->prog_apply_corr && ctx->prog_collision && ctx->prog_edge_edge;
+             ctx->prog_apply_corr && ctx->prog_collision && ctx->prog_edge_edge &&
+             ctx->prog_cg_init && ctx->prog_cg_zero_v && ctx->prog_cg_jt_scatter &&
+             ctx->prog_cg_minv_scale && ctx->prog_cg_j_gather && ctx->prog_cg_dot_reduce &&
+             ctx->prog_cg_update_xr && ctx->prog_cg_update_p &&
+             ctx->prog_cg_jt_gather &&
+             ctx->prog_lbvh_morton_walls && ctx->prog_lbvh_morton_edges &&
+             ctx->prog_lbvh_sort_walls   && ctx->prog_lbvh_sort_edges   &&
+             ctx->prog_lbvh_build_walls  && ctx->prog_lbvh_build_edges  &&
+             ctx->prog_lbvh_prepare_edge_dispatch;
     if (!ok) fprintf(stderr, "GPU: one or more shaders failed to compile.\n");
 
     /* Cache uniform locations */
@@ -427,10 +548,23 @@ int simulator_init_gpu(Simulator *s) {
     ctx->u_cg_max_iter = glGetUniformLocation(ctx->prog_cg_solve,   "u_max_iter");
     ctx->u_cg_tol      = glGetUniformLocation(ctx->prog_cg_solve,   "u_tol");
     ctx->u_ac_n        = glGetUniformLocation(ctx->prog_apply_corr, "u_n");
-    ctx->u_ac_m        = glGetUniformLocation(ctx->prog_apply_corr, "u_m");
     ctx->u_ac_dt       = glGetUniformLocation(ctx->prog_apply_corr, "u_dt");
     ctx->u_ac_sub_dt   = glGetUniformLocation(ctx->prog_apply_corr, "u_sub_dt");
     ctx->u_ac_N        = glGetUniformLocation(ctx->prog_apply_corr, "u_N");
+    // Sparse CG uniform locations
+    ctx->u_ci_m           = glGetUniformLocation(ctx->prog_cg_init,       "u_m");
+    ctx->u_czv_n3         = glGetUniformLocation(ctx->prog_cg_zero_v,     "u_n3");
+    ctx->u_cjs_m          = glGetUniformLocation(ctx->prog_cg_jt_scatter, "u_m");
+    ctx->u_cms_n          = glGetUniformLocation(ctx->prog_cg_minv_scale, "u_n");
+    ctx->u_cjg_m          = glGetUniformLocation(ctx->prog_cg_j_gather,   "u_m");
+    ctx->u_cjg_dt         = glGetUniformLocation(ctx->prog_cg_j_gather,   "u_dt");
+    ctx->u_cdr_n_partials = glGetUniformLocation(ctx->prog_cg_dot_reduce, "u_n_partials");
+    ctx->u_cdr_mode       = glGetUniformLocation(ctx->prog_cg_dot_reduce, "u_mode");
+    ctx->u_cuxr_m         = glGetUniformLocation(ctx->prog_cg_update_xr,  "u_m");
+    ctx->u_cup_m          = glGetUniformLocation(ctx->prog_cg_update_p,   "u_m");
+    ctx->u_cjtg_n3        = glGetUniformLocation(ctx->prog_cg_jt_gather,  "u_n3");
+    ctx->u_cjtg_src       = glGetUniformLocation(ctx->prog_cg_jt_gather,  "u_src");
+    ctx->u_cjtg_apply_minv= glGetUniformLocation(ctx->prog_cg_jt_gather,  "u_apply_minv");
     ctx->u_col_n        = glGetUniformLocation(ctx->prog_collision,  "u_n");
     ctx->u_col_n_tris   = glGetUniformLocation(ctx->prog_collision,  "u_n_tris");
     ctx->u_col_stiffness= glGetUniformLocation(ctx->prog_collision,  "u_stiffness");
@@ -440,6 +574,54 @@ int simulator_init_gpu(Simulator *s) {
     ctx->u_ee_m_total     = glGetUniformLocation(ctx->prog_edge_edge, "u_m_total");
     ctx->u_ee_restitution = glGetUniformLocation(ctx->prog_edge_edge, "u_restitution");
     ctx->u_ee_mu          = glGetUniformLocation(ctx->prog_edge_edge, "u_mu");
+    ctx->u_bvh_w_n_tris   = 0;  // unused (old serial builder removed)
+    ctx->u_bvh_e_m_total  = 0;  // unused
+    // LBVH Pass 1 uniform locations
+    ctx->u_mw_n_prims   = glGetUniformLocation(ctx->prog_lbvh_morton_walls, "u_n_tris");
+    ctx->u_mw_scene_min = glGetUniformLocation(ctx->prog_lbvh_morton_walls, "u_scene_min");
+    ctx->u_mw_scene_max = glGetUniformLocation(ctx->prog_lbvh_morton_walls, "u_scene_max");
+    ctx->u_me_m_total   = glGetUniformLocation(ctx->prog_lbvh_morton_edges, "u_m_total");
+    ctx->u_me_scene_min = glGetUniformLocation(ctx->prog_lbvh_morton_edges, "u_scene_min");
+    ctx->u_me_scene_max = glGetUniformLocation(ctx->prog_lbvh_morton_edges, "u_scene_max");
+    // LBVH Pass 2 uniform locations
+    ctx->u_sw_n_prims  = glGetUniformLocation(ctx->prog_lbvh_sort_walls, "u_n_prims");
+    ctx->u_sw_pass_len = glGetUniformLocation(ctx->prog_lbvh_sort_walls, "u_pass_len");
+    ctx->u_sw_sub_step = glGetUniformLocation(ctx->prog_lbvh_sort_walls, "u_sub_step");
+    ctx->u_sw_local    = glGetUniformLocation(ctx->prog_lbvh_sort_walls, "u_local");
+    ctx->u_se_n_prims  = glGetUniformLocation(ctx->prog_lbvh_sort_edges, "u_n_prims");
+    ctx->u_se_pass_len = glGetUniformLocation(ctx->prog_lbvh_sort_edges, "u_pass_len");
+    ctx->u_se_sub_step = glGetUniformLocation(ctx->prog_lbvh_sort_edges, "u_sub_step");
+    ctx->u_se_local    = glGetUniformLocation(ctx->prog_lbvh_sort_edges, "u_local");
+    // LBVH Pass 3 uniform locations
+    ctx->u_bw_n_prims = glGetUniformLocation(ctx->prog_lbvh_build_walls, "u_n_prims");
+    ctx->u_be_n_prims = glGetUniformLocation(ctx->prog_lbvh_build_edges, "u_n_prims");
+    ctx->u_ped_m_total = glGetUniformLocation(ctx->prog_lbvh_prepare_edge_dispatch, "u_m_total");
+    /* Bake mode value into each dot-reduce variant once at init */
+    if (ctx->prog_cg_dot_reduce_init) {
+        glUseProgram(ctx->prog_cg_dot_reduce_init);
+        glUniform1i(glGetUniformLocation(ctx->prog_cg_dot_reduce_init,  "u_mode"), 0);
+    }
+    if (ctx->prog_cg_dot_reduce_alpha) {
+        glUseProgram(ctx->prog_cg_dot_reduce_alpha);
+        glUniform1i(glGetUniformLocation(ctx->prog_cg_dot_reduce_alpha, "u_mode"), 1);
+    }
+    if (ctx->prog_cg_dot_reduce_beta) {
+        glUseProgram(ctx->prog_cg_dot_reduce_beta);
+        glUniform1i(glGetUniformLocation(ctx->prog_cg_dot_reduce_beta,  "u_mode"), 2);
+    }
+    /* Bake src/minv into jt_gather variants */
+    if (ctx->prog_cg_jt_gather_inloop) {
+        glUseProgram(ctx->prog_cg_jt_gather_inloop);
+        glUniform1i(glGetUniformLocation(ctx->prog_cg_jt_gather_inloop, "u_src"),        0);
+        glUniform1i(glGetUniformLocation(ctx->prog_cg_jt_gather_inloop, "u_apply_minv"), 1);
+        ctx->u_cjtg_il_n3 = glGetUniformLocation(ctx->prog_cg_jt_gather_inloop, "u_n3");
+    }
+    if (ctx->prog_cg_jt_gather_postsolve) {
+        glUseProgram(ctx->prog_cg_jt_gather_postsolve);
+        glUniform1i(glGetUniformLocation(ctx->prog_cg_jt_gather_postsolve, "u_src"),        1);
+        glUniform1i(glGetUniformLocation(ctx->prog_cg_jt_gather_postsolve, "u_apply_minv"), 0);
+        ctx->u_cjtg_ps_n3 = glGetUniformLocation(ctx->prog_cg_jt_gather_postsolve, "u_n3");
+    }
 
     GLuint *ss[] = {
         &ctx->ssbo_positions, &ctx->ssbo_velocities, &ctx->ssbo_inv_mass,
@@ -448,9 +630,13 @@ int simulator_init_gpu(Simulator *s) {
         &ctx->ssbo_b_vec, &ctx->ssbo_l_vec, &ctx->ssbo_collision,
         &ctx->ssbo_r_vec, &ctx->ssbo_p_vec, &ctx->ssbo_Ap_vec,
         &ctx->ssbo_bvh_nodes, &ctx->ssbo_triangles, &ctx->ssbo_wall_indices,
-        &ctx->ssbo_velcorr
+        &ctx->ssbo_velcorr,
+        &ctx->ssbo_edge_bvh, &ctx->ssbo_edge_bvh_scratch, &ctx->ssbo_wall_bvh_scratch,
+        &ctx->ssbo_jt_vec, &ctx->ssbo_cg_scalars, &ctx->ssbo_reduce_buf,
+        &ctx->ssbo_csr_offsets, &ctx->ssbo_csr_data,
+        &ctx->ssbo_indirect_args, &ctx->ssbo_edge_meta
     };
-    for (int i = 0; i < 19; i++) glGenBuffers(1, ss[i]);
+    for (int i = 0; i < 29; i++) glGenBuffers(1, ss[i]);
 
     /* Render programs */
     ctx->prog_draw_nodes       = compile_render_program_from_files(
@@ -492,6 +678,29 @@ void simulator_free_gpu(Simulator *s) {
     if (ctx->prog_apply_corr) glDeleteProgram(ctx->prog_apply_corr);
     if (ctx->prog_collision)  glDeleteProgram(ctx->prog_collision);
     if (ctx->prog_edge_edge)  glDeleteProgram(ctx->prog_edge_edge);
+    // Sparse CG programs
+    if (ctx->prog_cg_init)       glDeleteProgram(ctx->prog_cg_init);
+    if (ctx->prog_cg_zero_v)     glDeleteProgram(ctx->prog_cg_zero_v);
+    if (ctx->prog_cg_jt_scatter) glDeleteProgram(ctx->prog_cg_jt_scatter);
+    if (ctx->prog_cg_minv_scale) glDeleteProgram(ctx->prog_cg_minv_scale);
+    if (ctx->prog_cg_j_gather)   glDeleteProgram(ctx->prog_cg_j_gather);
+    if (ctx->prog_cg_dot_reduce) glDeleteProgram(ctx->prog_cg_dot_reduce);
+    if (ctx->prog_cg_update_xr)  glDeleteProgram(ctx->prog_cg_update_xr);
+    if (ctx->prog_cg_update_p)   glDeleteProgram(ctx->prog_cg_update_p);
+    if (ctx->prog_cg_jt_gather)  glDeleteProgram(ctx->prog_cg_jt_gather);
+    // LBVH programs (prog_bvh_walls/edges are aliases for build programs, don't double-free)
+    if (ctx->prog_lbvh_morton_walls) glDeleteProgram(ctx->prog_lbvh_morton_walls);
+    if (ctx->prog_lbvh_morton_edges) glDeleteProgram(ctx->prog_lbvh_morton_edges);
+    if (ctx->prog_lbvh_sort_walls)   glDeleteProgram(ctx->prog_lbvh_sort_walls);
+    if (ctx->prog_lbvh_sort_edges)   glDeleteProgram(ctx->prog_lbvh_sort_edges);
+    if (ctx->prog_lbvh_build_walls)  glDeleteProgram(ctx->prog_lbvh_build_walls);
+    if (ctx->prog_lbvh_build_edges)  glDeleteProgram(ctx->prog_lbvh_build_edges);
+    if (ctx->prog_lbvh_prepare_edge_dispatch) glDeleteProgram(ctx->prog_lbvh_prepare_edge_dispatch);
+    if (ctx->prog_cg_dot_reduce_init)   glDeleteProgram(ctx->prog_cg_dot_reduce_init);
+    if (ctx->prog_cg_dot_reduce_alpha)  glDeleteProgram(ctx->prog_cg_dot_reduce_alpha);
+    if (ctx->prog_cg_dot_reduce_beta)   glDeleteProgram(ctx->prog_cg_dot_reduce_beta);
+    if (ctx->prog_cg_jt_gather_inloop)    glDeleteProgram(ctx->prog_cg_jt_gather_inloop);
+    if (ctx->prog_cg_jt_gather_postsolve) glDeleteProgram(ctx->prog_cg_jt_gather_postsolve);
     if (ctx->prog_draw_nodes)       glDeleteProgram(ctx->prog_draw_nodes);
     if (ctx->prog_draw_constraints) glDeleteProgram(ctx->prog_draw_constraints);
     if (ctx->prog_draw_walls)       glDeleteProgram(ctx->prog_draw_walls);
@@ -499,20 +708,172 @@ void simulator_free_gpu(Simulator *s) {
     if (ctx->vbo_sphere) glDeleteBuffers(1, &ctx->vbo_sphere);
     if (ctx->ibo_sphere) glDeleteBuffers(1, &ctx->ibo_sphere);
     if (ctx->vao_empty)  glDeleteVertexArrays(1, &ctx->vao_empty);
-    free(ctx->cpu_wall_node_indices); ctx->cpu_wall_node_indices = NULL;
-    GLuint bufs[19] = {
+    /* Unmap persistent buffers before deletion (required by spec) */
+    if (ctx->pos_map) {
+        glBindBuffer(GL_SHADER_STORAGE_BUFFER, ctx->ssbo_positions);
+        glUnmapBuffer(GL_SHADER_STORAGE_BUFFER);
+        ctx->pos_map = NULL;
+    }
+    if (ctx->vel_map) {
+        glBindBuffer(GL_SHADER_STORAGE_BUFFER, ctx->ssbo_velocities);
+        glUnmapBuffer(GL_SHADER_STORAGE_BUFFER);
+        ctx->vel_map = NULL;
+    }
+    if (ctx->readback_fence) {
+        glDeleteSync(ctx->readback_fence);
+        ctx->readback_fence = NULL;
+    }
+    GLuint bufs[29] = {
         ctx->ssbo_positions, ctx->ssbo_velocities, ctx->ssbo_inv_mass,
         ctx->ssbo_ext_forces, ctx->ssbo_node_flags, ctx->ssbo_constraints,
         ctx->ssbo_J_cols, ctx->ssbo_J_vals, ctx->ssbo_A_dense,
         ctx->ssbo_b_vec, ctx->ssbo_l_vec, ctx->ssbo_collision,
         ctx->ssbo_r_vec, ctx->ssbo_p_vec, ctx->ssbo_Ap_vec,
         ctx->ssbo_bvh_nodes, ctx->ssbo_triangles, ctx->ssbo_wall_indices,
-        ctx->ssbo_velcorr
+        ctx->ssbo_velcorr,
+        ctx->ssbo_edge_bvh, ctx->ssbo_edge_bvh_scratch, ctx->ssbo_wall_bvh_scratch,
+        ctx->ssbo_jt_vec, ctx->ssbo_cg_scalars, ctx->ssbo_reduce_buf,
+        ctx->ssbo_csr_offsets, ctx->ssbo_csr_data,
+        ctx->ssbo_indirect_args, ctx->ssbo_edge_meta
     };
-    glDeleteBuffers(19, bufs);
+    glDeleteBuffers(29, bufs);
     free(ctx);
     s->gpu_ctx = NULL;
     s->use_gpu = 0;
+}
+
+// ── LBVH sort helper ──────────────────────────────────────────────────────────
+// Dispatches the bitonic sort for a scratch SSBO that has already been filled
+// with n_prims entries (Morton code in slot [7]).
+// Use u_local=1 for n<=1024 (single workgroup, 32KB shared mem), else 2-pass global bitonic.
+#define LBVH_SORT_LOCAL_MAX 1024
+static void lbvh_dispatch_sort(GLuint prog, GLint u_n, GLint u_pass, GLint u_step, GLint u_local,
+                                int n_prims) {
+    if (n_prims <= 0) return;
+    glUseProgram(prog);
+    glUniform1i(u_n, n_prims);
+
+    if (n_prims <= LBVH_SORT_LOCAL_MAX) {
+        // Single-workgroup shared-memory bitonic sort
+        glUniform1i(u_local, 1);
+        glUniform1i(u_pass,  0);
+        glUniform1i(u_step,  0);
+        glDispatchCompute(1, 1, 1);
+        glMemoryBarrier(GL_SHADER_STORAGE_BARRIER_BIT);
+        return;
+    }
+
+    // Global 2-pass bitonic sort: O(log^2 n) dispatch rounds.
+    // Round up to next power of two.
+    int n2 = 1;
+    while (n2 < n_prims) n2 <<= 1;
+    int half_n2   = n2 >> 1;
+    int groups    = (half_n2 + 63) / 64;
+
+    glUniform1i(u_local, 0);
+    for (int len = 2; len <= n2; len <<= 1) {
+        for (int step = len >> 1; step >= 1; step >>= 1) {
+            glUniform1i(u_pass, len);
+            glUniform1i(u_step, step);
+            glDispatchCompute((GLuint)groups, 1, 1);
+            glMemoryBarrier(GL_SHADER_STORAGE_BARRIER_BIT);
+        }
+    }
+}
+
+// ── LBVH 3-pass build helper ──────────────────────────────────────────────────
+// Runs Morton → Sort → Build for walls.
+// scene_min/max: tight AABB of ALL primitives (for Morton normalization).
+// n_prims: number of triangles.
+static void lbvh_build_walls_gpu(GPUContext *ctx, int n_prims,
+                                  float *scene_min, float *scene_max) {
+    if (n_prims <= 0) return;
+
+    // Pass 1: Morton codes
+    glUseProgram(ctx->prog_lbvh_morton_walls);
+    glUniform1i(ctx->u_mw_n_prims,   n_prims);
+    glUniform3f(ctx->u_mw_scene_min, scene_min[0], scene_min[1], scene_min[2]);
+    glUniform3f(ctx->u_mw_scene_max, scene_max[0], scene_max[1], scene_max[2]);
+    int mg = (n_prims + 63) / 64;
+    glDispatchCompute((GLuint)mg, 1, 1);
+    glMemoryBarrier(GL_SHADER_STORAGE_BARRIER_BIT);
+
+    // Pass 2: Sort
+    lbvh_dispatch_sort(ctx->prog_lbvh_sort_walls,
+                       ctx->u_sw_n_prims, ctx->u_sw_pass_len,
+                       ctx->u_sw_sub_step, ctx->u_sw_local,
+                       n_prims);
+
+    // Pass 3: Build
+    glUseProgram(ctx->prog_lbvh_build_walls);
+    glUniform1i(ctx->u_bw_n_prims, n_prims);
+    int total = (n_prims == 1) ? 1 : (2 * n_prims - 1);
+    int bg    = (total + 63) / 64;
+    glDispatchCompute((GLuint)bg, 1, 1);
+    glMemoryBarrier(GL_SHADER_STORAGE_BARRIER_BIT);
+}
+
+// ── LBVH 3-pass build helper ──────────────────────────────────────────────────
+// Runs Morton → (GPU-prepare args) → Sort → Build for edges.
+// No CPU readback.  The edge count and dispatch args are written GPU-side by
+// prog_lbvh_prepare_edge_dispatch into ssbo_indirect_args (binding 28) and
+// ssbo_edge_meta (binding 29).  Sort and Build use glDispatchComputeIndirect.
+static void lbvh_build_edges_gpu(GPUContext *ctx, int m_total,
+                                  float *scene_min, float *scene_max,
+                                  int *n_edges_out) {
+    if (m_total <= 0) { if (n_edges_out) *n_edges_out = 0; return; }
+
+    /* Zero the atomic counter at escratch[m_total * 8].                         */
+    /* glBufferSubData uploads 1 int without a GPU pipeline stall.               */
+    glBindBuffer(GL_SHADER_STORAGE_BUFFER, ctx->ssbo_edge_bvh_scratch);
+    GLint zero_i = 0;
+    glBufferSubData(GL_SHADER_STORAGE_BUFFER, (GLintptr)(sizeof(int) * (size_t)m_total * 8),
+                    sizeof(GLint), &zero_i);
+
+    /* Pass 1: Morton + compact ─────────────────────────────────────────────── */
+    glUseProgram(ctx->prog_lbvh_morton_edges);
+    glUniform1i(ctx->u_me_m_total,   m_total);
+    glUniform3f(ctx->u_me_scene_min, scene_min[0], scene_min[1], scene_min[2]);
+    glUniform3f(ctx->u_me_scene_max, scene_max[0], scene_max[1], scene_max[2]);
+    int mg = (m_total + 63) / 64;
+    glDispatchCompute((GLuint)mg, 1, 1);
+    /* Barrier: morton writes escratch[] and the atomic counter.                 */
+    glMemoryBarrier(GL_SHADER_STORAGE_BARRIER_BIT);
+
+    /* Pass 1.5: Prepare indirect dispatch args (GPU-side, no CPU readback) ─── */
+    /* Reads escratch[m_total*8] → writes ssbo_indirect_args[0..5] + edge_meta[0] */
+    glUseProgram(ctx->prog_lbvh_prepare_edge_dispatch);
+    glUniform1i(ctx->u_ped_m_total, m_total);
+    glDispatchCompute(1, 1, 1);
+    /* GL_COMMAND_BARRIER_BIT: makes indirect_args visible to glDispatchComputeIndirect */
+    glMemoryBarrier(GL_SHADER_STORAGE_BARRIER_BIT | GL_COMMAND_BARRIER_BIT);
+
+    /* Pass 2: Sort (indirect) ─────────────────────────────────────────────── */
+    /* The sort shader reads n_prims from edge_meta[0]; indirect_args[0..2] = {sort_x,1,1} */
+    glUseProgram(ctx->prog_lbvh_sort_edges);
+    /* u_n_prims=-1 → shader reads n from edge_meta[0] */
+    glUniform1i(ctx->u_se_n_prims, -1);
+    glUniform1i(ctx->u_se_local,    1);   /* always try local first; shader checks n */
+    glUniform1i(ctx->u_se_pass_len, 0);
+    glUniform1i(ctx->u_se_sub_step, 0);
+    glBindBuffer(GL_DISPATCH_INDIRECT_BUFFER, ctx->ssbo_indirect_args);
+    glDispatchComputeIndirect(0);  /* sort_x at offset 0 */
+    glBindBuffer(GL_DISPATCH_INDIRECT_BUFFER, 0);
+    glMemoryBarrier(GL_SHADER_STORAGE_BARRIER_BIT);
+
+    /* Pass 3: Build (indirect) ─────────────────────────────────────────────── */
+    /* u_n_prims=-1 → shader reads n from edge_meta[0] */
+    glUseProgram(ctx->prog_lbvh_build_edges);
+    glUniform1i(ctx->u_be_n_prims, -1);
+    glBindBuffer(GL_DISPATCH_INDIRECT_BUFFER, ctx->ssbo_indirect_args);
+    glDispatchComputeIndirect(12); /* build_x at byte offset 12 (second uvec3) */
+    glBindBuffer(GL_DISPATCH_INDIRECT_BUFFER, 0);
+    glMemoryBarrier(GL_SHADER_STORAGE_BARRIER_BIT);
+
+    /* n_edges_out is no longer available without a stall.  Callers that only   */
+    /* used it for ctx->last_n_edges (informational) get 0 here; that field is  */
+    /* now stale but not used for any logic.                                     */
+    if (n_edges_out) *n_edges_out = 0;
 }
 
 // Upload static scene data (positions/velocities/inv_mass/flags/constraints) and
@@ -523,9 +884,13 @@ void simulator_upload_scene_to_gpu(Simulator *s, PackedScene *p) {
     int n       = p->node_count;
     int m       = p->m_sparse;
     int m_total = p->constraint_count;
-    ctx->node_count = n;
-    ctx->m_sparse   = m;
-    ctx->m_total    = m_total;
+    ctx->node_count  = n;
+    ctx->m_sparse    = m;
+    ctx->m_total     = m_total;
+    ctx->last_n_edges = 0;
+    /* Default generous scene AABB (overwritten below if walls are present) */
+    ctx->scene_min[0] = ctx->scene_min[1] = ctx->scene_min[2] = -100.0f;
+    ctx->scene_max[0] = ctx->scene_max[1] = ctx->scene_max[2] =  100.0f;
 
 #define _BIND(b, ssbo) glBindBufferBase(GL_SHADER_STORAGE_BUFFER, (b), (ssbo))
 
@@ -537,13 +902,37 @@ void simulator_upload_scene_to_gpu(Simulator *s, PackedScene *p) {
             pos4[4*i+0]=p->positions[3*i+0]; pos4[4*i+1]=p->positions[3*i+1]; pos4[4*i+2]=p->positions[3*i+2]; pos4[4*i+3]=p->radius[i];
             vel4[4*i+0]=p->velocities[3*i+0]; vel4[4*i+1]=p->velocities[3*i+1]; vel4[4*i+2]=p->velocities[3*i+2];
         }
+        /* Allocate positions/velocities with immutable persistent+coherent storage so
+           simulator_sync_positions can read them without ever stalling the pipeline.
+           glBufferStorage is one-shot per buffer object: unmap, delete, recreate.   */
+        if (ctx->pos_map) {
+            glBindBuffer(GL_SHADER_STORAGE_BUFFER, ctx->ssbo_positions);
+            glUnmapBuffer(GL_SHADER_STORAGE_BUFFER);
+            ctx->pos_map = NULL;
+        }
+        if (ctx->vel_map) {
+            glBindBuffer(GL_SHADER_STORAGE_BUFFER, ctx->ssbo_velocities);
+            glUnmapBuffer(GL_SHADER_STORAGE_BUFFER);
+            ctx->vel_map = NULL;
+        }
+        /* Delete + recreate so we can call glBufferStorage on a fresh object */
+        glDeleteBuffers(1, &ctx->ssbo_positions);  glGenBuffers(1, &ctx->ssbo_positions);
+        glDeleteBuffers(1, &ctx->ssbo_velocities); glGenBuffers(1, &ctx->ssbo_velocities);
+        GLbitfield stor_flags = GL_MAP_PERSISTENT_BIT | GL_MAP_READ_BIT
+                              | GL_MAP_COHERENT_BIT   | GL_DYNAMIC_STORAGE_BIT;
+        GLbitfield map_flags  = GL_MAP_PERSISTENT_BIT | GL_MAP_READ_BIT | GL_MAP_COHERENT_BIT;
+        GLsizeiptr pv_sz = (GLsizeiptr)(sizeof(float) * (size_t)n * 4);
         glBindBuffer(GL_SHADER_STORAGE_BUFFER, ctx->ssbo_positions);
-        glBufferData(GL_SHADER_STORAGE_BUFFER, sizeof(float)*n*4, pos4, GL_DYNAMIC_DRAW);
+        glBufferStorage(GL_SHADER_STORAGE_BUFFER, pv_sz, pos4, stor_flags);
+        ctx->pos_map = (float*)glMapBufferRange(GL_SHADER_STORAGE_BUFFER, 0, pv_sz, map_flags);
         _BIND(0, ctx->ssbo_positions);
         glBindBuffer(GL_SHADER_STORAGE_BUFFER, ctx->ssbo_velocities);
-        glBufferData(GL_SHADER_STORAGE_BUFFER, sizeof(float)*n*4, vel4, GL_DYNAMIC_DRAW);
+        glBufferStorage(GL_SHADER_STORAGE_BUFFER, pv_sz, vel4, stor_flags);
+        ctx->vel_map = (float*)glMapBufferRange(GL_SHADER_STORAGE_BUFFER, 0, pv_sz, map_flags);
         _BIND(1, ctx->ssbo_velocities);
         free(pos4); free(vel4);
+        if (!ctx->pos_map || !ctx->vel_map)
+            fprintf(stderr, "GPU: persistent map failed — sync_positions will use slow path\n");
 
         glBindBuffer(GL_SHADER_STORAGE_BUFFER, ctx->ssbo_inv_mass);
         glBufferData(GL_SHADER_STORAGE_BUFFER, sizeof(float)*n, p->inv_mass, GL_STATIC_DRAW);
@@ -594,8 +983,9 @@ void simulator_upload_scene_to_gpu(Simulator *s, PackedScene *p) {
         glBindBuffer(GL_SHADER_STORAGE_BUFFER, ctx->ssbo_J_vals);
         glBufferData(GL_SHADER_STORAGE_BUFFER, sizeof(float)*m*6, NULL, GL_DYNAMIC_DRAW);
         _BIND(7, ctx->ssbo_J_vals);
+        // A_dense: stub (1 float) — build_A is not dispatched in the sparse CG path
         glBindBuffer(GL_SHADER_STORAGE_BUFFER, ctx->ssbo_A_dense);
-        glBufferData(GL_SHADER_STORAGE_BUFFER, sizeof(float)*(size_t)m*m, NULL, GL_DYNAMIC_DRAW);
+        glBufferData(GL_SHADER_STORAGE_BUFFER, sizeof(float), NULL, GL_DYNAMIC_DRAW);
         _BIND(8, ctx->ssbo_A_dense);
         int bindings[] = { 9, 10, 12, 13, 14 };
         GLuint *vbufs[] = { &ctx->ssbo_b_vec, &ctx->ssbo_l_vec, &ctx->ssbo_r_vec, &ctx->ssbo_p_vec, &ctx->ssbo_Ap_vec };
@@ -604,69 +994,138 @@ void simulator_upload_scene_to_gpu(Simulator *s, PackedScene *p) {
             glBufferData(GL_SHADER_STORAGE_BUFFER, sizeof(float)*m, NULL, GL_DYNAMIC_DRAW);
             _BIND(bindings[i], *vbufs[i]);
         }
+        // Sparse CG SSBOs
+        int n_partials = (m + 63) / 64;
+        glBindBuffer(GL_SHADER_STORAGE_BUFFER, ctx->ssbo_jt_vec);
+        glBufferData(GL_SHADER_STORAGE_BUFFER, sizeof(float)*(size_t)n*3, NULL, GL_DYNAMIC_DRAW);
+        _BIND(23, ctx->ssbo_jt_vec);
+        glBindBuffer(GL_SHADER_STORAGE_BUFFER, ctx->ssbo_cg_scalars);
+        glBufferData(GL_SHADER_STORAGE_BUFFER, sizeof(float)*8, NULL, GL_DYNAMIC_DRAW);
+        _BIND(24, ctx->ssbo_cg_scalars);
+        glBindBuffer(GL_SHADER_STORAGE_BUFFER, ctx->ssbo_reduce_buf);
+        glBufferData(GL_SHADER_STORAGE_BUFFER, sizeof(float)*(size_t)n_partials, NULL, GL_DYNAMIC_DRAW);
+        _BIND(25, ctx->ssbo_reduce_buf);
+
+        /* Build static J^T CSR (topology fixed at upload; only J_vals change per substep).
+           For each DOF d = 3*node+dim, store list of (c, k_slot) pairs where
+           J_cols[c*6+k] == d.  CT_DIST=1: slots 0-2 for a_idx, 3-5 for b_idx if not anchored.
+           CT_ANCHOR=3: slots 0-2 for a_idx only. */
+        {
+            /* max 6 entries per constraint */
+            int *tmp = (int*)malloc(sizeof(int) * m * 6 * 3); /* (dof,c,k) triples */
+            int n_ent = 0;
+            for (int c = 0; c < m; c++) {
+                int ctype = p->ctype[c];
+                int a_idx = p->a_idx[c];
+                int b_idx = p->b_idx[c];
+                if (a_idx >= 0 && (ctype == 1 || ctype == 3)) {
+                    for (int d = 0; d < 3; d++) {
+                        tmp[n_ent*3+0] = 3*a_idx+d; tmp[n_ent*3+1] = c; tmp[n_ent*3+2] = d;
+                        n_ent++;
+                    }
+                }
+                if (ctype == 1 && b_idx >= 0 && !(p->flags[b_idx] & 1u)) {
+                    for (int d = 0; d < 3; d++) {
+                        tmp[n_ent*3+0] = 3*b_idx+d; tmp[n_ent*3+1] = c; tmp[n_ent*3+2] = 3+d;
+                        n_ent++;
+                    }
+                }
+            }
+            ctx->n_csr_entries = n_ent;
+            int dof_count = 3 * n;
+            /* counting sort by dof */
+            int *cnts = (int*)calloc((size_t)dof_count, sizeof(int));
+            for (int e = 0; e < n_ent; e++) cnts[tmp[e*3+0]]++;
+            int *off = (int*)malloc(sizeof(int) * ((size_t)dof_count + 1));
+            off[0] = 0;
+            for (int d = 0; d < dof_count; d++) off[d+1] = off[d] + cnts[d];
+            int *csr_d = (int*)(n_ent > 0 ? malloc(sizeof(int)*n_ent*2) : malloc(sizeof(int)));
+            int *pos   = (int*)calloc((size_t)dof_count, sizeof(int));
+            for (int e = 0; e < n_ent; e++) {
+                int dof = tmp[e*3+0];
+                int idx = off[dof] + pos[dof]++;
+                csr_d[idx*2+0] = tmp[e*3+1]; /* c */
+                csr_d[idx*2+1] = tmp[e*3+2]; /* k */
+            }
+            glBindBuffer(GL_SHADER_STORAGE_BUFFER, ctx->ssbo_csr_offsets);
+            glBufferData(GL_SHADER_STORAGE_BUFFER, sizeof(int)*((size_t)dof_count+1), off, GL_STATIC_DRAW);
+            _BIND(26, ctx->ssbo_csr_offsets);
+            glBindBuffer(GL_SHADER_STORAGE_BUFFER, ctx->ssbo_csr_data);
+            glBufferData(GL_SHADER_STORAGE_BUFFER, n_ent > 0 ? sizeof(int)*n_ent*2 : sizeof(int), csr_d, GL_STATIC_DRAW);
+            _BIND(27, ctx->ssbo_csr_data);
+            free(tmp); free(cnts); free(off); free(csr_d); free(pos);
+        }
+
+        /* ssbo_indirect_args (binding 28): 6 uints = 2x DispatchIndirectCommand.
+           Initialise to {1,1,1, 1,1,1} — safe default (shader guards on n<=0). */
+        glBindBuffer(GL_SHADER_STORAGE_BUFFER, ctx->ssbo_indirect_args);
+        static const GLuint init_args[6] = {1,1,1, 1,1,1};
+        glBufferData(GL_SHADER_STORAGE_BUFFER, sizeof(init_args), init_args, GL_DYNAMIC_DRAW);
+        glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 28, ctx->ssbo_indirect_args);
+
+        /* ssbo_edge_meta (binding 29): 2 ints [n_edges, n_wall_prims(unused)].
+           Initialise to {0, n_wall_prims} — n_wall_prims is filled once at upload. */
+        int edge_meta_init[2] = {0, 0};
+        glBindBuffer(GL_SHADER_STORAGE_BUFFER, ctx->ssbo_edge_meta);
+        glBufferData(GL_SHADER_STORAGE_BUFFER, sizeof(edge_meta_init), edge_meta_init, GL_DYNAMIC_DRAW);
+        glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 29, ctx->ssbo_edge_meta);
     }
 #undef _BIND
 
-    /* Build flat BVH for static triangle walls, upload once */
+    /* --- Wall triangle index SSBO (binding 17) + LBVH build (bindings 15, 22) --- */
     {
-        int tcount = p->triangle_count;
+        int tcount = (int)dynarray_size(s->walls);
         ctx->n_triangles = tcount;
-        ctx->n_bvh_nodes = 0;
-        if (tcount > 0 && p->triangle_vertices) {
-            const float *tv = p->triangle_vertices;
-            BVHPrim *prims = (BVHPrim*)malloc(sizeof(BVHPrim) * (size_t)tcount);
+        if (tcount > 0) {
+            /* Upload wall node indices in original scene order (not sorted).
+               The LBVH morton shader reads SSBO 17 + SSBO 0 → SSBO 22 scratch.
+               SSBO 17 stays in scene order (required by wall_vert). */
+            int *widx_data = (int*)malloc(sizeof(int) * 4 * (size_t)tcount);
+            /* Compute scene AABB on CPU for Morton normalization */
+            float scene_min[3] = { 1e30f,  1e30f,  1e30f};
+            float scene_max[3] = {-1e30f, -1e30f, -1e30f};
             for (int i = 0; i < tcount; i++) {
-                float ax=tv[9*i+0],ay=tv[9*i+1],az=tv[9*i+2];
-                float bx=tv[9*i+3],by=tv[9*i+4],bz=tv[9*i+5];
-                float cx=tv[9*i+6],cy=tv[9*i+7],cz=tv[9*i+8];
-                prims[i].min[0]=fminf(fminf(ax,bx),cx)-0.01f;
-                prims[i].min[1]=fminf(fminf(ay,by),cy)-0.01f;
-                prims[i].min[2]=fminf(fminf(az,bz),cz)-0.01f;
-                prims[i].max[0]=fmaxf(fmaxf(ax,bx),cx)+0.01f;
-                prims[i].max[1]=fmaxf(fmaxf(ay,by),cy)+0.01f;
-                prims[i].max[2]=fmaxf(fmaxf(az,bz),cz)+0.01f;
-                prims[i].prim = i;
+                TriangleWall *w = (TriangleWall*)dynarray_get(s->walls, i);
+                widx_data[4*i+0] = w->A->idx;
+                widx_data[4*i+1] = w->B->idx;
+                widx_data[4*i+2] = w->C->idx;
+                widx_data[4*i+3] = 0;
+                Node *verts[3] = {w->A, w->B, w->C};
+                for (int v = 0; v < 3; v++) {
+                    for (int d = 0; d < 3; d++) {
+                        if (verts[v]->pos[d] < scene_min[d]) scene_min[d] = verts[v]->pos[d];
+                        if (verts[v]->pos[d] > scene_max[d]) scene_max[d] = verts[v]->pos[d];
+                    }
+                }
             }
-            IntBuf bvh_buf = {0};
-            bvh_build_rec(prims, 0, tcount, &bvh_buf);
-            ctx->n_bvh_nodes = bvh_buf.size / 10;
-            /* Reorder triangle data to match BVH leaf order */
-            int *tri_data = (int*)malloc(sizeof(int) * 12 * (size_t)tcount);
-            for (int i = 0; i < tcount; i++) {
-                int o = prims[i].prim;
-                float ax=tv[9*o+0],ay=tv[9*o+1],az=tv[9*o+2];
-                float bx=tv[9*o+3],by=tv[9*o+4],bz=tv[9*o+5];
-                float cx=tv[9*o+6],cy=tv[9*o+7],cz=tv[9*o+8];
-                tri_data[12*i+ 0]=fbits(ax); tri_data[12*i+ 1]=fbits(ay); tri_data[12*i+ 2]=fbits(az); tri_data[12*i+ 3]=-1;
-                tri_data[12*i+ 4]=fbits(bx); tri_data[12*i+ 5]=fbits(by); tri_data[12*i+ 6]=fbits(bz); tri_data[12*i+ 7]=-1;
-                tri_data[12*i+ 8]=fbits(cx); tri_data[12*i+ 9]=fbits(cy); tri_data[12*i+10]=fbits(cz); tri_data[12*i+11]=-1;
-            }
-            glBindBuffer(GL_SHADER_STORAGE_BUFFER, ctx->ssbo_bvh_nodes);
-            glBufferData(GL_SHADER_STORAGE_BUFFER, sizeof(int)*(size_t)bvh_buf.size, bvh_buf.data, GL_STATIC_DRAW);
-            glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 15, ctx->ssbo_bvh_nodes);
-            glBindBuffer(GL_SHADER_STORAGE_BUFFER, ctx->ssbo_triangles);
-            glBufferData(GL_SHADER_STORAGE_BUFFER, sizeof(int)*12*(size_t)tcount, tri_data, GL_STATIC_DRAW);
-            glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 16, ctx->ssbo_triangles);
+            /* Pad scene AABB slightly so edge prims at the boundary get valid codes */
+            for (int d = 0; d < 3; d++) { scene_min[d] -= 0.1f; scene_max[d] += 0.1f; }
 
-            /* Build wall node index SSBO (binding 17) — reordered same as tri_data */
-            int *widx_data = (int*)malloc(sizeof(int)*4*(size_t)tcount);
-            int *cpuidx    = (int*)malloc(sizeof(int)*3*(size_t)tcount);
-            for (int i = 0; i < tcount; i++) {
-                int o = prims[i].prim;  /* original wall index before BVH sort */
-                TriangleWall *w = (TriangleWall*)dynarray_get(s->walls, o);
-                widx_data[4*i+0] = w->A->idx; widx_data[4*i+1] = w->B->idx;
-                widx_data[4*i+2] = w->C->idx; widx_data[4*i+3] = 0;
-                cpuidx[3*i+0] = w->A->idx; cpuidx[3*i+1] = w->B->idx; cpuidx[3*i+2] = w->C->idx;
+            /* Store in ctx for per-substep edge build (generous bounds) */
+            for (int d = 0; d < 3; d++) {
+                ctx->scene_min[d] = scene_min[d] - 10.0f;
+                ctx->scene_max[d] = scene_max[d] + 10.0f;
             }
-            free(ctx->cpu_wall_node_indices);
-            ctx->cpu_wall_node_indices = cpuidx;
+
             glBindBuffer(GL_SHADER_STORAGE_BUFFER, ctx->ssbo_wall_indices);
             glBufferData(GL_SHADER_STORAGE_BUFFER, sizeof(int)*4*(size_t)tcount, widx_data, GL_STATIC_DRAW);
             glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 17, ctx->ssbo_wall_indices);
             free(widx_data);
 
-            free(bvh_buf.data); free(tri_data); free(prims);
-            fprintf(stderr, "GPU: BVH built (%d nodes, %d tris).\n", ctx->n_bvh_nodes, tcount);
+            /* Allocate BVH node buffer (binding 15): 2*tcount nodes (LBVH: n-1 internal + n leaf) */
+            glBindBuffer(GL_SHADER_STORAGE_BUFFER, ctx->ssbo_bvh_nodes);
+            glBufferData(GL_SHADER_STORAGE_BUFFER, sizeof(int)*10*2*(size_t)tcount, NULL, GL_DYNAMIC_DRAW);
+            glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 15, ctx->ssbo_bvh_nodes);
+
+            /* Allocate wall BVH scratch (binding 22): 8 ints/prim */
+            glBindBuffer(GL_SHADER_STORAGE_BUFFER, ctx->ssbo_wall_bvh_scratch);
+            glBufferData(GL_SHADER_STORAGE_BUFFER, sizeof(int)*8*(size_t)tcount, NULL, GL_DYNAMIC_DRAW);
+            glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 22, ctx->ssbo_wall_bvh_scratch);
+
+            /* Dispatch LBVH 3-pass pipeline (walls are static — built once) */
+            lbvh_build_walls_gpu(ctx, tcount, scene_min, scene_max);
+            fprintf(stderr, "GPU: wall LBVH built on GPU (%d tris, %d nodes).\n",
+                    tcount, (tcount == 1) ? 1 : (2*tcount - 1));
         }
     }
 
@@ -677,6 +1136,20 @@ void simulator_upload_scene_to_gpu(Simulator *s, PackedScene *p) {
         glBufferData(GL_SHADER_STORAGE_BUFFER, sizeof(GLuint) * (size_t)n * 3, NULL, GL_DYNAMIC_DRAW);
         glClearBufferData(GL_SHADER_STORAGE_BUFFER, GL_R32UI, GL_RED_INTEGER, GL_UNSIGNED_INT, &zero);
         glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 18, ctx->ssbo_velcorr);
+    }
+
+    /* --- edge BVH SSBOs (bindings 20-21): allocated once, rebuilt GPU-side each substep ---
+       Scratch needs one extra int at offset [m_total*8] for the atomic compact counter. */
+    if (m_total > 0) {
+        /* worst case: 2*m_total BVH nodes */
+        glBindBuffer(GL_SHADER_STORAGE_BUFFER, ctx->ssbo_edge_bvh);
+        glBufferData(GL_SHADER_STORAGE_BUFFER, sizeof(int)*10*2*(size_t)m_total, NULL, GL_DYNAMIC_DRAW);
+        glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 20, ctx->ssbo_edge_bvh);
+
+        /* scratch: 8 ints/prim + 1 extra int for atomic counter at slot [m_total*8] */
+        glBindBuffer(GL_SHADER_STORAGE_BUFFER, ctx->ssbo_edge_bvh_scratch);
+        glBufferData(GL_SHADER_STORAGE_BUFFER, sizeof(int)*((size_t)m_total*8 + 1), NULL, GL_DYNAMIC_DRAW);
+        glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 21, ctx->ssbo_edge_bvh_scratch);
     }
 
     fprintf(stderr, "GPU: scene uploaded (n=%d, m_sparse=%d, m_total=%d).\n", n, m, m_total);
@@ -1216,7 +1689,9 @@ void simulator_gpu_step(Simulator *s) {
 
     /* Validate all shaders compiled */
     if (!ctx->prog_ext_forces || !ctx->prog_build_j || !ctx->prog_build_b ||
-        !ctx->prog_build_A    || !ctx->prog_cg_solve || !ctx->prog_apply_corr) {
+        !ctx->prog_cg_init    || !ctx->prog_cg_zero_v || !ctx->prog_cg_jt_scatter ||
+        !ctx->prog_cg_minv_scale || !ctx->prog_cg_j_gather || !ctx->prog_cg_dot_reduce ||
+        !ctx->prog_cg_update_xr  || !ctx->prog_cg_update_p || !ctx->prog_apply_corr) {
         fprintf(stderr, "[GPU] One or more compute programs not compiled — cannot step\n");
         return;
     }
@@ -1225,15 +1700,12 @@ void simulator_gpu_step(Simulator *s) {
     int m       = ctx->m_sparse;
     int m_total = ctx->m_total;
     if (n <= 0) return;
-    if (m > 512) {
-        fprintf(stderr, "[GPU] m_sparse=%d exceeds single-workgroup CG limit (512)\n", m);
-        return;
-    }
+    /* Sparse CG supports unlimited m — no 512-constraint cap */
 
     int   N      = (s->solver_iters > 0) ? s->solver_iters : 1;
     float sub_dt = s->dt / (float)N;
 
-    /* -- Bind all 17 SSBOs once (never change within a frame) -- */
+    /* -- Bind all SSBOs once (never change within a frame except slot 13 swap) -- */
     glBindBufferBase(GL_SHADER_STORAGE_BUFFER,  0, ctx->ssbo_positions);
     glBindBufferBase(GL_SHADER_STORAGE_BUFFER,  1, ctx->ssbo_velocities);
     glBindBufferBase(GL_SHADER_STORAGE_BUFFER,  2, ctx->ssbo_inv_mass);
@@ -1253,11 +1725,20 @@ void simulator_gpu_step(Simulator *s) {
     glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 16, ctx->ssbo_triangles);
     glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 17, ctx->ssbo_wall_indices);
     glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 18, ctx->ssbo_velcorr);
+    glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 20, ctx->ssbo_edge_bvh);
+    glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 21, ctx->ssbo_edge_bvh_scratch);
+    glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 22, ctx->ssbo_wall_bvh_scratch);
+    glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 23, ctx->ssbo_jt_vec);
+    glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 24, ctx->ssbo_cg_scalars);
+    glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 25, ctx->ssbo_reduce_buf);
+    glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 26, ctx->ssbo_csr_offsets);
+    glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 27, ctx->ssbo_csr_data);
+    glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 28, ctx->ssbo_indirect_args);
+    glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 29, ctx->ssbo_edge_meta);
 
     /* -- Set all uniforms once (constant across substeps) -- */
     int ng = (n + 63) / 64;
     int mg = (m > 0) ? (m + 63) / 64 : 0;
-    int wg = (m > 0) ? (m + 7)  / 8  : 0;
 
     if (ctx->prog_collision && ctx->n_triangles > 0) {
         glUseProgram(ctx->prog_collision);
@@ -1265,7 +1746,7 @@ void simulator_gpu_step(Simulator *s) {
         glUniform1i(ctx->u_col_n_tris,    ctx->n_triangles);
         glUniform1f(ctx->u_col_stiffness, 500.0f);
         glUniform1f(ctx->u_col_damp,      100.0f);
-        glUniform1f(ctx->u_col_fr,          0.4f);  /* μ kinetic: 0=frictionless, 1=very grippy */
+        glUniform1f(ctx->u_col_fr,          0.4f);
     }
 
     if (ctx->prog_edge_edge && m_total > 0) {
@@ -1289,18 +1770,56 @@ void simulator_gpu_step(Simulator *s) {
         glUseProgram(ctx->prog_build_b);
         glUniform1i(ctx->u_bb_m, m);
 
-        glUseProgram(ctx->prog_build_A);
-        glUniform1i(ctx->u_ba_m,  m);
-        glUniform1f(ctx->u_ba_dt, sub_dt);
+        // --- Sparse CG uniforms (invariant across substeps) ---
+        int n_partials = (m + 63) / 64;
 
-        glUseProgram(ctx->prog_cg_solve);
-        glUniform1i(ctx->u_cg_m,        m);
-        glUniform1i(ctx->u_cg_max_iter, 200);
-        glUniform1f(ctx->u_cg_tol,      1e-12f);
+        glUseProgram(ctx->prog_cg_init);
+        glUniform1i(ctx->u_ci_m, m);
+
+        /* Baked jt_gather variants — only n3 varies per scene upload */
+        if (ctx->prog_cg_jt_gather_inloop) {
+            glUseProgram(ctx->prog_cg_jt_gather_inloop);
+            glUniform1i(ctx->u_cjtg_il_n3, 3 * n);
+        }
+        if (ctx->prog_cg_jt_gather_postsolve) {
+            glUseProgram(ctx->prog_cg_jt_gather_postsolve);
+            glUniform1i(ctx->u_cjtg_ps_n3, 3 * n);
+        }
+        /* Legacy jt_gather — kept as fallback */
+        glUseProgram(ctx->prog_cg_jt_gather);
+        glUniform1i(ctx->u_cjtg_n3, 3 * n);
+
+        glUseProgram(ctx->prog_cg_j_gather);
+        glUniform1i(ctx->u_cjg_m,  m);
+        glUniform1f(ctx->u_cjg_dt, sub_dt);
+
+        /* Baked dot-reduce variants — n_partials is the only per-scene uniform */
+        GLint u_np = ctx->u_cdr_n_partials;
+        if (ctx->prog_cg_dot_reduce_init) {
+            glUseProgram(ctx->prog_cg_dot_reduce_init);
+            glUniform1i(glGetUniformLocation(ctx->prog_cg_dot_reduce_init,  "u_n_partials"), n_partials);
+        }
+        if (ctx->prog_cg_dot_reduce_alpha) {
+            glUseProgram(ctx->prog_cg_dot_reduce_alpha);
+            glUniform1i(glGetUniformLocation(ctx->prog_cg_dot_reduce_alpha, "u_n_partials"), n_partials);
+        }
+        if (ctx->prog_cg_dot_reduce_beta) {
+            glUseProgram(ctx->prog_cg_dot_reduce_beta);
+            glUniform1i(glGetUniformLocation(ctx->prog_cg_dot_reduce_beta,  "u_n_partials"), n_partials);
+        }
+        /* Legacy dot_reduce — fallback */
+        glUseProgram(ctx->prog_cg_dot_reduce);
+        glUniform1i(u_np, n_partials);
+        (void)u_np;
+
+        glUseProgram(ctx->prog_cg_update_xr);
+        glUniform1i(ctx->u_cuxr_m, m);
+
+        glUseProgram(ctx->prog_cg_update_p);
+        glUniform1i(ctx->u_cup_m, m);
 
         glUseProgram(ctx->prog_apply_corr);
         glUniform1i(ctx->u_ac_n,      n);
-        glUniform1i(ctx->u_ac_m,      m);
         glUniform1f(ctx->u_ac_dt,     s->dt);
         glUniform1f(ctx->u_ac_sub_dt, sub_dt);
         glUniform1i(ctx->u_ac_N,      N);
@@ -1308,22 +1827,32 @@ void simulator_gpu_step(Simulator *s) {
 
     for (int sub = 0; sub < N; sub++) {
 
-        /* -- edge-edge capsule collision: writes velocity impulses to velcorr (binding 18) -- */
-        if (ctx->prog_edge_edge && m_total > 0) {
-            int ee_groups = (m_total * m_total + 63) / 64;
-            glUseProgram(ctx->prog_edge_edge);
-            glDispatchCompute((GLuint)ee_groups, 1, 1);
-            /* no barrier yet — apply_corr reads velcorr at the end of the substep */
+        /* -- Build edge LBVH for this substep (positions may have changed) --
+           Use a generous fixed scene AABB for Morton normalization.           */
+        if (m_total > 0 && ctx->prog_lbvh_morton_edges && ctx->prog_lbvh_sort_edges && ctx->prog_lbvh_build_edges) {
+            float smin[3] = { ctx->scene_min[0], ctx->scene_min[1], ctx->scene_min[2] };
+            float smax[3] = { ctx->scene_max[0], ctx->scene_max[1], ctx->scene_max[2] };
+            int n_edges = 0;
+            lbvh_build_edges_gpu(ctx, m_total, smin, smax, &n_edges);
+            ctx->last_n_edges = n_edges;
         }
 
-        /* -- 0+1. GPU BVH collision + ext_forces (independent → one barrier) -- */
+        /* -- Edge-edge collision: 1 thread/edge, BVH traversal (O(m log m)) -- */
+        if (ctx->prog_edge_edge && m_total > 0) {
+            int ee_groups = (m_total + 63) / 64;   /* 1 thread per edge (was m²/64) */
+            glUseProgram(ctx->prog_edge_edge);
+            glDispatchCompute((GLuint)ee_groups, 1, 1);
+            /* no barrier yet — apply_corr reads velcorr at end of substep */
+        }
+
+        /* -- Sphere-triangle collision (BVH traversal) + ext_forces (independent) -- */
         if (ctx->prog_collision && ctx->n_triangles > 0) {
             glUseProgram(ctx->prog_collision);
             glDispatchCompute((GLuint)ng, 1, 1);
         }
         glUseProgram(ctx->prog_ext_forces);
         glDispatchCompute((GLuint)ng, 1, 1);
-        glMemoryBarrier(GL_SHADER_STORAGE_BARRIER_BIT);  /* covers both 0 and 1 */
+        glMemoryBarrier(GL_SHADER_STORAGE_BARRIER_BIT);
 
         if (m > 0) {
             /* -- 2. Build J -- */
@@ -1336,28 +1865,98 @@ void simulator_gpu_step(Simulator *s) {
             glDispatchCompute((GLuint)mg, 1, 1);
             glMemoryBarrier(GL_SHADER_STORAGE_BARRIER_BIT);
 
-            /* -- 4. Build A -- */
-            glUseProgram(ctx->prog_build_A);
-            glDispatchCompute((GLuint)wg, (GLuint)wg, 1);
-            glMemoryBarrier(GL_SHADER_STORAGE_BARRIER_BIT);
+            /* -- 4-7. Sparse CG: Aλ = b  where A = dt² J M⁻¹ Jᵀ (implicit, CSR gather) -- */
+            {
+                int jsg = mg;                        /* ceil(m/64)  */
+                int jtg = (3*n + 63) / 64;           /* ceil(3n/64) */
 
-            /* -- 5. CG solve -- */
-            glUseProgram(ctx->prog_cg_solve);
-            glDispatchCompute(1, 1, 1);
-            glMemoryBarrier(GL_SHADER_STORAGE_BARRIER_BIT);
+                /* Resolve baked program handles (fall back to generic if not compiled) */
+                GLuint dr_init  = ctx->prog_cg_dot_reduce_init  ? ctx->prog_cg_dot_reduce_init  : ctx->prog_cg_dot_reduce;
+                GLuint dr_alpha = ctx->prog_cg_dot_reduce_alpha ? ctx->prog_cg_dot_reduce_alpha : ctx->prog_cg_dot_reduce;
+                GLuint dr_beta  = ctx->prog_cg_dot_reduce_beta  ? ctx->prog_cg_dot_reduce_beta  : ctx->prog_cg_dot_reduce;
+                GLuint jtg_il   = ctx->prog_cg_jt_gather_inloop    ? ctx->prog_cg_jt_gather_inloop    : ctx->prog_cg_jt_gather;
+                GLuint jtg_ps   = ctx->prog_cg_jt_gather_postsolve ? ctx->prog_cg_jt_gather_postsolve : ctx->prog_cg_jt_gather;
 
-            /* -- 6. Optional debug comparison (first substep only) -- */
-            if (ctx->gpu_debug && sub == 0) {
-                gpu_debug_compare(ctx, s, sub_dt);
+                /* When falling back to generic programs, re-apply the uniforms that
+                   the baked variants have pre-set.  Baked variants skip these calls. */
+                int using_generic_dr  = (dr_init == ctx->prog_cg_dot_reduce);
+                int using_generic_jtg = (jtg_il  == ctx->prog_cg_jt_gather);
+
+                /* Init: x=0, r=p=b; partial r·r → reduce_buf */
+                glUseProgram(ctx->prog_cg_init);
+                glDispatchCompute((GLuint)jsg, 1, 1);
+                glMemoryBarrier(GL_SHADER_STORAGE_BARRIER_BIT);
+
+                /* reduce_buf → rr₀ → cg_scalars[0]  (baked mode=0, no glUniform) */
+                glUseProgram(dr_init);
+                if (using_generic_dr) glUniform1i(ctx->u_cdr_mode, 0);
+                glDispatchCompute(1, 1, 1);
+                glMemoryBarrier(GL_SHADER_STORAGE_BARRIER_BIT);
+
+                /* Fixed-iteration CG — no CPU readback, no glUniform inside loop */
+                int max_cg_iter = (m < 20) ? m : 20;
+                for (int iter = 0; iter < max_cg_iter; iter++) {
+
+                    /* jt_vec = M⁻¹ Jᵀ p  (baked: src=p, minv=1) */
+                    glUseProgram(jtg_il);
+                    if (using_generic_jtg) {
+                        glUniform1i(ctx->u_cjtg_src,        0);
+                        glUniform1i(ctx->u_cjtg_apply_minv, 1);
+                    }
+                    glDispatchCompute((GLuint)jtg, 1, 1);
+                    glMemoryBarrier(GL_SHADER_STORAGE_BARRIER_BIT);
+
+                    /* Ap = dt² J jt_vec + 1e-10*p; partial p·Ap → reduce_buf */
+                    glUseProgram(ctx->prog_cg_j_gather);
+                    glDispatchCompute((GLuint)jsg, 1, 1);
+                    glMemoryBarrier(GL_SHADER_STORAGE_BARRIER_BIT);
+
+                    /* reduce_buf → pAp; α = rr/pAp  (baked mode=1) */
+                    glUseProgram(dr_alpha);
+                    if (using_generic_dr) glUniform1i(ctx->u_cdr_mode, 1);
+                    glDispatchCompute(1, 1, 1);
+                    glMemoryBarrier(GL_SHADER_STORAGE_BARRIER_BIT);
+
+                    /* x += α*p;  r -= α*Ap;  partial r·r → reduce_buf */
+                    glUseProgram(ctx->prog_cg_update_xr);
+                    glDispatchCompute((GLuint)jsg, 1, 1);
+                    glMemoryBarrier(GL_SHADER_STORAGE_BARRIER_BIT);
+
+                    /* reduce_buf → rr_new; β = rr_new/rr  (baked mode=2) */
+                    glUseProgram(dr_beta);
+                    if (using_generic_dr) glUniform1i(ctx->u_cdr_mode, 2);
+                    glDispatchCompute(1, 1, 1);
+                    glMemoryBarrier(GL_SHADER_STORAGE_BARRIER_BIT);
+
+                    /* p = r + β*p */
+                    glUseProgram(ctx->prog_cg_update_p);
+                    glDispatchCompute((GLuint)jsg, 1, 1);
+                    glMemoryBarrier(GL_SHADER_STORAGE_BARRIER_BIT);
+                }
+
+                /* Post-solve: jt_vec = Jᵀλ (raw, no M⁻¹)  (baked: src=λ, minv=0) */
+                glUseProgram(jtg_ps);
+                if (using_generic_jtg) {
+                    glUniform1i(ctx->u_cjtg_src,        1);
+                    glUniform1i(ctx->u_cjtg_apply_minv, 0);
+                }
+                glDispatchCompute((GLuint)jtg, 1, 1);
+                glMemoryBarrier(GL_SHADER_STORAGE_BARRIER_BIT);
             }
 
-            /* -- 7. Apply corrections + integrate -- */
+            /* -- 8. Apply corrections + integrate -- */
             glUseProgram(ctx->prog_apply_corr);
             glDispatchCompute((GLuint)ng, 1, 1);
             glMemoryBarrier(GL_SHADER_STORAGE_BARRIER_BIT);
         }
 
     } /* end substep loop */
+
+    /* Plant a fence so simulator_sync_positions can check (non-blocking) when the
+       GPU has finished writing positions/velocities.  With GL_MAP_COHERENT_BIT the
+       data is automatically visible to the CPU once the fence signals.             */
+    if (ctx->readback_fence) glDeleteSync(ctx->readback_fence);
+    ctx->readback_fence = glFenceSync(GL_SYNC_GPU_COMMANDS_COMPLETE, 0);
 }
 
 // // Incremental octree rebuild: only update dirty nodes
@@ -1844,26 +2443,55 @@ void simulator_step(Simulator *s) {
 
 /* Read back GPU positions + velocities to the CPU Node structs.
    Call once per render frame (not inside the substep loop) so that
-   UI picking / drag-force code has up-to-date positions. */
+   UI picking / drag-force code has up-to-date positions.
+
+   Fast path  (persistent coherent map available):
+     Checks the fence from the previous gpu_step non-blocking (0 ns timeout).
+     If signaled → GPU writes are coherently visible → memcpy from mapped pointer.
+     If not yet signaled (GPU still busy) → returns immediately; Node positions
+     remain at the last successfully synced frame (1-frame stale is fine for UI).
+
+   Slow fallback (no persistent map, e.g. glBufferStorage unavailable):
+     Calls glGetBufferSubData which stalls the pipeline until the GPU is done. */
 void simulator_sync_positions(Simulator *s) {
     if (!s || !s->use_gpu || !s->gpu_ctx) return;
     GPUContext *ctx = (GPUContext*)s->gpu_ctx;
     int n = ctx->node_count;
     if (n <= 0) return;
-    size_t pos_bytes = sizeof(float) * (size_t)n * 4;
-    size_t vel_bytes = sizeof(float) * (size_t)n * 4;
-    float *pos4 = (float*)malloc(pos_bytes);
-    float *vel4 = (float*)malloc(vel_bytes);
+
+    /* ── Fast path: persistent coherent map ─────────────────────────────────── */
+    if (ctx->pos_map && ctx->vel_map) {
+        /* If no fence yet (before first gpu_step) just read the initial upload. */
+        if (!ctx->readback_fence ||
+            glClientWaitSync(ctx->readback_fence, GL_SYNC_FLUSH_COMMANDS_BIT, 0)
+                != GL_TIMEOUT_EXPIRED) {
+            const float *pm = ctx->pos_map;
+            const float *vm = ctx->vel_map;
+            for (int i = 0; i < n; i++) {
+                Node *nd = (Node*)dynarray_get(s->nodes, i);
+                if (!nd) continue;
+                nd->pos[0] = pm[4*i];   nd->pos[1] = pm[4*i+1]; nd->pos[2] = pm[4*i+2];
+                nd->vel[0] = vm[4*i];   nd->vel[1] = vm[4*i+1]; nd->vel[2] = vm[4*i+2];
+            }
+        }
+        /* If GL_TIMEOUT_EXPIRED: GPU still running; keep last-known positions. */
+        return;
+    }
+
+    /* ── Slow fallback: drain pipeline + copy ────────────────────────────────── */
+    size_t pv_sz = sizeof(float) * (size_t)n * 4;
+    float *pos4 = (float*)malloc(pv_sz);
+    float *vel4 = (float*)malloc(pv_sz);
     if (pos4 && vel4) {
         glBindBuffer(GL_SHADER_STORAGE_BUFFER, ctx->ssbo_positions);
-        glGetBufferSubData(GL_SHADER_STORAGE_BUFFER, 0, pos_bytes, pos4);
+        glGetBufferSubData(GL_SHADER_STORAGE_BUFFER, 0, (GLsizeiptr)pv_sz, pos4);
         glBindBuffer(GL_SHADER_STORAGE_BUFFER, ctx->ssbo_velocities);
-        glGetBufferSubData(GL_SHADER_STORAGE_BUFFER, 0, vel_bytes, vel4);
+        glGetBufferSubData(GL_SHADER_STORAGE_BUFFER, 0, (GLsizeiptr)pv_sz, vel4);
         for (int i = 0; i < n; i++) {
             Node *nd = (Node*)dynarray_get(s->nodes, i);
             if (!nd) continue;
-            nd->pos[0] = pos4[4*i];   nd->pos[1] = pos4[4*i+1]; nd->pos[2] = pos4[4*i+2];
-            nd->vel[0] = vel4[4*i];   nd->vel[1] = vel4[4*i+1]; nd->vel[2] = vel4[4*i+2];
+            nd->pos[0] = pos4[4*i]; nd->pos[1] = pos4[4*i+1]; nd->pos[2] = pos4[4*i+2];
+            nd->vel[0] = vel4[4*i]; nd->vel[1] = vel4[4*i+1]; nd->vel[2] = vel4[4*i+2];
         }
     }
     free(pos4);

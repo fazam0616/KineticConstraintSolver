@@ -951,8 +951,8 @@ int main(int argc, char *argv[]) {
     }
 
     // Request OpenGL 3.3 (compatibility profile for immediate-mode UI rendering)
-    SDL_GL_SetAttribute(SDL_GL_CONTEXT_MAJOR_VERSION, 3);
-    SDL_GL_SetAttribute(SDL_GL_CONTEXT_MINOR_VERSION, 3);
+    SDL_GL_SetAttribute(SDL_GL_CONTEXT_MAJOR_VERSION, 4);
+    SDL_GL_SetAttribute(SDL_GL_CONTEXT_MINOR_VERSION, 4);
     SDL_GL_SetAttribute(SDL_GL_CONTEXT_PROFILE_MASK, SDL_GL_CONTEXT_PROFILE_COMPATIBILITY);
 
     SDL_Window *window = SDL_CreateWindow("SDL OpenGL Simulator",
@@ -1031,14 +1031,14 @@ int main(int argc, char *argv[]) {
         fprintf(stderr, "Simulator GPU initialization failed — falling back to CPU path.\n");
     }
 
-     /* UI menus: registry of menus. We'll dispatch mouse events to each menu in
-         order and stop when one handles the event. This allows stacking UI. */
-     DynArray *menus = dynarray_create(4);
+    /* UI menus: registry of menus. We'll dispatch mouse events to each menu in
+        order and stop when one handles the event. This allows stacking UI. */
+    DynArray *menus = dynarray_create(4);
 
-     /* Control menu: step size slider and pause toggle. The slider updates
-         sim->dt via callback. */
-     double step_size = sim->dt;
-     int paused = 0;
+    /* Control menu: step size slider and pause toggle. The slider updates
+        sim->dt via callback. */
+    double step_size = sim->dt;
+    int paused = 1;
     // Octree rendering control
     int show_octree = 1;
     double grid_cell_size = 10.0; /* default matches Simulator.c cell size; slider range below */
@@ -2126,6 +2126,10 @@ int main(int argc, char *argv[]) {
         if (!paused) {
             simulator_step(sim);
         }
+        /* Sync GPU positions/velocities to CPU Node structs so that UI picking,
+           drag forces, and selection highlights use up-to-date positions.
+           Uses a persistent coherent map + non-blocking fence — no pipeline stall. */
+        simulator_sync_positions(sim);
 
         // Draw collision BVHs (triangle and edge) when toggle enabled
         if (show_octree) {
