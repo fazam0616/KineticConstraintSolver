@@ -33,20 +33,13 @@ void mark_node_dirty_if_moved(Node *node, float threshold) {
 //  23 jt_vec  24 cg_scalars  25 reduce_buf  26 csr_offsets  27 csr_data
 typedef struct GPUContext {
     // ----- programs -----
-    GLuint prog_build_j;       // build Jacobian rows (1 thread/constraint)
-    GLuint prog_build_b;       // build RHS b = -err (1 thread/constraint)
-    GLuint prog_build_A;       // build A = dt^2 J M^-1 J^T (kept for reference, not dispatched)
+    GLuint prog_build_jb;      // merged build J + b (1 thread/constraint)
     GLuint prog_ext_forces;    // gravity + spring external forces (1 thread/node)
-    GLuint prog_cg_solve;      // old dense CG (single WG 512), kept as fallback
     GLuint prog_apply_corr;    // apply corr_f + symplectic-Euler integrate
-    // ----- sparse CG programs (replace build_A + cg_solve) -----
-    GLuint prog_cg_init;       // x=0,r=p=b,partial rr→reduce_buf
-    GLuint prog_cg_zero_v;     // zero jt_vec before each J^T scatter
-    GLuint prog_cg_jt_scatter; // atomic J^T p → jt_vec
-    GLuint prog_cg_minv_scale; // jt_vec *= inv_mass
-    GLuint prog_cg_j_gather;   // Ap = J jt_vec; partial p·Ap → reduce_buf
-    GLuint prog_cg_dot_reduce; // tree-reduce → alpha / beta / rr
-    GLuint prog_cg_update_xr;  // x += α*p; r -= α*Ap; partial r·r → reduce_buf
+    // ----- sparse CG programs -----
+    GLuint prog_cg_init;       // x=0,r=p=b,partial rr→reduce_buf; finalizes rr inline
+    GLuint prog_cg_j_gather;   // Ap = J jt_vec; partial p·Ap → reduce_buf; finalizes α inline
+    GLuint prog_cg_update_xr;  // x += α*p; r -= α*Ap; partial r·r → reduce_buf; finalizes β inline
     GLuint prog_cg_update_p;   // p = r + β*p
     GLuint prog_cg_jt_gather;  // CSR J^T gather, one thread per DOF, no atomics
     // ----- SSBOs -----
@@ -67,7 +60,7 @@ typedef struct GPUContext {
     GLuint ssbo_Ap_vec;        // binding 14 : m_sparse float  (CG temp Ap)
     // ----- sparse CG SSBOs -----
     GLuint ssbo_jt_vec;        // binding 23 : 3n floats  (J^T p or J^T λ, written by cg_jt_gather)
-    GLuint ssbo_cg_scalars;    // binding 24 : 8 floats [rr,pAp,alpha,beta,...]
+    GLuint ssbo_cg_scalars;    // binding 24 : 8 floats [rr,pAp,alpha,beta,...] + uint reduce_ctr
     GLuint ssbo_reduce_buf;    // binding 25 : ceil(m/64) floats
     GLuint ssbo_csr_offsets;   // binding 26 : (3n+1) ints  [static J^T sparsity CSR]
     GLuint ssbo_csr_data;      // binding 27 : n_csr_entries×2 ints {c, k_slot}
@@ -79,18 +72,11 @@ typedef struct GPUContext {
     int gpu_debug;  // 1 → print CPU vs GPU comparison each first substep
     // ----- cached uniform locations (set once at init / upload) -----
     GLint u_ef_n, u_ef_m_sparse, u_ef_m_total, u_ef_gravity;
-    GLint u_bj_m;
-    GLint u_bb_m;
-    GLint u_ba_m, u_ba_dt;
-    GLint u_cg_m, u_cg_max_iter, u_cg_tol;
+    GLint u_bjb_m;
     GLint u_ac_n, u_ac_dt, u_ac_sub_dt, u_ac_N;
     // ----- sparse CG uniform locations -----
     GLint u_ci_m;                          // cg_init
-    GLint u_czv_n3;                        // cg_zero_v  (= 3*n)
-    GLint u_cjs_m;                         // cg_jt_scatter
-    GLint u_cms_n;                         // cg_minv_scale
     GLint u_cjg_m, u_cjg_dt;              // cg_j_gather
-    GLint u_cdr_n_partials, u_cdr_mode;    // cg_dot_reduce
     GLint u_cuxr_m;                        // cg_update_xr
     GLint u_cup_m;                         // cg_update_p
     GLint u_cjtg_n3, u_cjtg_src, u_cjtg_apply_minv; // cg_jt_gather
@@ -141,20 +127,18 @@ typedef struct GPUContext {
     // ----- indirect dispatch infra (bindings 28-29) -----
     // prog_lbvh_prepare_edge_dispatch: 1-thread shader, reads escratch atomic counter,
     // writes {sort_x,1,1, build_x,1,1} into ssbo_indirect_args and n_edges into ssbo_edge_meta.
+    // LBVH
     GLuint prog_lbvh_prepare_edge_dispatch;
-    GLint  u_ped_m_total;          // uniform: total constraint count (to find counter offset)
-    GLuint ssbo_indirect_args;     // binding 28: 6 uints = 2× DispatchIndirectCommand
-    GLuint ssbo_edge_meta;         // binding 29: 2 ints [edge n_prims, wall n_prims(unused)]
-    // baked CG dot-reduce program variants (mode baked via #define, removes glUniform from loop)
-    GLuint prog_cg_dot_reduce_init;   // mode=0 (rr0 accumulate)
-    GLuint prog_cg_dot_reduce_alpha;  // mode=1 (pAp → alpha)
-    GLuint prog_cg_dot_reduce_beta;   // mode=2 (rr_new → beta)
-    // baked CG jt_gather variants
-    GLuint prog_cg_jt_gather_inloop;   // u_src=0 u_apply_minv=1  (M⁻¹Jᵀp per CG iter)
-    GLuint prog_cg_jt_gather_postsolve;// u_src=1 u_apply_minv=0  (Jᵀλ post-solve)
-    // uniform locations for baked jt_gather (n3 only — mode/minv baked)
-    GLint  u_cjtg_il_n3;   // inloop variant
-    GLint  u_cjtg_ps_n3;   // postsolve variant
+    GLint  u_ped_m_total;
+    GLuint ssbo_indirect_args;
+    GLuint ssbo_edge_meta;
+    // baked CG jt_gather variant for CG inloop (src=p, apply_minv=1)
+    GLuint prog_cg_jt_gather_inloop;
+    GLint  u_cjtg_il_n3;
+    // per-scene cached n_partials locations for inline-reduction shaders
+    GLint  u_ci_n_partials;    // cg_init
+    GLint  u_cjg_n_partials;   // cg_j_gather
+    GLint  u_cuxr_n_partials;  // cg_update_xr
     /* Persistent coherent readback — eliminates glGetBufferSubData pipeline drain.
        ssbo_positions and ssbo_velocities are allocated with glBufferStorage so they
        can be persistently mapped; the CPU reads pos_map/vel_map directly after the
@@ -482,21 +466,14 @@ int simulator_init_gpu(Simulator *s) {
 
     GPUContext *ctx = (GPUContext*)calloc(1, sizeof(GPUContext));
 
-    ctx->prog_build_j    = compile_compute_program_from_file("gpu/build_j.comp.glsl");
-    ctx->prog_build_b    = compile_compute_program_from_file("gpu/build_b.comp.glsl");
-    ctx->prog_build_A    = compile_compute_program_from_file("gpu/build_A.comp.glsl");
+    ctx->prog_build_jb   = compile_compute_program_from_file("gpu/build_jb.comp.glsl");
     ctx->prog_ext_forces = compile_compute_program_from_file("gpu/ext_forces.comp.glsl");
-    ctx->prog_cg_solve   = compile_compute_program_from_file("gpu/cg_solve.comp.glsl");
     ctx->prog_apply_corr  = compile_compute_program_from_file("gpu/apply_corr.comp.glsl");
     ctx->prog_collision   = compile_compute_program_from_file("gpu/collision.comp.glsl");
     ctx->prog_edge_edge   = compile_compute_program_from_file("gpu/edge_edge.comp.glsl");
     // Sparse CG shaders
     ctx->prog_cg_init        = compile_compute_program_from_file("gpu/cg_init.comp.glsl");
-    ctx->prog_cg_zero_v      = compile_compute_program_from_file("gpu/cg_zero_v.comp.glsl");
-    ctx->prog_cg_jt_scatter  = compile_compute_program_from_file("gpu/cg_jt_scatter.comp.glsl");
-    ctx->prog_cg_minv_scale  = compile_compute_program_from_file("gpu/cg_minv_scale.comp.glsl");
     ctx->prog_cg_j_gather    = compile_compute_program_from_file("gpu/cg_j_gather.comp.glsl");
-    ctx->prog_cg_dot_reduce  = compile_compute_program_from_file("gpu/cg_dot_reduce.comp.glsl");
     ctx->prog_cg_update_xr   = compile_compute_program_from_file("gpu/cg_update_xr.comp.glsl");
     ctx->prog_cg_update_p    = compile_compute_program_from_file("gpu/cg_update_p.comp.glsl");
     ctx->prog_cg_jt_gather   = compile_compute_program_from_file("gpu/cg_jt_gather.comp.glsl");
@@ -510,23 +487,11 @@ int simulator_init_gpu(Simulator *s) {
     ctx->prog_lbvh_build_edges  = ctx->prog_bvh_edges;
     ctx->prog_lbvh_prepare_edge_dispatch = compile_compute_program_from_file(
         "gpu/lbvh_prepare_edge_dispatch.comp.glsl");
-    /* Baked CG dot-reduce variants — compile cg_dot_reduce 3 times with different #define */
-    /* We inject a preamble before the shader source.  compile_compute_program_from_file   */
-    /* already reads the file; we use glShaderSource override here via a two-source trick. */
-    /* Simplest portable approach: compile the same file but override uniform with const.  */
-    /* Since cg_dot_reduce uses `uniform int u_mode`, we compile 3 separate programs and   */
-    /* call glUniform once at init time to bake the value in. */
-    ctx->prog_cg_dot_reduce_init  = compile_compute_program_from_file("gpu/cg_dot_reduce.comp.glsl");
-    ctx->prog_cg_dot_reduce_alpha = compile_compute_program_from_file("gpu/cg_dot_reduce.comp.glsl");
-    ctx->prog_cg_dot_reduce_beta  = compile_compute_program_from_file("gpu/cg_dot_reduce.comp.glsl");
-    ctx->prog_cg_jt_gather_inloop    = compile_compute_program_from_file("gpu/cg_jt_gather.comp.glsl");
-    ctx->prog_cg_jt_gather_postsolve = compile_compute_program_from_file("gpu/cg_jt_gather.comp.glsl");
+    ctx->prog_cg_jt_gather_inloop = compile_compute_program_from_file("gpu/cg_jt_gather.comp.glsl");
 
-    int ok = ctx->prog_build_j && ctx->prog_build_b && ctx->prog_build_A &&
-             ctx->prog_ext_forces && ctx->prog_cg_solve &&
+    int ok = ctx->prog_build_jb && ctx->prog_ext_forces &&
              ctx->prog_apply_corr && ctx->prog_collision && ctx->prog_edge_edge &&
-             ctx->prog_cg_init && ctx->prog_cg_zero_v && ctx->prog_cg_jt_scatter &&
-             ctx->prog_cg_minv_scale && ctx->prog_cg_j_gather && ctx->prog_cg_dot_reduce &&
+             ctx->prog_cg_init && ctx->prog_cg_j_gather &&
              ctx->prog_cg_update_xr && ctx->prog_cg_update_p &&
              ctx->prog_cg_jt_gather &&
              ctx->prog_lbvh_morton_walls && ctx->prog_lbvh_morton_edges &&
@@ -540,31 +505,24 @@ int simulator_init_gpu(Simulator *s) {
     ctx->u_ef_m_sparse = glGetUniformLocation(ctx->prog_ext_forces, "u_m_sparse");
     ctx->u_ef_m_total  = glGetUniformLocation(ctx->prog_ext_forces, "u_m_total");
     ctx->u_ef_gravity  = glGetUniformLocation(ctx->prog_ext_forces, "u_gravity");
-    ctx->u_bj_m        = glGetUniformLocation(ctx->prog_build_j,    "u_m");
-    ctx->u_bb_m        = glGetUniformLocation(ctx->prog_build_b,    "u_m");
-    ctx->u_ba_m        = glGetUniformLocation(ctx->prog_build_A,    "u_m");
-    ctx->u_ba_dt       = glGetUniformLocation(ctx->prog_build_A,    "u_dt");
-    ctx->u_cg_m        = glGetUniformLocation(ctx->prog_cg_solve,   "u_m");
-    ctx->u_cg_max_iter = glGetUniformLocation(ctx->prog_cg_solve,   "u_max_iter");
-    ctx->u_cg_tol      = glGetUniformLocation(ctx->prog_cg_solve,   "u_tol");
+    ctx->u_bjb_m       = glGetUniformLocation(ctx->prog_build_jb,   "u_m");
     ctx->u_ac_n        = glGetUniformLocation(ctx->prog_apply_corr, "u_n");
     ctx->u_ac_dt       = glGetUniformLocation(ctx->prog_apply_corr, "u_dt");
     ctx->u_ac_sub_dt   = glGetUniformLocation(ctx->prog_apply_corr, "u_sub_dt");
     ctx->u_ac_N        = glGetUniformLocation(ctx->prog_apply_corr, "u_N");
     // Sparse CG uniform locations
     ctx->u_ci_m           = glGetUniformLocation(ctx->prog_cg_init,       "u_m");
-    ctx->u_czv_n3         = glGetUniformLocation(ctx->prog_cg_zero_v,     "u_n3");
-    ctx->u_cjs_m          = glGetUniformLocation(ctx->prog_cg_jt_scatter, "u_m");
-    ctx->u_cms_n          = glGetUniformLocation(ctx->prog_cg_minv_scale, "u_n");
     ctx->u_cjg_m          = glGetUniformLocation(ctx->prog_cg_j_gather,   "u_m");
     ctx->u_cjg_dt         = glGetUniformLocation(ctx->prog_cg_j_gather,   "u_dt");
-    ctx->u_cdr_n_partials = glGetUniformLocation(ctx->prog_cg_dot_reduce, "u_n_partials");
-    ctx->u_cdr_mode       = glGetUniformLocation(ctx->prog_cg_dot_reduce, "u_mode");
     ctx->u_cuxr_m         = glGetUniformLocation(ctx->prog_cg_update_xr,  "u_m");
     ctx->u_cup_m          = glGetUniformLocation(ctx->prog_cg_update_p,   "u_m");
     ctx->u_cjtg_n3        = glGetUniformLocation(ctx->prog_cg_jt_gather,  "u_n3");
     ctx->u_cjtg_src       = glGetUniformLocation(ctx->prog_cg_jt_gather,  "u_src");
     ctx->u_cjtg_apply_minv= glGetUniformLocation(ctx->prog_cg_jt_gather,  "u_apply_minv");
+    // u_n_partials for inline-reduction shaders (uploaded once per scene load)
+    ctx->u_ci_n_partials   = glGetUniformLocation(ctx->prog_cg_init,      "u_n_partials");
+    ctx->u_cjg_n_partials  = glGetUniformLocation(ctx->prog_cg_j_gather,  "u_n_partials");
+    ctx->u_cuxr_n_partials = glGetUniformLocation(ctx->prog_cg_update_xr, "u_n_partials");
     ctx->u_col_n        = glGetUniformLocation(ctx->prog_collision,  "u_n");
     ctx->u_col_n_tris   = glGetUniformLocation(ctx->prog_collision,  "u_n_tris");
     ctx->u_col_stiffness= glGetUniformLocation(ctx->prog_collision,  "u_stiffness");
@@ -596,31 +554,12 @@ int simulator_init_gpu(Simulator *s) {
     ctx->u_bw_n_prims = glGetUniformLocation(ctx->prog_lbvh_build_walls, "u_n_prims");
     ctx->u_be_n_prims = glGetUniformLocation(ctx->prog_lbvh_build_edges, "u_n_prims");
     ctx->u_ped_m_total = glGetUniformLocation(ctx->prog_lbvh_prepare_edge_dispatch, "u_m_total");
-    /* Bake mode value into each dot-reduce variant once at init */
-    if (ctx->prog_cg_dot_reduce_init) {
-        glUseProgram(ctx->prog_cg_dot_reduce_init);
-        glUniform1i(glGetUniformLocation(ctx->prog_cg_dot_reduce_init,  "u_mode"), 0);
-    }
-    if (ctx->prog_cg_dot_reduce_alpha) {
-        glUseProgram(ctx->prog_cg_dot_reduce_alpha);
-        glUniform1i(glGetUniformLocation(ctx->prog_cg_dot_reduce_alpha, "u_mode"), 1);
-    }
-    if (ctx->prog_cg_dot_reduce_beta) {
-        glUseProgram(ctx->prog_cg_dot_reduce_beta);
-        glUniform1i(glGetUniformLocation(ctx->prog_cg_dot_reduce_beta,  "u_mode"), 2);
-    }
     /* Bake src/minv into jt_gather variants */
     if (ctx->prog_cg_jt_gather_inloop) {
         glUseProgram(ctx->prog_cg_jt_gather_inloop);
         glUniform1i(glGetUniformLocation(ctx->prog_cg_jt_gather_inloop, "u_src"),        0);
         glUniform1i(glGetUniformLocation(ctx->prog_cg_jt_gather_inloop, "u_apply_minv"), 1);
         ctx->u_cjtg_il_n3 = glGetUniformLocation(ctx->prog_cg_jt_gather_inloop, "u_n3");
-    }
-    if (ctx->prog_cg_jt_gather_postsolve) {
-        glUseProgram(ctx->prog_cg_jt_gather_postsolve);
-        glUniform1i(glGetUniformLocation(ctx->prog_cg_jt_gather_postsolve, "u_src"),        1);
-        glUniform1i(glGetUniformLocation(ctx->prog_cg_jt_gather_postsolve, "u_apply_minv"), 0);
-        ctx->u_cjtg_ps_n3 = glGetUniformLocation(ctx->prog_cg_jt_gather_postsolve, "u_n3");
     }
 
     GLuint *ss[] = {
@@ -670,21 +609,15 @@ int simulator_init_gpu(Simulator *s) {
 void simulator_free_gpu(Simulator *s) {
     if (!s || !s->gpu_ctx) { if (s) s->use_gpu = 0; return; }
     GPUContext *ctx = (GPUContext*)s->gpu_ctx;
-    if (ctx->prog_build_j)    glDeleteProgram(ctx->prog_build_j);
-    if (ctx->prog_build_b)    glDeleteProgram(ctx->prog_build_b);
-    if (ctx->prog_build_A)    glDeleteProgram(ctx->prog_build_A);
-    if (ctx->prog_ext_forces) glDeleteProgram(ctx->prog_ext_forces);
-    if (ctx->prog_cg_solve)   glDeleteProgram(ctx->prog_cg_solve);
-    if (ctx->prog_apply_corr) glDeleteProgram(ctx->prog_apply_corr);
-    if (ctx->prog_collision)  glDeleteProgram(ctx->prog_collision);
-    if (ctx->prog_edge_edge)  glDeleteProgram(ctx->prog_edge_edge);
+    if (ctx->prog_build_jb)   glDeleteProgram(ctx->prog_build_jb);
+    if (ctx->prog_ext_forces)  glDeleteProgram(ctx->prog_ext_forces);
+    if (ctx->prog_apply_corr)  glDeleteProgram(ctx->prog_apply_corr);
+    if (ctx->prog_collision)   glDeleteProgram(ctx->prog_collision);
+    if (ctx->prog_edge_edge)   glDeleteProgram(ctx->prog_edge_edge);
     // Sparse CG programs
     if (ctx->prog_cg_init)       glDeleteProgram(ctx->prog_cg_init);
-    if (ctx->prog_cg_zero_v)     glDeleteProgram(ctx->prog_cg_zero_v);
-    if (ctx->prog_cg_jt_scatter) glDeleteProgram(ctx->prog_cg_jt_scatter);
-    if (ctx->prog_cg_minv_scale) glDeleteProgram(ctx->prog_cg_minv_scale);
     if (ctx->prog_cg_j_gather)   glDeleteProgram(ctx->prog_cg_j_gather);
-    if (ctx->prog_cg_dot_reduce) glDeleteProgram(ctx->prog_cg_dot_reduce);
+
     if (ctx->prog_cg_update_xr)  glDeleteProgram(ctx->prog_cg_update_xr);
     if (ctx->prog_cg_update_p)   glDeleteProgram(ctx->prog_cg_update_p);
     if (ctx->prog_cg_jt_gather)  glDeleteProgram(ctx->prog_cg_jt_gather);
@@ -696,11 +629,7 @@ void simulator_free_gpu(Simulator *s) {
     if (ctx->prog_lbvh_build_walls)  glDeleteProgram(ctx->prog_lbvh_build_walls);
     if (ctx->prog_lbvh_build_edges)  glDeleteProgram(ctx->prog_lbvh_build_edges);
     if (ctx->prog_lbvh_prepare_edge_dispatch) glDeleteProgram(ctx->prog_lbvh_prepare_edge_dispatch);
-    if (ctx->prog_cg_dot_reduce_init)   glDeleteProgram(ctx->prog_cg_dot_reduce_init);
-    if (ctx->prog_cg_dot_reduce_alpha)  glDeleteProgram(ctx->prog_cg_dot_reduce_alpha);
-    if (ctx->prog_cg_dot_reduce_beta)   glDeleteProgram(ctx->prog_cg_dot_reduce_beta);
     if (ctx->prog_cg_jt_gather_inloop)    glDeleteProgram(ctx->prog_cg_jt_gather_inloop);
-    if (ctx->prog_cg_jt_gather_postsolve) glDeleteProgram(ctx->prog_cg_jt_gather_postsolve);
     if (ctx->prog_draw_nodes)       glDeleteProgram(ctx->prog_draw_nodes);
     if (ctx->prog_draw_constraints) glDeleteProgram(ctx->prog_draw_constraints);
     if (ctx->prog_draw_walls)       glDeleteProgram(ctx->prog_draw_walls);
@@ -832,9 +761,8 @@ static void lbvh_build_edges_gpu(GPUContext *ctx, int m_total,
 
     /* Pass 1: Morton + compact ─────────────────────────────────────────────── */
     glUseProgram(ctx->prog_lbvh_morton_edges);
-    glUniform1i(ctx->u_me_m_total,   m_total);
-    glUniform3f(ctx->u_me_scene_min, scene_min[0], scene_min[1], scene_min[2]);
-    glUniform3f(ctx->u_me_scene_max, scene_max[0], scene_max[1], scene_max[2]);
+    glUniform1i(ctx->u_me_m_total, m_total);
+    /* scene_min/max are pre-uploaded at scene load time (ctx->scene_min/max) */
     int mg = (m_total + 63) / 64;
     glDispatchCompute((GLuint)mg, 1, 1);
     /* Barrier: morton writes escratch[] and the atomic counter.                 */
@@ -1000,7 +928,7 @@ void simulator_upload_scene_to_gpu(Simulator *s, PackedScene *p) {
         glBufferData(GL_SHADER_STORAGE_BUFFER, sizeof(float)*(size_t)n*3, NULL, GL_DYNAMIC_DRAW);
         _BIND(23, ctx->ssbo_jt_vec);
         glBindBuffer(GL_SHADER_STORAGE_BUFFER, ctx->ssbo_cg_scalars);
-        glBufferData(GL_SHADER_STORAGE_BUFFER, sizeof(float)*8, NULL, GL_DYNAMIC_DRAW);
+        glBufferData(GL_SHADER_STORAGE_BUFFER, sizeof(float)*8 + sizeof(GLuint), NULL, GL_DYNAMIC_DRAW);
         _BIND(24, ctx->ssbo_cg_scalars);
         glBindBuffer(GL_SHADER_STORAGE_BUFFER, ctx->ssbo_reduce_buf);
         glBufferData(GL_SHADER_STORAGE_BUFFER, sizeof(float)*(size_t)n_partials, NULL, GL_DYNAMIC_DRAW);
@@ -1153,6 +1081,14 @@ void simulator_upload_scene_to_gpu(Simulator *s, PackedScene *p) {
     }
 
     fprintf(stderr, "GPU: scene uploaded (n=%d, m_sparse=%d, m_total=%d).\n", n, m, m_total);
+
+    /* Pre-upload scene_min/max to the edge morton shader so lbvh_build_edges_gpu
+       does not re-upload them every substep. */
+    if (ctx->prog_lbvh_morton_edges) {
+        glUseProgram(ctx->prog_lbvh_morton_edges);
+        glUniform3f(ctx->u_me_scene_min, ctx->scene_min[0], ctx->scene_min[1], ctx->scene_min[2]);
+        glUniform3f(ctx->u_me_scene_max, ctx->scene_max[0], ctx->scene_max[1], ctx->scene_max[2]);
+    }
     fflush(stderr);
 }
 
@@ -1619,8 +1555,9 @@ static void gpu_debug_compare(GPUContext *ctx, Simulator *s, float sub_dt) {
     glGetBufferSubData(GL_SHADER_STORAGE_BUFFER, 0, sizeof(float)*(size_t)m, b_gpu);
     glBindBuffer(GL_SHADER_STORAGE_BUFFER, ctx->ssbo_l_vec);
     glGetBufferSubData(GL_SHADER_STORAGE_BUFFER, 0, sizeof(float)*(size_t)m, l_gpu);
-    glBindBuffer(GL_SHADER_STORAGE_BUFFER, ctx->ssbo_A_dense);
-    glGetBufferSubData(GL_SHADER_STORAGE_BUFFER, 0, sizeof(float)*(size_t)m*(size_t)m, A_gpu);
+    /* ssbo_A_dense is a 1-float stub — build_A is not dispatched in the sparse CG path.
+       Zero A_gpu so the CPU CG solve below is skipped (pAp=0 → break on first iter). */
+    memset(A_gpu, 0, sizeof(float)*(size_t)m*(size_t)m);
 
     /* CPU CG solve using the same A and b from GPU readback */
     float *l_cpu = (float*)calloc((size_t)m, sizeof(float));
@@ -1660,10 +1597,6 @@ static void gpu_debug_compare(GPUContext *ctx, Simulator *s, float sub_dt) {
             fprintf(stderr, "[GPU_DEBUG]  %3d | %11.6f | %9.6f | %9.6f\n",
                     i, b_gpu[i], l_gpu[i], l_cpu[i]);
         }
-        fprintf(stderr, "[GPU_DEBUG] A diag: ");
-        int diag_n = (m < 5) ? m : 5;
-        for (int i = 0; i < diag_n; i++) fprintf(stderr, "%.4f ", A_gpu[i*m+i]);
-        fprintf(stderr, "\n");
     }
 
     free(b_gpu); free(l_gpu); free(A_gpu);
@@ -1688,9 +1621,8 @@ void simulator_gpu_step(Simulator *s) {
     GPUContext *ctx = (GPUContext*)s->gpu_ctx;
 
     /* Validate all shaders compiled */
-    if (!ctx->prog_ext_forces || !ctx->prog_build_j || !ctx->prog_build_b ||
-        !ctx->prog_cg_init    || !ctx->prog_cg_zero_v || !ctx->prog_cg_jt_scatter ||
-        !ctx->prog_cg_minv_scale || !ctx->prog_cg_j_gather || !ctx->prog_cg_dot_reduce ||
+    if (!ctx->prog_ext_forces || !ctx->prog_build_jb ||
+        !ctx->prog_cg_init    || !ctx->prog_cg_j_gather ||
         !ctx->prog_cg_update_xr  || !ctx->prog_cg_update_p || !ctx->prog_apply_corr) {
         fprintf(stderr, "[GPU] One or more compute programs not compiled — cannot step\n");
         return;
@@ -1764,11 +1696,8 @@ void simulator_gpu_step(Simulator *s) {
     glUniform3f(ctx->u_ef_gravity,  s->gravity[0], s->gravity[1], s->gravity[2]);
 
     if (m > 0) {
-        glUseProgram(ctx->prog_build_j);
-        glUniform1i(ctx->u_bj_m, m);
-
-        glUseProgram(ctx->prog_build_b);
-        glUniform1i(ctx->u_bb_m, m);
+        glUseProgram(ctx->prog_build_jb);
+        glUniform1i(ctx->u_bjb_m, m);
 
         // --- Sparse CG uniforms (invariant across substeps) ---
         int n_partials = (m + 63) / 64;
@@ -1781,10 +1710,6 @@ void simulator_gpu_step(Simulator *s) {
             glUseProgram(ctx->prog_cg_jt_gather_inloop);
             glUniform1i(ctx->u_cjtg_il_n3, 3 * n);
         }
-        if (ctx->prog_cg_jt_gather_postsolve) {
-            glUseProgram(ctx->prog_cg_jt_gather_postsolve);
-            glUniform1i(ctx->u_cjtg_ps_n3, 3 * n);
-        }
         /* Legacy jt_gather — kept as fallback */
         glUseProgram(ctx->prog_cg_jt_gather);
         glUniform1i(ctx->u_cjtg_n3, 3 * n);
@@ -1793,24 +1718,13 @@ void simulator_gpu_step(Simulator *s) {
         glUniform1i(ctx->u_cjg_m,  m);
         glUniform1f(ctx->u_cjg_dt, sub_dt);
 
-        /* Baked dot-reduce variants — n_partials is the only per-scene uniform */
-        GLint u_np = ctx->u_cdr_n_partials;
-        if (ctx->prog_cg_dot_reduce_init) {
-            glUseProgram(ctx->prog_cg_dot_reduce_init);
-            glUniform1i(glGetUniformLocation(ctx->prog_cg_dot_reduce_init,  "u_n_partials"), n_partials);
-        }
-        if (ctx->prog_cg_dot_reduce_alpha) {
-            glUseProgram(ctx->prog_cg_dot_reduce_alpha);
-            glUniform1i(glGetUniformLocation(ctx->prog_cg_dot_reduce_alpha, "u_n_partials"), n_partials);
-        }
-        if (ctx->prog_cg_dot_reduce_beta) {
-            glUseProgram(ctx->prog_cg_dot_reduce_beta);
-            glUniform1i(glGetUniformLocation(ctx->prog_cg_dot_reduce_beta,  "u_n_partials"), n_partials);
-        }
-        /* Legacy dot_reduce — fallback */
-        glUseProgram(ctx->prog_cg_dot_reduce);
-        glUniform1i(u_np, n_partials);
-        (void)u_np;
+        /* Upload n_partials to the 3 inline-reduction shaders (replaces separate dr_ dispatches) */
+        glUseProgram(ctx->prog_cg_init);
+        glUniform1i(ctx->u_ci_n_partials, n_partials);
+        glUseProgram(ctx->prog_cg_j_gather);
+        glUniform1i(ctx->u_cjg_n_partials, n_partials);
+        glUseProgram(ctx->prog_cg_update_xr);
+        glUniform1i(ctx->u_cuxr_n_partials, n_partials);
 
         glUseProgram(ctx->prog_cg_update_xr);
         glUniform1i(ctx->u_cuxr_m, m);
@@ -1855,13 +1769,8 @@ void simulator_gpu_step(Simulator *s) {
         glMemoryBarrier(GL_SHADER_STORAGE_BARRIER_BIT);
 
         if (m > 0) {
-            /* -- 2. Build J -- */
-            glUseProgram(ctx->prog_build_j);
-            glDispatchCompute((GLuint)mg, 1, 1);
-            glMemoryBarrier(GL_SHADER_STORAGE_BARRIER_BIT);
-
-            /* -- 3. Build b -- */
-            glUseProgram(ctx->prog_build_b);
+            /* -- 2+3. Build J and b (merged into one dispatch) -- */
+            glUseProgram(ctx->prog_build_jb);
             glDispatchCompute((GLuint)mg, 1, 1);
             glMemoryBarrier(GL_SHADER_STORAGE_BARRIER_BIT);
 
@@ -1870,27 +1779,13 @@ void simulator_gpu_step(Simulator *s) {
                 int jsg = mg;                        /* ceil(m/64)  */
                 int jtg = (3*n + 63) / 64;           /* ceil(3n/64) */
 
-                /* Resolve baked program handles (fall back to generic if not compiled) */
-                GLuint dr_init  = ctx->prog_cg_dot_reduce_init  ? ctx->prog_cg_dot_reduce_init  : ctx->prog_cg_dot_reduce;
-                GLuint dr_alpha = ctx->prog_cg_dot_reduce_alpha ? ctx->prog_cg_dot_reduce_alpha : ctx->prog_cg_dot_reduce;
-                GLuint dr_beta  = ctx->prog_cg_dot_reduce_beta  ? ctx->prog_cg_dot_reduce_beta  : ctx->prog_cg_dot_reduce;
-                GLuint jtg_il   = ctx->prog_cg_jt_gather_inloop    ? ctx->prog_cg_jt_gather_inloop    : ctx->prog_cg_jt_gather;
-                GLuint jtg_ps   = ctx->prog_cg_jt_gather_postsolve ? ctx->prog_cg_jt_gather_postsolve : ctx->prog_cg_jt_gather;
+                GLuint jtg_il   = ctx->prog_cg_jt_gather_inloop ? ctx->prog_cg_jt_gather_inloop : ctx->prog_cg_jt_gather;
 
-                /* When falling back to generic programs, re-apply the uniforms that
-                   the baked variants have pre-set.  Baked variants skip these calls. */
-                int using_generic_dr  = (dr_init == ctx->prog_cg_dot_reduce);
-                int using_generic_jtg = (jtg_il  == ctx->prog_cg_jt_gather);
+                int using_generic_jtg = (jtg_il == ctx->prog_cg_jt_gather);
 
-                /* Init: x=0, r=p=b; partial r·r → reduce_buf */
+                /* Init: x=0, r=p=b; partial r·r → reduce_buf; finalizes cg_scalars[0] inline */
                 glUseProgram(ctx->prog_cg_init);
                 glDispatchCompute((GLuint)jsg, 1, 1);
-                glMemoryBarrier(GL_SHADER_STORAGE_BARRIER_BIT);
-
-                /* reduce_buf → rr₀ → cg_scalars[0]  (baked mode=0, no glUniform) */
-                glUseProgram(dr_init);
-                if (using_generic_dr) glUniform1i(ctx->u_cdr_mode, 0);
-                glDispatchCompute(1, 1, 1);
                 glMemoryBarrier(GL_SHADER_STORAGE_BARRIER_BIT);
 
                 /* Fixed-iteration CG — no CPU readback, no glUniform inside loop */
@@ -1906,26 +1801,14 @@ void simulator_gpu_step(Simulator *s) {
                     glDispatchCompute((GLuint)jtg, 1, 1);
                     glMemoryBarrier(GL_SHADER_STORAGE_BARRIER_BIT);
 
-                    /* Ap = dt² J jt_vec + 1e-10*p; partial p·Ap → reduce_buf */
+                    /* Ap = dt² J jt_vec + 1e-10*p; partial p·Ap → reduce_buf; finalizes α inline */
                     glUseProgram(ctx->prog_cg_j_gather);
                     glDispatchCompute((GLuint)jsg, 1, 1);
                     glMemoryBarrier(GL_SHADER_STORAGE_BARRIER_BIT);
 
-                    /* reduce_buf → pAp; α = rr/pAp  (baked mode=1) */
-                    glUseProgram(dr_alpha);
-                    if (using_generic_dr) glUniform1i(ctx->u_cdr_mode, 1);
-                    glDispatchCompute(1, 1, 1);
-                    glMemoryBarrier(GL_SHADER_STORAGE_BARRIER_BIT);
-
-                    /* x += α*p;  r -= α*Ap;  partial r·r → reduce_buf */
+                    /* x += α*p;  r -= α*Ap;  partial r·r → reduce_buf; finalizes β inline */
                     glUseProgram(ctx->prog_cg_update_xr);
                     glDispatchCompute((GLuint)jsg, 1, 1);
-                    glMemoryBarrier(GL_SHADER_STORAGE_BARRIER_BIT);
-
-                    /* reduce_buf → rr_new; β = rr_new/rr  (baked mode=2) */
-                    glUseProgram(dr_beta);
-                    if (using_generic_dr) glUniform1i(ctx->u_cdr_mode, 2);
-                    glDispatchCompute(1, 1, 1);
                     glMemoryBarrier(GL_SHADER_STORAGE_BARRIER_BIT);
 
                     /* p = r + β*p */
@@ -1934,17 +1817,9 @@ void simulator_gpu_step(Simulator *s) {
                     glMemoryBarrier(GL_SHADER_STORAGE_BARRIER_BIT);
                 }
 
-                /* Post-solve: jt_vec = Jᵀλ (raw, no M⁻¹)  (baked: src=λ, minv=0) */
-                glUseProgram(jtg_ps);
-                if (using_generic_jtg) {
-                    glUniform1i(ctx->u_cjtg_src,        1);
-                    glUniform1i(ctx->u_cjtg_apply_minv, 0);
-                }
-                glDispatchCompute((GLuint)jtg, 1, 1);
-                glMemoryBarrier(GL_SHADER_STORAGE_BARRIER_BIT);
-            }
+            } /* end CG block */
 
-            /* -- 8. Apply corrections + integrate -- */
+            /* -- 8. Apply corrections + integrate (J^T λ computed inline) -- */
             glUseProgram(ctx->prog_apply_corr);
             glDispatchCompute((GLuint)ng, 1, 1);
             glMemoryBarrier(GL_SHADER_STORAGE_BARRIER_BIT);

@@ -22,7 +22,7 @@ uniform int   u_m_total;     // total constraint count
 uniform float u_restitution; // e.g. 0.05
 uniform float u_mu;          // kinetic friction coefficient
 
-const int  CT_DIST        = 0;
+const int  CT_DIST        = 1;
 const uint ANCHORED_BIT   = 1u;
 const uint SIM_IGNORE_BIT = 4u;
 

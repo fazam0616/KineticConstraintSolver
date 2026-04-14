@@ -23,7 +23,7 @@ uniform int  u_m_total;
 uniform vec3 u_scene_min;
 uniform vec3 u_scene_max;
 
-const int CT_DIST = 0;
+const int CT_DIST = 1;
 
 uint expand_bits(uint v) {
     v = (v * 0x00010001u) & 0xFF0000FFu;

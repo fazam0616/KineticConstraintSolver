@@ -894,36 +894,6 @@ static int screen_to_world_plane(int screen_x, int screen_y, int win_w, int win_
                               world_x, world_y, world_z);
 }
 
-// void draw_octree_node(OctreeNode *node) {
-//     if (!node) return;
-//     // Draw wireframe cube for this node's bounds
-//     float minx = node->bounds.min[0], miny = node->bounds.min[1], minz = node->bounds.min[2];
-//     float maxx = node->bounds.max[0], maxy = node->bounds.max[1], maxz = node->bounds.max[2];
-//     glBegin(GL_LINES);
-//     // Bottom face
-//     glVertex3f(minx, miny, minz); glVertex3f(maxx, miny, minz);
-//     glVertex3f(maxx, miny, minz); glVertex3f(maxx, miny, maxz);
-//     glVertex3f(maxx, miny, maxz); glVertex3f(minx, miny, maxz);
-//     glVertex3f(minx, miny, maxz); glVertex3f(minx, miny, minz);
-//     // Top face
-//     glVertex3f(minx, maxy, minz); glVertex3f(maxx, maxy, minz);
-//     glVertex3f(maxx, maxy, minz); glVertex3f(maxx, maxy, maxz);
-//     glVertex3f(maxx, maxy, maxz); glVertex3f(minx, maxy, maxz);
-//     glVertex3f(minx, maxy, maxz); glVertex3f(minx, maxy, minz);
-//     // Vertical edges
-//     glVertex3f(minx, miny, minz); glVertex3f(minx, maxy, minz);
-//     glVertex3f(maxx, miny, minz); glVertex3f(maxx, maxy, minz);
-//     glVertex3f(maxx, miny, maxz); glVertex3f(maxx, maxy, maxz);
-//     glVertex3f(minx, miny, maxz); glVertex3f(minx, maxy, maxz);
-//     glEnd();
-//     // Recursively draw children
-//     if (!node->is_leaf) {
-//         for (int i = 0; i < 8; i++) {
-//             draw_octree_node(node->children[i]);
-//         }
-//     }
-// }
-
 int main(int argc, char *argv[]) {
     // parse runtime options
     int override_solver_iters = 0;
@@ -1210,95 +1180,95 @@ int main(int argc, char *argv[]) {
     simulator_add_wall(sim, ramp2);
 
     // Generate a soft sphere made of many low-mass surface nodes and a heavier center
-    // float sphere_x = (ramp_x0 + ramp_x1) * 0.5f;
-    // float sphere_z = (ramp_z0 + ramp_z1) * 0.5f + 10;
-    // float sphere_radius = 8.0f;
-    // float center_y = ramp_y_top + sphere_radius - 5.0f; // just above ramp
+    float sphere_x = (ramp_x0 + ramp_x1) * 0.5f;
+    float sphere_z = (ramp_z0 + ramp_z1) * 0.5f + 10;
+    float sphere_radius = 8.0f;
+    float center_y = ramp_y_top + sphere_radius - 5.0f; // just above ramp
 
-    // // Parameters for sphere mesh
-    // int lat_count = 6;   // number of latitude divisions (including poles)
-    // int lon_count = 6;  // number of longitudinal samples per ring
-    // float surface_mass = 0.2f;
-    // float center_mass = 5.0f;
+    // Parameters for sphere mesh
+    int lat_count = 6;   // number of latitude divisions (including poles)
+    int lon_count = 6;  // number of longitudinal samples per ring
+    float surface_mass = 0.2f;
+    float center_mass = 5.0f;
 
-    // // Create center structural node
-    // Node *sphere_center = node_create(-1, center_mass, sphere_x, center_y, sphere_z);
-    // sphere_center->friction = 0.6f;
-    // sphere_center->radius = 0.5f; // ensure center node collides with ground and ramp
-    // simulator_add_node(sim, sphere_center);
+    // Create center structural node
+    Node *sphere_center = node_create(-1, center_mass, sphere_x, center_y, sphere_z);
+    sphere_center->friction = 0.6f;
+    sphere_center->radius = 0.5f; // ensure center node collides with ground and ramp
+    simulator_add_node(sim, sphere_center);
 
-    // // Allocate array for surface nodes (including poles)
-    // int total_surface = 2 + (lat_count-1) * lon_count; // poles + rings
-    // Node **surface_nodes = (Node**)malloc(sizeof(Node*) * total_surface);
-    // int idx = 0;
-    // // North pole
-    // surface_nodes[idx++] = node_create(-1, surface_mass, sphere_x, center_y + sphere_radius, sphere_z);
-    // // Rings (exclude poles)
-    // for (int i = 1; i < lat_count; ++i) {
-    //     float phi = (float)i * 3.14159265f / (float)lat_count; // 0..pi
-    //     float y = center_y + sphere_radius * cosf(phi);
-    //     float r_xy = sphere_radius * sinf(phi);
-    //     for (int j = 0; j < lon_count; ++j) {
-    //         float theta = 2.0f * 3.14159265f * (float)j / (float)lon_count;
-    //         float x = sphere_x + r_xy * cosf(theta);
-    //         float z = sphere_z + r_xy * sinf(theta);
-    //         surface_nodes[idx++] = node_create(-1, surface_mass, x, y, z);
-    //         surface_nodes[idx-1]->radius = 1.0f; // give surface nodes a radius for better collision with ground and ramp
-    //     }
-    // }
-    // // South pole
-    // surface_nodes[idx++] = node_create(-1, surface_mass, sphere_x, center_y - sphere_radius, sphere_z);
+    // Allocate array for surface nodes (including poles)
+    int total_surface = 2 + (lat_count-1) * lon_count; // poles + rings
+    Node **surface_nodes = (Node**)malloc(sizeof(Node*) * total_surface);
+    int idx = 0;
+    // North pole
+    surface_nodes[idx++] = node_create(-1, surface_mass, sphere_x, center_y + sphere_radius, sphere_z);
+    // Rings (exclude poles)
+    for (int i = 1; i < lat_count; ++i) {
+        float phi = (float)i * 3.14159265f / (float)lat_count; // 0..pi
+        float y = center_y + sphere_radius * cosf(phi);
+        float r_xy = sphere_radius * sinf(phi);
+        for (int j = 0; j < lon_count; ++j) {
+            float theta = 2.0f * 3.14159265f * (float)j / (float)lon_count;
+            float x = sphere_x + r_xy * cosf(theta);
+            float z = sphere_z + r_xy * sinf(theta);
+            surface_nodes[idx++] = node_create(-1, surface_mass, x, y, z);
+            surface_nodes[idx-1]->radius = 1.0f; // give surface nodes a radius for better collision with ground and ramp
+        }
+    }
+    // South pole
+    surface_nodes[idx++] = node_create(-1, surface_mass, sphere_x, center_y - sphere_radius, sphere_z);
 
-    // // Set friction and add to simulator
-    // for (int i = 0; i < total_surface; ++i) {
-    //     surface_nodes[i]->friction = 0.6f;
-    //     simulator_add_node(sim, surface_nodes[i]);
-    // }
+    // Set friction and add to simulator
+    for (int i = 0; i < total_surface; ++i) {
+        surface_nodes[i]->friction = 0.6f;
+        simulator_add_node(sim, surface_nodes[i]);
+    }
 
-    // // Add distance constraints between neighboring surface nodes (rings and longitudes)
-    // // Indexing: 0 = north pole, then rings in order, last = south pole
-    // // Connect north pole to first ring
-    // int ring_start = 1;
-    // for (int j = 0; j < lon_count; ++j) {
-    //     Constraint *c = distconstraint_create(surface_nodes[0], surface_nodes[ring_start + j], -1);
-    //     simulator_add_constraint(sim, c);
-    // }
-    // // Connect rings internally and between rings
-    // for (int r = 0; r < lat_count-1; ++r) {
-    //     int this_ring_start = 1 + r * lon_count;
-    //     int next_ring_start = this_ring_start + lon_count;
-    //     // If next_ring_start points to south pole, handle separately
-    //     int next_is_pole = (r == lat_count-2);
-    //     for (int j = 0; j < lon_count; ++j) {
-    //         int a = this_ring_start + j;
-    //         int b = this_ring_start + ((j+1) % lon_count);
-    //         // same-ring neighbor
-    //         Constraint *c1 = distconstraint_create(surface_nodes[a], surface_nodes[b], -1);
-    //         simulator_add_constraint(sim, c1);
-    //         // connect to next ring (or south pole)
-    //         if (next_is_pole) {
-    //             int south_idx = total_surface - 1;
-    //             Constraint *c2 = distconstraint_create(surface_nodes[a], surface_nodes[south_idx], -1);
-    //             simulator_add_constraint(sim, c2);
-    //         } else {
-    //             int cidx = next_ring_start + j;
-    //             Constraint *c2 = distconstraint_create(surface_nodes[a], surface_nodes[cidx], -1);
-    //             simulator_add_constraint(sim, c2);
-    //             // also connect to next ring neighbor for triangulation
-    //             int cidx2 = next_ring_start + ((j+1) % lon_count);
-    //             Constraint *c3 = distconstraint_create(surface_nodes[a], surface_nodes[cidx2], -1);
-    //             simulator_add_constraint(sim, c3);
-    //         }
-    //     }
-    // }
+    // Add distance constraints between neighboring surface nodes (rings and longitudes)
+    // Indexing: 0 = north pole, then rings in order, last = south pole
+    // Connect north pole to first ring
+    int ring_start = 1;
+    for (int j = 0; j < lon_count; ++j) {
+        Constraint *c = distconstraint_create(surface_nodes[0], surface_nodes[ring_start + j], -1);
+        simulator_add_constraint(sim, c);
+    }
+    // Connect rings internally and between rings
+    for (int r = 0; r < lat_count-1; ++r) {
+        int this_ring_start = 1 + r * lon_count;
+        int next_ring_start = this_ring_start + lon_count;
+        // If next_ring_start points to south pole, handle separately
+        int next_is_pole = (r == lat_count-2);
+        for (int j = 0; j < lon_count; ++j) {
+            int a = this_ring_start + j;
+            int b = this_ring_start + ((j+1) % lon_count);
+            // same-ring neighbor
+            Constraint *c1 = distconstraint_create(surface_nodes[a], surface_nodes[b], -1);
+            simulator_add_constraint(sim, c1);
+            // connect to next ring (or south pole)
+            if (next_is_pole) {
+                int south_idx = total_surface - 1;
+                Constraint *c2 = distconstraint_create(surface_nodes[a], surface_nodes[south_idx], -1);
+                simulator_add_constraint(sim, c2);
+            } else {
+                int cidx = next_ring_start + j;
+                Constraint *c2 = distconstraint_create(surface_nodes[a], surface_nodes[cidx], -1);
+                simulator_add_constraint(sim, c2);
+                // also connect to next ring neighbor for triangulation
+                int cidx2 = next_ring_start + ((j+1) % lon_count);
+                Constraint *c3 = distconstraint_create(surface_nodes[a], surface_nodes[cidx2], -1);
+                simulator_add_constraint(sim, c3);
+            }
+        }
+    }
 
-    // // Connect all surface nodes radially to center
-    // for (int i = 0; i < total_surface; ++i) {
-    //     Constraint *cr = distconstraint_create(surface_nodes[i], sphere_center, -1);
-    //     simulator_add_constraint(sim, cr);
-    // }
+    // Connect all surface nodes radially to center
+    for (int i = 0; i < total_surface; ++i) {
+        Constraint *cr = distconstraint_create(surface_nodes[i], sphere_center, -1);
+        simulator_add_constraint(sim, cr);
+    }
 
-    // free(surface_nodes);
+    free(surface_nodes);
     
     // Tetrahedron above ground, pointy end down
     float tet_size = 30.0f;
