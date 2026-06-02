@@ -1,4 +1,5 @@
 // Clean, corrected main.c
+#include <GL/glew.h>
 #include <SDL2/SDL.h>
 #include <SDL2/SDL_opengl.h>
 #include <stdio.h>
@@ -82,6 +83,7 @@ static void sel_cb_delete_nodes(VariableInteraction *vi, void *user_data);
 static void sel_cb_set_constraint_distance(VariableInteraction *vi, void *user_data);
 static void sel_cb_set_spring_prop(VariableInteraction *vi, void *user_data);
 static void sel_cb_set_wall_prop(VariableInteraction *vi, void *user_data);
+static void sel_cb_toggle_wall_translucent(VariableInteraction *vi, void *user_data);
 
 // Create the edit palette menu (if not already created). Caller must ensure ed != NULL
 static void create_edit_menu_if_needed(EditData *ed) {
@@ -262,6 +264,11 @@ static void create_select_menu_if_needed(EditData *ed) {
                 VariableInteraction *v_wr = variableinteraction_create(wr, "Restitution", 0.0, 1.0, VAR_SLIDER, sel_cb_set_wall_prop, ed);
                 menurow_add_interaction(r_wr, v_wr);
                 menu_add_row(m, r_wr);
+                MenuRow *r_wt = menurow_create();
+                int *wt = malloc(sizeof(int)); *wt = w->translucent;
+                VariableInteraction *v_wt = variableinteraction_create(wt, "Translucent", 0, 1, VAR_BOOL, sel_cb_toggle_wall_translucent, ed);
+                menurow_add_interaction(r_wt, v_wt);
+                menu_add_row(m, r_wt);
             }
         }
     }
@@ -899,6 +906,7 @@ int main(int argc, char *argv[]) {
     int override_solver_iters = 0;
     int run_mesh_test = 0;
     int want_gpu = 0;
+    const char *active_scene = "default";
     int mesh_k = 3;
     for (int ai = 1; ai < argc; ++ai) {
         const char *arg = argv[ai];
@@ -913,6 +921,12 @@ int main(int argc, char *argv[]) {
             if (v > 0) mesh_k = v;
         } else if (strcmp(arg, "--gpu") == 0) {
             want_gpu = 1;
+        } else if (strcmp(arg, "-piston") == 0) {
+            active_scene = "piston";
+            want_gpu = 1; /* piston scene requires GPU */
+        } else if (strcmp(arg, "-tank") == 0) {
+            active_scene = "tank";
+            want_gpu = 1; /* tank scene requires GPU */
         }
     }
     if (SDL_Init(SDL_INIT_VIDEO) < 0) {
@@ -973,11 +987,12 @@ int main(int argc, char *argv[]) {
     int fps_value = 0;
 
     // 3D Camera: position, orientation (yaw=horizontal, pitch=vertical), and movement speed
-    float cam_x = 0.0f, cam_y = 0.0f, cam_z = 500.0f;  // start 500 units back from origin
-    float cam_yaw = 0.0f;   // horizontal rotation (radians) - looking forward
-    float cam_pitch = 0.0f; // vertical rotation (radians) - looking straight ahead
-    float cam_speed = 50.0f; // units per second for WASD movement
-    float cam_zoom = 1.0f;   // multiplier for movement speed
+    /* Default: 500 units back from origin, looking forward */
+    float cam_x = 0.0f, cam_y = 0.0f, cam_z = 500.0f;
+    float cam_yaw = 0.0f;   // horizontal rotation (radians)
+    float cam_pitch = 0.0f; // vertical rotation (radians)
+    float cam_speed = 50.0f;
+    float cam_zoom = 1.0f;
     int space_down = 0;
     int rotating_camera = 0;
     int rotate_last_x = 0, rotate_last_y = 0;
@@ -986,7 +1001,7 @@ int main(int argc, char *argv[]) {
     int key_shift = 0, key_ctrl = 0;
 
     // --- Initial scenario: Box in Sleeve ---
-    Simulator *sim = simulator_create(1.0f/40.0f);
+    Simulator *sim = simulator_create(1.0f/60.0f);
     if (override_solver_iters > 0) sim->solver_iters = override_solver_iters;
 
     
@@ -1011,6 +1026,8 @@ int main(int argc, char *argv[]) {
     int paused = 1;
     // Octree rendering control
     int show_octree = 1;
+    // Particle colour mode: 1=velocity viridis (default), 0=element colour
+    int ps_vel_color = 1;
     double grid_cell_size = 10.0; /* default matches Simulator.c cell size; slider range below */
 
     Menu *ctrl = menu_create(10, 10, 220, 110, 100, "Controls", (Color){255,255,255,255}, (Color){40,40,60,255});
@@ -1036,6 +1053,11 @@ int main(int argc, char *argv[]) {
     VariableInteraction *vi_grid = variableinteraction_create(&show_octree, "Show VBH's", 0, 1, VAR_BOOL, NULL, NULL);
     menurow_add_interaction(r_grid, vi_grid);
     menu_add_row(ctrl, r_grid);
+    // Row: Particle vel/element colour toggle
+    MenuRow *r_velcol = menurow_create();
+    VariableInteraction *vi_velcol = variableinteraction_create(&ps_vel_color, "Vel Color", 0, 1, VAR_BOOL, NULL, NULL);
+    menurow_add_interaction(r_velcol, vi_velcol);
+    menu_add_row(ctrl, r_velcol);
     // Row: Cell size slider (0.5 .. 75)
     MenuRow *r_cell = menurow_create();
     VariableInteraction *vi_cell = variableinteraction_create(&grid_cell_size, "Cell Size", 0.5, 75.0, VAR_SLIDER, NULL, NULL);
@@ -1130,364 +1152,14 @@ int main(int argc, char *argv[]) {
         }
     }
     
-    // NEW SCENE: Ground + Tetrahedron
-    // Position in front of camera (0,0,500), slightly below (y < 0)
-    // Camera looks along -Z axis, so objects should be at negative Z
-    
-    // Ground plane: 2 large anchored triangles forming a square
-    float ground_size = 200.0f;
-    float ground_z = -300.0f;  // in front of camera
-    float ground_y = -50.0f;   // below camera
-    
-    // Ground corners
-    Node *g1 = node_create(-1, 1.0f, -ground_size, ground_y, ground_z - ground_size);
-    Node *g2 = node_create(-1, 1.0f,  ground_size, ground_y, ground_z - ground_size);
-    Node *g3 = node_create(-1, 1.0f,  ground_size, ground_y, ground_z + ground_size);
-    Node *g4 = node_create(-1, 1.0f, -ground_size, ground_y, ground_z + ground_size);
-    g1->anchored = true; g2->anchored = true; g3->anchored = true; g4->anchored = true;
-    simulator_add_node(sim, g1);
-    simulator_add_node(sim, g2);
-    simulator_add_node(sim, g3);
-    simulator_add_node(sim, g4);
-    
-    // Ground triangle walls (low restitution to reduce bounciness)
-    TriangleWall *ground1 = trianglewall_create(g1, g2, g3, 0.05f, 0.0f, NULL, NULL, NULL);
-    TriangleWall *ground2 = trianglewall_create(g1, g3, g4, 0.05f, 0.0f, NULL, NULL, NULL);
-    simulator_add_wall(sim, ground1);
-    simulator_add_wall(sim, ground2);
-
-    // Additional tilted rectangular tile (ramp) formed from two triangles.
-    // Place the ramp slightly in front of the ground and incline it up in Y.
-    float ramp_x0 = -50.0f, ramp_x1 = 50.0f;
-    float ramp_z0 = ground_z + 120.0f; // slightly forward of ground center
-    float ramp_z1 = ground_z + 160.0f;
-    float ramp_y_bottom = ground_y;
-    float ramp_y_top = ground_y + 40.0f; // incline height
-
-    Node *r1 = node_create(-1, 1.0f, ramp_x0, ramp_y_bottom, ramp_z0);
-    Node *r2 = node_create(-1, 1.0f, ramp_x1, ramp_y_bottom, ramp_z0);
-    Node *r3 = node_create(-1, 1.0f, ramp_x1, ramp_y_top,    ramp_z1);
-    Node *r4 = node_create(-1, 1.0f, ramp_x0, ramp_y_top,    ramp_z1);
-    r1->anchored = true; r2->anchored = true; r3->anchored = true; r4->anchored = true;
-    simulator_add_node(sim, r1);
-    simulator_add_node(sim, r2);
-    simulator_add_node(sim, r3);
-    simulator_add_node(sim, r4);
-    // Ramp triangles: low restitution to avoid bouncing
-    TriangleWall *ramp1 = trianglewall_create(r1, r2, r3, 0.05f, 0.6f, NULL, NULL, NULL);
-    TriangleWall *ramp2 = trianglewall_create(r1, r3, r4, 0.05f, 0.6f, NULL, NULL, NULL);
-    simulator_add_wall(sim, ramp1);
-    simulator_add_wall(sim, ramp2);
-
-    // Generate a soft sphere made of many low-mass surface nodes and a heavier center
-    float sphere_x = (ramp_x0 + ramp_x1) * 0.5f;
-    float sphere_z = (ramp_z0 + ramp_z1) * 0.5f + 10;
-    float sphere_radius = 8.0f;
-    float center_y = ramp_y_top + sphere_radius - 5.0f; // just above ramp
-
-    // Parameters for sphere mesh
-    int lat_count = 6;   // number of latitude divisions (including poles)
-    int lon_count = 6;  // number of longitudinal samples per ring
-    float surface_mass = 0.2f;
-    float center_mass = 5.0f;
-
-    // Create center structural node
-    Node *sphere_center = node_create(-1, center_mass, sphere_x, center_y, sphere_z);
-    sphere_center->friction = 0.6f;
-    sphere_center->radius = 0.5f; // ensure center node collides with ground and ramp
-    simulator_add_node(sim, sphere_center);
-
-    // Allocate array for surface nodes (including poles)
-    int total_surface = 2 + (lat_count-1) * lon_count; // poles + rings
-    Node **surface_nodes = (Node**)malloc(sizeof(Node*) * total_surface);
-    int idx = 0;
-    // North pole
-    surface_nodes[idx++] = node_create(-1, surface_mass, sphere_x, center_y + sphere_radius, sphere_z);
-    // Rings (exclude poles)
-    for (int i = 1; i < lat_count; ++i) {
-        float phi = (float)i * 3.14159265f / (float)lat_count; // 0..pi
-        float y = center_y + sphere_radius * cosf(phi);
-        float r_xy = sphere_radius * sinf(phi);
-        for (int j = 0; j < lon_count; ++j) {
-            float theta = 2.0f * 3.14159265f * (float)j / (float)lon_count;
-            float x = sphere_x + r_xy * cosf(theta);
-            float z = sphere_z + r_xy * sinf(theta);
-            surface_nodes[idx++] = node_create(-1, surface_mass, x, y, z);
-            surface_nodes[idx-1]->radius = 1.0f; // give surface nodes a radius for better collision with ground and ramp
-        }
+    /* Scene initialization: the flag selects a file pasted in place here */
+    if (strcmp(active_scene, "piston") == 0) {
+#include "scenes/piston.scene.c"
+    } else if (strcmp(active_scene, "tank") == 0) {
+#include "scenes/tank.scene.c"
+    } else {
+#include "scenes/default.scene.c"
     }
-    // South pole
-    surface_nodes[idx++] = node_create(-1, surface_mass, sphere_x, center_y - sphere_radius, sphere_z);
-
-    // Set friction and add to simulator
-    for (int i = 0; i < total_surface; ++i) {
-        surface_nodes[i]->friction = 0.6f;
-        simulator_add_node(sim, surface_nodes[i]);
-    }
-
-    // Add distance constraints between neighboring surface nodes (rings and longitudes)
-    // Indexing: 0 = north pole, then rings in order, last = south pole
-    // Connect north pole to first ring
-    int ring_start = 1;
-    for (int j = 0; j < lon_count; ++j) {
-        Constraint *c = distconstraint_create(surface_nodes[0], surface_nodes[ring_start + j], -1);
-        simulator_add_constraint(sim, c);
-    }
-    // Connect rings internally and between rings
-    for (int r = 0; r < lat_count-1; ++r) {
-        int this_ring_start = 1 + r * lon_count;
-        int next_ring_start = this_ring_start + lon_count;
-        // If next_ring_start points to south pole, handle separately
-        int next_is_pole = (r == lat_count-2);
-        for (int j = 0; j < lon_count; ++j) {
-            int a = this_ring_start + j;
-            int b = this_ring_start + ((j+1) % lon_count);
-            // same-ring neighbor
-            Constraint *c1 = distconstraint_create(surface_nodes[a], surface_nodes[b], -1);
-            simulator_add_constraint(sim, c1);
-            // connect to next ring (or south pole)
-            if (next_is_pole) {
-                int south_idx = total_surface - 1;
-                Constraint *c2 = distconstraint_create(surface_nodes[a], surface_nodes[south_idx], -1);
-                simulator_add_constraint(sim, c2);
-            } else {
-                int cidx = next_ring_start + j;
-                Constraint *c2 = distconstraint_create(surface_nodes[a], surface_nodes[cidx], -1);
-                simulator_add_constraint(sim, c2);
-                // also connect to next ring neighbor for triangulation
-                int cidx2 = next_ring_start + ((j+1) % lon_count);
-                Constraint *c3 = distconstraint_create(surface_nodes[a], surface_nodes[cidx2], -1);
-                simulator_add_constraint(sim, c3);
-            }
-        }
-    }
-
-    // Connect all surface nodes radially to center
-    for (int i = 0; i < total_surface; ++i) {
-        Constraint *cr = distconstraint_create(surface_nodes[i], sphere_center, -1);
-        simulator_add_constraint(sim, cr);
-    }
-
-    free(surface_nodes);
-    
-    // Tetrahedron above ground, pointy end down
-    float tet_size = 30.0f;
-    float tet_center_z = ground_z;  // same Z as ground center
-    float tet_bottom_y = ground_y + 50.0f;  // 20 units above ground
-    float tet_height = tet_size * sqrtf(2.0f / 3.0f);  // height of regular tetrahedron
-    
-    // Bottom vertex (pointy end)
-    Node *t_bottom = node_create(-1, 1.0f, 0.0f, tet_bottom_y, tet_center_z);
-    t_bottom->friction = 0.1f; // add some friction to bottom vertex to help stabilize
-    simulator_add_node(sim, t_bottom);
-    
-    // Top 3 vertices forming equilateral triangle
-    float top_y = tet_bottom_y + tet_height;
-    float angle_offset = 3.14159265f / 2.0f;  // start at top
-    Node *t1 = node_create(-1, 1.1f, 
-        tet_size * cosf(angle_offset), 
-        top_y, 
-        tet_center_z + tet_size * sinf(angle_offset));
-    t1->friction = 0.1f;
-    Node *t2 = node_create(-1, 1.0f, 
-        tet_size * cosf(angle_offset + 2.0f * 3.14159265f / 3.0f), 
-        top_y, 
-        tet_center_z + tet_size * sinf(angle_offset + 2.0f * 3.14159265f / 3.0f));
-    t2->friction = 0.1f;
-    Node *t3 = node_create(-1, 1.05f, 
-        tet_size * cosf(angle_offset + 4.0f * 3.14159265f / 3.0f), 
-        top_y, 
-        tet_center_z + tet_size * sinf(angle_offset + 4.0f * 3.14159265f / 3.0f));
-    t3->friction = 0.1f;
-    simulator_add_node(sim, t1);
-    simulator_add_node(sim, t2);
-    simulator_add_node(sim, t3);
-    
-    // Distance constraints for all 6 edges of tetrahedron
-    Constraint* t_bottom_tb1 = distconstraint_create(t_bottom, t1, -1);
-    simulator_add_constraint(sim, t_bottom_tb1);
-    Constraint* t_bottom_tb2 = distconstraint_create(t_bottom, t2, -1);
-    simulator_add_constraint(sim, t_bottom_tb2);
-    Constraint* t_bottom_tb3 = distconstraint_create(t_bottom, t3, -1);
-    simulator_add_constraint(sim, t_bottom_tb3);
-    Constraint* t1_t2 = distconstraint_create(t1, t2, -1);
-    simulator_add_constraint(sim, t1_t2);
-    Constraint* t2_t3 = distconstraint_create(t2, t3, -1);
-    simulator_add_constraint(sim, t2_t3);
-    simulator_add_constraint(sim, distconstraint_create(t3, t1, -1));
-    
-    // Triangle walls for all 4 faces of tetrahedron
-    TriangleWall *tet_face1 = trianglewall_create(t1, t2, t3, 1.0f, 0.0f, t1_t2, t2_t3, t_bottom_tb1);  // Top face
-    TriangleWall *tet_face2 = trianglewall_create(t_bottom, t2, t1, 1.0f, 0.0f, t_bottom_tb2, t1_t2, t_bottom_tb1);  // Side 1
-    TriangleWall *tet_face3 = trianglewall_create(t_bottom, t3, t2, 1.0f, 0.0f, t_bottom_tb3, t2_t3, t_bottom_tb2);  // Side 2
-    TriangleWall *tet_face4 = trianglewall_create(t_bottom, t1, t3, 1.0f, 0.0f, t_bottom_tb1, t_bottom_tb3, t1_t2);  // Side 3
-    simulator_add_wall(sim, tet_face1);
-    simulator_add_wall(sim, tet_face2);
-    simulator_add_wall(sim, tet_face3);
-    simulator_add_wall(sim, tet_face4);
-    
-    // Double pendulum: above and to the side
-    // Anchor point at (150, 50, -300) - off to the right, above ground
-    float pend_anchor_x = 150.0f;
-    float pend_anchor_y = 50.0f;
-    float pend_anchor_z = -300.0f;
-    float arm_length = 40.0f;
-    
-    // Anchor node (fixed)
-    Node *pend_anchor = node_create(-1, 1.0f, pend_anchor_x, pend_anchor_y, pend_anchor_z);
-    pend_anchor->anchored = true;
-    simulator_add_node(sim, pend_anchor);
-    
-    // First bob: lying flat on xz plane (extend in +x direction)
-    Node *pend_bob1 = node_create(-1, 5.0f, pend_anchor_x + arm_length, pend_anchor_y, pend_anchor_z);
-    simulator_add_node(sim, pend_bob1);
-    
-    // Second bob: pointing up (extend in +y direction from bob1)
-    Node *pend_bob2 = node_create(-1, 5.0f, pend_bob1->pos[0], pend_bob1->pos[1] + arm_length, pend_bob1->pos[2]);
-    simulator_add_node(sim, pend_bob2);
-    
-    // Distance constraints for pendulum arms
-    simulator_add_constraint(sim, distconstraint_create(pend_anchor, pend_bob1, -1));
-    simulator_add_constraint(sim, distconstraint_create(pend_bob1, pend_bob2, -1));
-    
-    // Equilateral Triangular Prism near tetrahedron
-    float prism_side = 30.0f;  // side length of equilateral triangle base
-    float prism_height = 60.0f;  // height/length of prism
-    float prism_x = 80.0f;  // offset to the right of tetrahedron
-    float prism_y = ground_y + 40.0f;  // base at 40 units above ground
-    float prism_z = ground_z;  // same Z as ground
-    
-    // Bottom triangle vertices (equilateral triangle in XZ plane)
-    float tri_height = prism_side * sqrtf(3.0f) / 2.0f;  // height of equilateral triangle
-    Node *pb1 = node_create(-1, 1.0f, prism_x, prism_y, prism_z - tri_height / 3.0f);
-    Node *pb2 = node_create(-1, 1.0f, prism_x - prism_side / 2.0f, prism_y, prism_z + tri_height * 2.0f / 3.0f);
-    Node *pb3 = node_create(-1, 1.0f, prism_x + prism_side / 2.0f, prism_y, prism_z + tri_height * 2.0f / 3.0f);
-    simulator_add_node(sim, pb1);
-    simulator_add_node(sim, pb2);
-    simulator_add_node(sim, pb3);
-    
-    // Top triangle vertices (directly above bottom triangle)
-    Node *pt1 = node_create(-1, 1.0f, pb1->pos[0], prism_y + prism_height, pb1->pos[2]);
-    Node *pt2 = node_create(-1, 1.0f, pb2->pos[0], prism_y + prism_height, pb2->pos[2]);
-    Node *pt3 = node_create(-1, 1.0f, pb3->pos[0], prism_y + prism_height, pb3->pos[2]);
-    simulator_add_node(sim, pt1);
-    simulator_add_node(sim, pt2);
-    simulator_add_node(sim, pt3);
-    
-    // Distance constraints for all edges (3 bottom, 3 top, 3 vertical)
-    Constraint* pb1_pb2 = distconstraint_create(pb1, pb2, -1);
-    simulator_add_constraint(sim, pb1_pb2);
-    Constraint* pb2_pb3 = distconstraint_create(pb2, pb3, -1);
-    simulator_add_constraint(sim, pb2_pb3);
-    Constraint* pb3_pb1 = distconstraint_create(pb3, pb1, -1);
-    simulator_add_constraint(sim, pb3_pb1);
-    Constraint* pt1_pt2 = distconstraint_create(pt1, pt2, -1);
-    simulator_add_constraint(sim, pt1_pt2);
-    Constraint* pt2_pt3 = distconstraint_create(pt2, pt3, -1);
-    simulator_add_constraint(sim, pt2_pt3);
-    Constraint* pt3_pt1 = distconstraint_create(pt3, pt1, -1);
-    simulator_add_constraint(sim, pt3_pt1);
-    Constraint* pb1_pt1 = distconstraint_create(pb1, pt1, -1);
-    simulator_add_constraint(sim, pb1_pt1);
-    Constraint* pb2_pt2 = distconstraint_create(pb2, pt2, -1);
-    simulator_add_constraint(sim, pb2_pt2);
-    Constraint* pb3_pt3 = distconstraint_create(pb3, pt3, -1);
-    simulator_add_constraint(sim, pb3_pt3);
-    Constraint* pb1_pt2 = distconstraint_create(pb1, pt2, -1);
-    simulator_add_constraint(sim, pb1_pt2);
-    Constraint* pb2_pt3 = distconstraint_create(pb2, pt3, -1);
-    simulator_add_constraint(sim, pb2_pt3);
-    Constraint* pb3_pt1 = distconstraint_create(pb3, pt1, -1);
-    simulator_add_constraint(sim, pb3_pt1);
-    
-    // Triangle walls for bottom and top faces
-    TriangleWall *prism_bottom = trianglewall_create(pb1, pb3, pb2, 1.0f, 0.0f, pb1_pb2, pb2_pb3, pb3_pb1);  // Bottom (clockwise from below)
-    TriangleWall *prism_top = trianglewall_create(pt1, pt2, pt3, 1.0f, 0.0f, pt1_pt2, pt2_pt3, pt3_pt1);  // Top (clockwise from above)
-    simulator_add_wall(sim, prism_bottom);
-    simulator_add_wall(sim, prism_top);
-    
-    // Rectangular side walls (each split into 2 triangles)
-    // Side 1: pb1-pb2-pt2-pt1
-    TriangleWall *prism_side1a = trianglewall_create(pb1, pb2, pt2, 1.0f, 0.0f, pb1_pb2, pb2_pt2, pb1_pt2);
-    TriangleWall *prism_side1b = trianglewall_create(pb1, pt2, pt1, 1.0f, 0.0f, pb1_pt2, pt1_pt2, pb1_pt1);
-    simulator_add_wall(sim, prism_side1a);
-    simulator_add_wall(sim, prism_side1b);
-    
-    // Side 2: pb2-pb3-pt3-pt2
-    TriangleWall *prism_side2a = trianglewall_create(pb2, pb3, pt3, 1.0f, 0.0f, pb2_pb3, pb3_pt3, pb2_pt3);
-    TriangleWall *prism_side2b = trianglewall_create(pb2, pt3, pt2, 1.0f, 0.0f, pb2_pt3, pt2_pt3, pb2_pt2);
-    simulator_add_wall(sim, prism_side2a);
-    simulator_add_wall(sim, prism_side2b);
-    
-    // Side 3: pb3-pb1-pt1-pt3
-    TriangleWall *prism_side3a = trianglewall_create(pb3, pb1, pt1, 1.0f, 0.0f, pb3_pb1, pb1_pt1, pb3_pt1);
-    TriangleWall *prism_side3b = trianglewall_create(pb3, pt1, pt3, 1.0f, 0.0f, pb3_pt1, pt3_pt1, pb3_pt3);
-    simulator_add_wall(sim, prism_side3a);
-    simulator_add_wall(sim, prism_side3b);
-    
-    // Edge-Edge Collision Test (to the left)
-    // Single anchor with a triangular pendulum that swings and collides with a horizontal triangle
-    float test_x = -250.0f;
-    float test_y = ground_y + 60.0f;
-    float test_z = ground_z;
-    
-    // Anchor point
-    Node *edge_anchor = node_create(-1, 0.5f, test_x, test_y, test_z);
-    edge_anchor->anchored = true;
-    simulator_add_node(sim, edge_anchor);
-    
-    // Triangular pendulum (3 nodes forming triangle, displaced to create swing)
-    float pend_arm = 40.0f;
-    float pend_tri_size = 25.0f;
-    Node *pend1 = node_create(-1, 2.0f, test_x + pend_arm - pend_tri_size/2, test_y - 20.0f, test_z);
-    Node *pend2 = node_create(-1, 2.0f, test_x + pend_arm + pend_tri_size/2, test_y - 20.0f, test_z);
-    Node *pend3 = node_create(-1, 2.0f, test_x + pend_arm, test_y - 20.0f - pend_tri_size * 0.866f, test_z);
-    simulator_add_node(sim, pend1);
-    simulator_add_node(sim, pend2);
-    simulator_add_node(sim, pend3);
-    
-    // Distance constraints: anchor to each vertex and between all vertices
-    Constraint* pa1 = distconstraint_create(edge_anchor, pend1, -1);
-    Constraint* pa2 = distconstraint_create(edge_anchor, pend2, -1);
-    Constraint* pa3 = distconstraint_create(edge_anchor, pend3, -1);
-    Constraint* p12 = distconstraint_create(pend1, pend2, -1);
-    Constraint* p23 = distconstraint_create(pend2, pend3, -1);
-    Constraint* p31 = distconstraint_create(pend3, pend1, -1);
-    simulator_add_constraint(sim, pa1);
-    simulator_add_constraint(sim, pa2);
-    simulator_add_constraint(sim, pa3);
-    simulator_add_constraint(sim, p12);
-    simulator_add_constraint(sim, p23);
-    simulator_add_constraint(sim, p31);
-    
-    // Pendulum triangle as collision surface
-    TriangleWall *pend_wall = trianglewall_create(pend1, pend2, pend3, 1.0f, 0.0f, p12, p23, p31);
-    simulator_add_wall(sim, pend_wall);
-    
-    // Static horizontal triangle (flat on x-z plane) positioned to collide with pendulum
-    float horiz_y = test_y - 45.0f;  // positioned in swing path
-    Node *horiz1 = node_create(-1, 1.0f, test_x - 20.0f, horiz_y, test_z - 20.0f);
-    Node *horiz2 = node_create(-1, 1.0f, test_x + 10.0f, horiz_y, test_z - 20.0f);
-    Node *horiz3 = node_create(-1, 1.0f, test_x - 5.0f, horiz_y, test_z + 20.0f);
-    horiz1->anchored = true;
-    horiz2->anchored = true;
-    horiz3->anchored = true;
-    simulator_add_node(sim, horiz1);
-    simulator_add_node(sim, horiz2);
-    simulator_add_node(sim, horiz3);
-    
-    // Distance constraints for horizontal triangle structure
-    Constraint* h12 = distconstraint_create(horiz1, horiz2, -1);
-    Constraint* h23 = distconstraint_create(horiz2, horiz3, -1);
-    Constraint* h31 = distconstraint_create(horiz3, horiz1, -1);
-    simulator_add_constraint(sim, h12);
-    simulator_add_constraint(sim, h23);
-    simulator_add_constraint(sim, h31);
-    
-    // Horizontal triangle as collision surface
-    TriangleWall *horiz_wall = trianglewall_create(horiz1, horiz2, horiz3, 1.0f, 0.0f, h12, h23, h31);
-    simulator_add_wall(sim, horiz_wall);
-    
     fprintf(stderr, "Generated initial scenario with %zu nodes, %zu constraints, %zu walls\n",
         dynarray_size(sim->nodes), dynarray_size(sim->constraints), dynarray_size(sim->walls)); fflush(stderr);
 
@@ -1507,6 +1179,14 @@ int main(int argc, char *argv[]) {
                 // keep CPU path active until GPU solver is complete
                 sim->use_gpu = 0;
                 fprintf(stderr, "Uploaded scene to GPU (buffers ready). CPU stepping remains active.\n"); fflush(stderr);
+            }
+
+            /* ── Post-GPU scene setup ── */
+            if (strcmp(active_scene, "piston") == 0 && sim->use_gpu) {
+#include "scenes/piston.post.scene.c"
+            }
+            if (strcmp(active_scene, "tank") == 0 && sim->use_gpu) {
+#include "scenes/tank.post.scene.c"
             }
         } else {
             fprintf(stderr, "Failed to pack scene for GPU upload — continuing on CPU.\n");
@@ -2125,6 +1805,8 @@ int main(int argc, char *argv[]) {
         }
 
         simulator_draw(sim, cam_yaw, cam_pitch);
+        /* Sync particle colour mode from menu toggle */
+        if (sim->particles) sim->particles->vel_color_mode = ps_vel_color;
         
         // draw selection highlights (camera-facing billboards, drawn on top)
         if (dynarray_size(selection) > 0) {
@@ -2279,6 +1961,54 @@ int main(int argc, char *argv[]) {
             int ty = win_h - pad - th;
             Color white = {255,255,255,255};
             menu_draw_text_at(fps_text, tx, ty, white);
+        }
+
+        // Draw particle reserve count in bottom-left
+        if (sim->particles) {
+            static int    s_cached_active = 0;
+            static Uint32 s_last_sample   = 0;
+            Uint32 now_ms = SDL_GetTicks();
+            if (now_ms - s_last_sample >= 250) {
+                s_cached_active = particle_sim_count_active(sim->particles);
+                s_last_sample   = now_ms;
+            }
+            int total   = sim->particles->n_particles;
+            int reserve = total - s_cached_active;
+            char res_buf[64];
+            Color res_col;
+            if (reserve > 0) {
+                snprintf(res_buf, sizeof(res_buf), "Reserve: %d / %d", reserve, total);
+                res_col = (Color){220, 220, 220, 255};
+            } else {
+                snprintf(res_buf, sizeof(res_buf), "Reserve: 0 / %d  EMPTY!", total);
+                res_col = (Color){255, 50, 50, 255};
+            }
+            int rw = 0, rh = 0;
+            if (menu_measure_text(res_buf, &rw, &rh) == 0)
+                menu_draw_text_at(res_buf, 8, win_h - 8 - rh, res_col);
+        }
+
+        // Draw timing HUD (vertical, top-right)
+        const SimTimings *tm = simulator_get_timings(sim);
+        if (tm) {
+            Color yellow = {255, 220, 50, 255};
+            int lw = 0, lh = 16;
+            menu_measure_text("Mg", &lw, &lh);
+            int hy = 30, ls = lh + 2, pad = 8;
+            char line[64];
+#define HUD_LINE(fmt, ...) do { \
+    snprintf(line, sizeof(line), fmt, ##__VA_ARGS__); \
+    int tw = 0, th = 0; menu_measure_text(line, &tw, &th); \
+    menu_draw_text_at(line, win_w - pad - tw, hy, yellow); hy += ls; \
+} while(0)
+            HUD_LINE("LBVH edges  CPU %5.1f  GPU %5.2f ms", tm->cpu_lbvh_ms,      tm->gpu_lbvh_ms);
+            HUD_LINE("Wall BVH    CPU %5.1f  GPU %5.2f ms", tm->cpu_wall_bvh_ms,  tm->gpu_wall_bvh_ms);
+            HUD_LINE("Collision   CPU %5.1f  GPU %5.2f ms", tm->cpu_collision_ms, tm->gpu_collision_ms);
+            HUD_LINE("CG solver   CPU %5.1f  GPU %5.2f ms", tm->cpu_cg_ms,        tm->gpu_cg_ms);
+            HUD_LINE("apply_corr  CPU %5.1f  GPU %5.2f ms", tm->cpu_apply_ms,     tm->gpu_apply_ms);
+            HUD_LINE("Particles   CPU %5.1f  GPU %5.2f ms", tm->cpu_particles_ms, tm->gpu_particles_ms);
+            HUD_LINE("Total step  %5.1f ms",                 tm->cpu_total_ms);
+#undef HUD_LINE
         }
         
         // Draw plane info in top-left when in placement/selection modes
@@ -2470,4 +2200,15 @@ static void sel_cb_set_wall_prop(VariableInteraction *vi, void *user_data) {
         if (strcmp(name, "Friction") == 0) w->friction = (float)v;
         else if (strcmp(name, "Restitution") == 0) w->restitution = (float)v;
     }
+}
+
+static void sel_cb_toggle_wall_translucent(VariableInteraction *vi, void *user_data) {
+    EditData *ed = (EditData*)user_data;
+    if (!ed || !ed->selection || !ed->sim) return;
+    int val = *(int*)vi->variable;
+    for (size_t i = 0; i < dynarray_size(ed->selection); ++i) {
+        TriangleWall *w = (TriangleWall*)dynarray_get(ed->selection, i);
+        if (w) w->translucent = val;
+    }
+    simulator_upload_wall_flags(ed->sim);
 }

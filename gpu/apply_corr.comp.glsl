@@ -2,8 +2,9 @@
 // One thread per node.
 // 1. Computes J^T λ inline via CSR gather (bindings 7,10,26,27) — no jt_vec intermediate.
 // 2. Reads collision forces from binding 11 (CPU-uploaded per substep).
-// 3. Applies: vel += inv_mass * (corr_f * N + ext_forces + collision_forces) * sub_dt
-// 4. Applies: pos += vel * sub_dt
+// 3. Reads particle-mesh forces from binding 39 (written by ParticleSim each substep).
+// 4. Applies: vel += inv_mass * (corr_f * N + ext_forces + collision_forces + particle_mesh_forces) * sub_dt
+// 5. Applies: pos += vel * sub_dt
 #version 430 core
 layout(local_size_x = 64) in;
 
@@ -18,6 +19,7 @@ layout(std430, binding = 11) readonly buffer CollisionBuf{ vec4  coll_forces[];}
 layout(std430, binding = 18)          buffer VelCorrBuf  { uint  velcorr[];    };// edge-edge impulses
 layout(std430, binding = 26) readonly buffer CsrOffBuf   { int   csr_offsets[];};  // 3n+1
 layout(std430, binding = 27) readonly buffer CsrDatBuf   { int   csr_data[];   };  // n_entries*2
+layout(std430, binding = 39) readonly buffer ParticleMeshForceBuf { vec4 particle_mesh_forces[]; };
 
 uniform int   u_n;      // node count
 uniform float u_dt;     // full dt
@@ -61,11 +63,12 @@ void main() {
     vec3 corr_f = -u_dt * jtl; // corr_f = -dt * J^T λ
 
     // --- Accumulate all forces ---
-    vec3 ext  = ext_forces[i].xyz;
-    vec3 coll = coll_forces[i].xyz;
+    vec3 ext   = ext_forces[i].xyz;
+    vec3 coll  = coll_forces[i].xyz;
+    vec3 pmesh = particle_mesh_forces[i].xyz;  // force from particle sim (Newtons)
 
     // CPU mirrors: fcx = corr_f[3*i]*N, total_fx = fcx + extx, ax = invm*total_fx, vel+=ax*sub_dt
-    vec3 total_f = corr_f * float(u_N) + ext + coll;
+    vec3 total_f = corr_f * float(u_N) + ext + coll + pmesh;
 
     float im     = inv_mass[i];
     vec3  accel  = im * total_f;

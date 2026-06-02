@@ -51,6 +51,7 @@ typedef struct TriangleWall {
     float restitution;
     float friction;
     Constraint* edges[3];
+    int translucent; // non-zero: render as light-blue semi-transparent
 } TriangleWall;
 
 TriangleWall* trianglewall_create(Node *A, Node *B, Node *C, float restitution, float friction, Constraint* edge_AB, Constraint* edge_BC, Constraint* edge_CA);

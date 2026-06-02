@@ -5,8 +5,16 @@
 #include <stdio.h>
 #include <stdint.h>
 #include <math.h>
+#include <time.h>
 #include <GL/glew.h>
 #include <GL/gl.h>
+
+/* High-resolution CPU wall-clock timestamp in seconds */
+static double cpu_now(void) {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return ts.tv_sec + ts.tv_nsec * 1e-9;
+}
 
 #include <cs.h>
 
@@ -124,6 +132,11 @@ typedef struct GPUContext {
     GLint  u_ee_n, u_ee_m_total, u_ee_restitution, u_ee_mu;
     // ----- wall BVH scratch (binding 22) -----
     GLuint ssbo_wall_bvh_scratch;  // binding 22: sorted wall prim list (8 ints/prim, GPU-built)
+    // ----- particle-mesh force SSBO (written by ParticleSim, read by apply_corr) -----
+    GLuint ssbo_particle_mesh_forces; // binding 39: n x vec4 (forces from particle collisions)
+    // ----- dynamic wall flags -----
+    int rebuild_wall_bvh_per_substep; // when 1: rebuild wall LBVH each substep (for moving walls)
+    int enable_edge_edge;             // when 0: skip edge LBVH build + edge-edge collisions
     // ----- indirect dispatch infra (bindings 28-29) -----
     // prog_lbvh_prepare_edge_dispatch: 1-thread shader, reads escratch atomic counter,
     // writes {sort_x,1,1, build_x,1,1} into ssbo_indirect_args and n_edges into ssbo_edge_meta.
@@ -135,6 +148,9 @@ typedef struct GPUContext {
     // baked CG jt_gather variant for CG inloop (src=p, apply_minv=1)
     GLuint prog_cg_jt_gather_inloop;
     GLint  u_cjtg_il_n3;
+    // warm-start CG init: given x0 in l_data + jt_vec=M^{-1}J^Tx0, sets r=b-Ax0, p=r, rr
+    GLuint prog_cg_warm_init;
+    GLint  u_cwi_m, u_cwi_n_partials, u_cwi_dt;
     // per-scene cached n_partials locations for inline-reduction shaders
     GLint  u_ci_n_partials;    // cg_init
     GLint  u_cjg_n_partials;   // cg_j_gather
@@ -160,6 +176,14 @@ typedef struct GPUContext {
     GLint  u_draw_node_mvp;
     GLint  u_draw_con_mvp;
     GLint  u_draw_wall_mvp;
+    // ── Timing ──────────────────────────────────────────────────────────────
+    // Double-buffered GL_TIME_ELAPSED queries, one per major phase.
+    // Phase indices: 0=lbvh_edges, 1=wall_bvh, 2=collision, 3=cg, 4=apply_corr, 5=particles
+#define SIM_TQ_PHASES 6
+    GLuint tq[2][SIM_TQ_PHASES]; // tq[frame&1][phase]
+    int    tq_idx;               // which slot we are writing this frame
+    int    tq_ready;             // 1 after the first completed frame
+    SimTimings timings;          // last fully-completed frame's timings
 } GPUContext;
 
 // Pack the pointer-based simulator data into contiguous buffers for GPU upload.
@@ -465,6 +489,7 @@ int simulator_init_gpu(Simulator *s) {
         fprintf(stderr, "GPU: GLEW init failed: %s\n", glewGetErrorString(glew_status));
 
     GPUContext *ctx = (GPUContext*)calloc(1, sizeof(GPUContext));
+    ctx->enable_edge_edge = 1; /* on by default; disable for scenes with no cloth edges */
 
     ctx->prog_build_jb   = compile_compute_program_from_file("gpu/build_jb.comp.glsl");
     ctx->prog_ext_forces = compile_compute_program_from_file("gpu/ext_forces.comp.glsl");
@@ -488,6 +513,14 @@ int simulator_init_gpu(Simulator *s) {
     ctx->prog_lbvh_prepare_edge_dispatch = compile_compute_program_from_file(
         "gpu/lbvh_prepare_edge_dispatch.comp.glsl");
     ctx->prog_cg_jt_gather_inloop = compile_compute_program_from_file("gpu/cg_jt_gather.comp.glsl");
+    ctx->prog_cg_warm_init         = compile_compute_program_from_file("gpu/cg_warm_init.comp.glsl");
+    if (!ctx->prog_cg_warm_init)
+        fprintf(stderr, "GPU: cg_warm_init failed to compile — warm start disabled.\n");
+    else {
+        ctx->u_cwi_m          = glGetUniformLocation(ctx->prog_cg_warm_init, "u_m");
+        ctx->u_cwi_n_partials = glGetUniformLocation(ctx->prog_cg_warm_init, "u_n_partials");
+        ctx->u_cwi_dt         = glGetUniformLocation(ctx->prog_cg_warm_init, "u_dt");
+    }
 
     int ok = ctx->prog_build_jb && ctx->prog_ext_forces &&
              ctx->prog_apply_corr && ctx->prog_collision && ctx->prog_edge_edge &&
@@ -576,6 +609,7 @@ int simulator_init_gpu(Simulator *s) {
         &ctx->ssbo_indirect_args, &ctx->ssbo_edge_meta
     };
     for (int i = 0; i < 29; i++) glGenBuffers(1, ss[i]);
+    glGenBuffers(1, &ctx->ssbo_particle_mesh_forces);
 
     /* Render programs */
     ctx->prog_draw_nodes       = compile_render_program_from_files(
@@ -598,6 +632,12 @@ int simulator_init_gpu(Simulator *s) {
 
     /* Empty VAO for gl_VertexID-only draws */
     glGenVertexArrays(1, &ctx->vao_empty);
+
+    /* Timer queries — double buffered, 6 phases */
+    for (int f = 0; f < 2; f++)
+        glGenQueries(SIM_TQ_PHASES, ctx->tq[f]);
+    ctx->tq_idx   = 0;
+    ctx->tq_ready = 0;
 
     s->gpu_ctx = ctx;
     s->use_gpu = 1;
@@ -629,7 +669,8 @@ void simulator_free_gpu(Simulator *s) {
     if (ctx->prog_lbvh_build_walls)  glDeleteProgram(ctx->prog_lbvh_build_walls);
     if (ctx->prog_lbvh_build_edges)  glDeleteProgram(ctx->prog_lbvh_build_edges);
     if (ctx->prog_lbvh_prepare_edge_dispatch) glDeleteProgram(ctx->prog_lbvh_prepare_edge_dispatch);
-    if (ctx->prog_cg_jt_gather_inloop)    glDeleteProgram(ctx->prog_cg_jt_gather_inloop);
+    if (ctx->prog_cg_jt_gather_inloop) glDeleteProgram(ctx->prog_cg_jt_gather_inloop);
+    if (ctx->prog_cg_warm_init)         glDeleteProgram(ctx->prog_cg_warm_init);
     if (ctx->prog_draw_nodes)       glDeleteProgram(ctx->prog_draw_nodes);
     if (ctx->prog_draw_constraints) glDeleteProgram(ctx->prog_draw_constraints);
     if (ctx->prog_draw_walls)       glDeleteProgram(ctx->prog_draw_walls);
@@ -637,6 +678,9 @@ void simulator_free_gpu(Simulator *s) {
     if (ctx->vbo_sphere) glDeleteBuffers(1, &ctx->vbo_sphere);
     if (ctx->ibo_sphere) glDeleteBuffers(1, &ctx->ibo_sphere);
     if (ctx->vao_empty)  glDeleteVertexArrays(1, &ctx->vao_empty);
+    /* Timer queries */
+    for (int f = 0; f < 2; f++)
+        glDeleteQueries(SIM_TQ_PHASES, ctx->tq[f]);
     /* Unmap persistent buffers before deletion (required by spec) */
     if (ctx->pos_map) {
         glBindBuffer(GL_SHADER_STORAGE_BUFFER, ctx->ssbo_positions);
@@ -671,7 +715,12 @@ void simulator_free_gpu(Simulator *s) {
     s->use_gpu = 0;
 }
 
-// ── LBVH sort helper ──────────────────────────────────────────────────────────
+const SimTimings* simulator_get_timings(const Simulator *s) {
+    if (!s || !s->gpu_ctx) return NULL;
+    return &((const GPUContext*)s->gpu_ctx)->timings;
+}
+
+// ── LBVH sort helper ───────────────────────────────────────────────────────────
 // Dispatches the bitonic sort for a scratch SSBO that has already been filled
 // with n_prims entries (Morton code in slot [7]).
 // Use u_local=1 for n<=1024 (single workgroup, 32KB shared mem), else 2-pass global bitonic.
@@ -879,6 +928,12 @@ void simulator_upload_scene_to_gpu(Simulator *s, PackedScene *p) {
         glBindBuffer(GL_SHADER_STORAGE_BUFFER, ctx->ssbo_collision);
         glBufferData(GL_SHADER_STORAGE_BUFFER, sizeof(float)*n*4, zeros, GL_DYNAMIC_DRAW);
         _BIND(11, ctx->ssbo_collision);
+
+        // particle-mesh forces: zeroed, written by ParticleSim each substep
+        glBindBuffer(GL_SHADER_STORAGE_BUFFER, ctx->ssbo_particle_mesh_forces);
+        glBufferData(GL_SHADER_STORAGE_BUFFER, sizeof(float)*n*4, zeros, GL_DYNAMIC_DRAW);
+        glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 39, ctx->ssbo_particle_mesh_forces);
+
         free(zeros);
     }
 
@@ -1017,7 +1072,7 @@ void simulator_upload_scene_to_gpu(Simulator *s, PackedScene *p) {
                 widx_data[4*i+0] = w->A->idx;
                 widx_data[4*i+1] = w->B->idx;
                 widx_data[4*i+2] = w->C->idx;
-                widx_data[4*i+3] = 0;
+                widx_data[4*i+3] = w->translucent ? 1 : 0;
                 Node *verts[3] = {w->A, w->B, w->C};
                 for (int v = 0; v < 3; v++) {
                     for (int d = 0; d < 3; d++) {
@@ -1637,6 +1692,13 @@ void simulator_gpu_step(Simulator *s) {
     int   N      = (s->solver_iters > 0) ? s->solver_iters : 1;
     float sub_dt = s->dt / (float)N;
 
+    /* ── Timing setup ─────────────────────────────────────────────────────── */
+    double t_frame_start   = cpu_now();
+    double acc_lbvh_ms     = 0.0, acc_wbvh_ms   = 0.0, acc_col_ms  = 0.0;
+    double acc_cg_ms       = 0.0, acc_apply_ms   = 0.0, acc_part_ms = 0.0;
+    int    tq_w = ctx->tq_idx; /* query buffer we write this frame */
+    double t0;                 /* scratch timestamp for phase measurement */
+
     /* -- Bind all SSBOs once (never change within a frame except slot 13 swap) -- */
     glBindBufferBase(GL_SHADER_STORAGE_BUFFER,  0, ctx->ssbo_positions);
     glBindBufferBase(GL_SHADER_STORAGE_BUFFER,  1, ctx->ssbo_velocities);
@@ -1667,6 +1729,7 @@ void simulator_gpu_step(Simulator *s) {
     glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 27, ctx->ssbo_csr_data);
     glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 28, ctx->ssbo_indirect_args);
     glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 29, ctx->ssbo_edge_meta);
+    glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 39, ctx->ssbo_particle_mesh_forces);
 
     /* -- Set all uniforms once (constant across substeps) -- */
     int ng = (n + 63) / 64;
@@ -1676,8 +1739,8 @@ void simulator_gpu_step(Simulator *s) {
         glUseProgram(ctx->prog_collision);
         glUniform1i(ctx->u_col_n,         n);
         glUniform1i(ctx->u_col_n_tris,    ctx->n_triangles);
-        glUniform1f(ctx->u_col_stiffness, 500.0f);
-        glUniform1f(ctx->u_col_damp,      100.0f);
+        glUniform1f(ctx->u_col_stiffness, 100000.0f);
+        glUniform1f(ctx->u_col_damp,       2000.0f);
         glUniform1f(ctx->u_col_fr,          0.4f);
     }
 
@@ -1726,6 +1789,14 @@ void simulator_gpu_step(Simulator *s) {
         glUseProgram(ctx->prog_cg_update_xr);
         glUniform1i(ctx->u_cuxr_n_partials, n_partials);
 
+        /* Warm-init shader uniforms (constant per scene) */
+        if (ctx->prog_cg_warm_init) {
+            glUseProgram(ctx->prog_cg_warm_init);
+            glUniform1i(ctx->u_cwi_m,          m);
+            glUniform1i(ctx->u_cwi_n_partials,  n_partials);
+            glUniform1f(ctx->u_cwi_dt,          sub_dt);
+        }
+
         glUseProgram(ctx->prog_cg_update_xr);
         glUniform1i(ctx->u_cuxr_m, m);
 
@@ -1741,18 +1812,38 @@ void simulator_gpu_step(Simulator *s) {
 
     for (int sub = 0; sub < N; sub++) {
 
+        /* ── Phase 0: LBVH edge build ─────────────────────────────────── */
+        t0 = cpu_now();
+        if (sub == 0) glBeginQuery(GL_TIME_ELAPSED, ctx->tq[tq_w][0]);
         /* -- Build edge LBVH for this substep (positions may have changed) --
            Use a generous fixed scene AABB for Morton normalization.           */
-        if (m_total > 0 && ctx->prog_lbvh_morton_edges && ctx->prog_lbvh_sort_edges && ctx->prog_lbvh_build_edges) {
+        if (ctx->enable_edge_edge && m_total > 0 && ctx->prog_lbvh_morton_edges && ctx->prog_lbvh_sort_edges && ctx->prog_lbvh_build_edges) {
             float smin[3] = { ctx->scene_min[0], ctx->scene_min[1], ctx->scene_min[2] };
             float smax[3] = { ctx->scene_max[0], ctx->scene_max[1], ctx->scene_max[2] };
             int n_edges = 0;
             lbvh_build_edges_gpu(ctx, m_total, smin, smax, &n_edges);
             ctx->last_n_edges = n_edges;
         }
+        if (sub == 0) glEndQuery(GL_TIME_ELAPSED);
+        acc_lbvh_ms += (cpu_now() - t0) * 1e3;
 
+        /* ── Phase 1: LBVH wall BVH rebuild ──────────────────────────── */
+        t0 = cpu_now();
+        if (sub == 0) glBeginQuery(GL_TIME_ELAPSED, ctx->tq[tq_w][1]);
+        /* -- Optionally rebuild wall LBVH (needed when walls contain moving nodes) -- */
+        if (ctx->rebuild_wall_bvh_per_substep && ctx->n_triangles > 0) {
+            float smin[3] = { ctx->scene_min[0], ctx->scene_min[1], ctx->scene_min[2] };
+            float smax[3] = { ctx->scene_max[0], ctx->scene_max[1], ctx->scene_max[2] };
+            lbvh_build_walls_gpu(ctx, ctx->n_triangles, smin, smax);
+        }
+        if (sub == 0) glEndQuery(GL_TIME_ELAPSED);
+        acc_wbvh_ms += (cpu_now() - t0) * 1e3;
+
+        /* ── Phase 2: Collision + external forces ─────────────────────── */
+        t0 = cpu_now();
+        if (sub == 0) glBeginQuery(GL_TIME_ELAPSED, ctx->tq[tq_w][2]);
         /* -- Edge-edge collision: 1 thread/edge, BVH traversal (O(m log m)) -- */
-        if (ctx->prog_edge_edge && m_total > 0) {
+        if (ctx->enable_edge_edge && ctx->prog_edge_edge && m_total > 0) {
             int ee_groups = (m_total + 63) / 64;   /* 1 thread per edge (was m²/64) */
             glUseProgram(ctx->prog_edge_edge);
             glDispatchCompute((GLuint)ee_groups, 1, 1);
@@ -1767,9 +1858,13 @@ void simulator_gpu_step(Simulator *s) {
         glUseProgram(ctx->prog_ext_forces);
         glDispatchCompute((GLuint)ng, 1, 1);
         glMemoryBarrier(GL_SHADER_STORAGE_BARRIER_BIT);
+        if (sub == 0) glEndQuery(GL_TIME_ELAPSED);
+        acc_col_ms += (cpu_now() - t0) * 1e3;
 
         if (m > 0) {
-            /* -- 2+3. Build J and b (merged into one dispatch) -- */
+            /* ── Phase 3: build_jb + CG ──────────────────────────────── */
+            t0 = cpu_now();
+            if (sub == 0) glBeginQuery(GL_TIME_ELAPSED, ctx->tq[tq_w][3]);            /* -- 2+3. Build J and b (merged into one dispatch) -- */
             glUseProgram(ctx->prog_build_jb);
             glDispatchCompute((GLuint)mg, 1, 1);
             glMemoryBarrier(GL_SHADER_STORAGE_BARRIER_BIT);
@@ -1783,13 +1878,26 @@ void simulator_gpu_step(Simulator *s) {
 
                 int using_generic_jtg = (jtg_il == ctx->prog_cg_jt_gather);
 
-                /* Init: x=0, r=p=b; partial r·r → reduce_buf; finalizes cg_scalars[0] inline */
-                glUseProgram(ctx->prog_cg_init);
-                glDispatchCompute((GLuint)jsg, 1, 1);
-                glMemoryBarrier(GL_SHADER_STORAGE_BARRIER_BIT);
-
-                /* Fixed-iteration CG — no CPU readback, no glUniform inside loop */
-                int max_cg_iter = (m < 20) ? m : 20;
+                /* Init / warm-start: set x, r, p and compute initial r·r */
+                int max_cg_iter;
+                if (sub == 0 || !ctx->prog_cg_warm_init) {
+                    /* Cold start (sub==0): x=0, r=p=b */
+                    glUseProgram(ctx->prog_cg_init);
+                    glDispatchCompute((GLuint)jsg, 1, 1);
+                    glMemoryBarrier(GL_SHADER_STORAGE_BARRIER_BIT);
+                    max_cg_iter = (m < 20) ? m : 20;
+                } else {
+                    /* Warm start: x=x_prev; compute jt_vec=M^{-1}J^Tx0, then r=b-Ax0, p=r */
+                    glUseProgram(ctx->prog_cg_jt_gather);
+                    glUniform1i(ctx->u_cjtg_src,        1); /* read l_data (x_prev) */
+                    glUniform1i(ctx->u_cjtg_apply_minv, 1);
+                    glDispatchCompute((GLuint)jtg, 1, 1);
+                    glMemoryBarrier(GL_SHADER_STORAGE_BARRIER_BIT);
+                    glUseProgram(ctx->prog_cg_warm_init);
+                    glDispatchCompute((GLuint)jsg, 1, 1);
+                    glMemoryBarrier(GL_SHADER_STORAGE_BARRIER_BIT);
+                    max_cg_iter = (m < 10) ? m : 10;
+                }
                 for (int iter = 0; iter < max_cg_iter; iter++) {
 
                     /* jt_vec = M⁻¹ Jᵀ p  (baked: src=p, minv=1) */
@@ -1819,13 +1927,96 @@ void simulator_gpu_step(Simulator *s) {
 
             } /* end CG block */
 
+            if (sub == 0) glEndQuery(GL_TIME_ELAPSED);
+            acc_cg_ms += (cpu_now() - t0) * 1e3;
+
+            /* ── Phase 4: apply_corr ──────────────────────────────────── */
+            t0 = cpu_now();
+            if (sub == 0) glBeginQuery(GL_TIME_ELAPSED, ctx->tq[tq_w][4]);
             /* -- 8. Apply corrections + integrate (J^T λ computed inline) -- */
             glUseProgram(ctx->prog_apply_corr);
             glDispatchCompute((GLuint)ng, 1, 1);
             glMemoryBarrier(GL_SHADER_STORAGE_BARRIER_BIT);
+            if (sub == 0) glEndQuery(GL_TIME_ELAPSED);
+            acc_apply_ms += (cpu_now() - t0) * 1e3;
+        } else if (sub == 0) {
+            /* m==0: issue empty queries so the result slots are defined */
+            glBeginQuery(GL_TIME_ELAPSED, ctx->tq[tq_w][3]); glEndQuery(GL_TIME_ELAPSED);
+            glBeginQuery(GL_TIME_ELAPSED, ctx->tq[tq_w][4]); glEndQuery(GL_TIME_ELAPSED);
         }
 
+        /* ── Phase 5: Particle sim step ──────────────────────────────── */
+        t0 = cpu_now();
+        if (sub == 0) glBeginQuery(GL_TIME_ELAPSED, ctx->tq[tq_w][5]);
+        /* -- Particle sim step: runs AFTER apply_corr so it reads up-to-date  --
+           node positions (piston at its true location for this substep).         --
+           particle_mesh_forces written here are used by apply_corr next substep. */
+        if (s->particles) {
+            ParticleSimExtern ext;
+            ext.ssbo_node_positions       = ctx->ssbo_positions;
+            ext.ssbo_node_inv_mass        = ctx->ssbo_inv_mass;
+            ext.ssbo_wall_bvh_nodes       = ctx->ssbo_bvh_nodes;
+            ext.ssbo_wall_bvh_scratch     = ctx->ssbo_wall_bvh_scratch;
+            ext.ssbo_wall_indices         = ctx->ssbo_wall_indices;
+            ext.ssbo_particle_mesh_forces = ctx->ssbo_particle_mesh_forces;
+            ext.n_tris                    = ctx->n_triangles;
+            ext.n_nodes                   = ctx->node_count;
+            particle_sim_step(s->particles, &ext, sub_dt);
+            /* Rebind SSBOs that particle_sim_step may have clobbered */
+            glBindBufferBase(GL_SHADER_STORAGE_BUFFER,  0, ctx->ssbo_positions);
+            glBindBufferBase(GL_SHADER_STORAGE_BUFFER,  1, ctx->ssbo_velocities);
+            glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 11, ctx->ssbo_collision);
+            glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 15, ctx->ssbo_bvh_nodes);
+            glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 17, ctx->ssbo_wall_indices);
+            glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 22, ctx->ssbo_wall_bvh_scratch);
+            glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 39, ctx->ssbo_particle_mesh_forces);
+        }
+        if (sub == 0) glEndQuery(GL_TIME_ELAPSED);
+        acc_part_ms += (cpu_now() - t0) * 1e3;
+
     } /* end substep loop */
+
+    /* ── GPU timer: end particle phase query if no particles (query still open) ── */
+    if (!s->particles) glEndQuery(GL_TIME_ELAPSED);
+
+    /* ── glFinish: wait for all GPU work this frame ─────────────────────── */
+    glFinish();
+    double t_total_end = cpu_now();
+
+    /* ── Populate cpu timings ───────────────────────────────────────────── */
+    ctx->timings.cpu_total_ms      = (t_total_end - t_frame_start) * 1e3;
+    ctx->timings.cpu_lbvh_ms       = acc_lbvh_ms;
+    ctx->timings.cpu_wall_bvh_ms   = acc_wbvh_ms;
+    ctx->timings.cpu_collision_ms  = acc_col_ms;
+    ctx->timings.cpu_cg_ms         = acc_cg_ms;
+    ctx->timings.cpu_apply_ms      = acc_apply_ms;
+    ctx->timings.cpu_particles_ms  = acc_part_ms;
+
+    /* ── Read GPU timings from the PREVIOUS frame's queries ─────────────── */
+    if (ctx->tq_ready) {
+        int old = ctx->tq_idx ^ 1;
+        const char *phase_names[SIM_TQ_PHASES] = {
+            "lbvh", "wall_bvh", "collision", "cg", "apply_corr", "particles"
+        };
+        double *gpu_fields[SIM_TQ_PHASES] = {
+            &ctx->timings.gpu_lbvh_ms,
+            &ctx->timings.gpu_wall_bvh_ms,
+            &ctx->timings.gpu_collision_ms,
+            &ctx->timings.gpu_cg_ms,
+            &ctx->timings.gpu_apply_ms,
+            &ctx->timings.gpu_particles_ms
+        };
+        for (int ph = 0; ph < SIM_TQ_PHASES; ph++) {
+            GLuint64 ns = 0;
+            glGetQueryObjectui64v(ctx->tq[old][ph], GL_QUERY_RESULT, &ns);
+            *gpu_fields[ph] = (double)ns * 1e-6; /* ns → ms */
+            (void)phase_names[ph];
+        }
+    }
+
+    /* Flip query buffer for next frame */
+    ctx->tq_idx ^= 1;
+    ctx->tq_ready = 1;
 
     /* Plant a fence so simulator_sync_positions can check (non-blocking) when the
        GPU has finished writing positions/velocities.  With GL_MAP_COHERENT_BIT the
@@ -2031,9 +2222,8 @@ Simulator* simulator_create(float dt) {
     // Internal physics uses positive-up coordinates: negative y is downwards.
     // Set gravity to negative to point downward in world coordinates.
     s->gravity[0] = 0.0f; s->gravity[1] = -9.81f; s->gravity[2] = 0.0f;
-    s->solver_iters = 100;
+    s->solver_iters = 50;
     s->damping = 0.01f;
-    s->velocity_blend = 0.5f; // blend factor between old velocity and position-derived velocity
     s->triangle_bvh = NULL;
     s->edge_bvh = NULL;
     return s;
@@ -2328,6 +2518,36 @@ void simulator_step(Simulator *s) {
 
    Slow fallback (no persistent map, e.g. glBufferStorage unavailable):
      Calls glGetBufferSubData which stalls the pipeline until the GPU is done. */
+void simulator_set_rebuild_wall_bvh(Simulator *s, int enable) {
+    if (!s || !s->gpu_ctx) return;
+    ((GPUContext*)s->gpu_ctx)->rebuild_wall_bvh_per_substep = enable;
+}
+
+void simulator_set_edge_edge(Simulator *s, int enable) {
+    if (!s || !s->gpu_ctx) return;
+    ((GPUContext*)s->gpu_ctx)->enable_edge_edge = enable;
+}
+
+void simulator_upload_wall_flags(Simulator *s) {
+    if (!s || !s->use_gpu || !s->gpu_ctx || !s->walls) return;
+    GPUContext *ctx = (GPUContext*)s->gpu_ctx;
+    int tcount = (int)dynarray_size(s->walls);
+    if (tcount <= 0) return;
+    /* Read back the full widx buffer, patch only the flag bytes, and re-upload */
+    glBindBuffer(GL_SHADER_STORAGE_BUFFER, ctx->ssbo_wall_indices);
+    int *buf = (int*)glMapBufferRange(GL_SHADER_STORAGE_BUFFER, 0,
+                                      sizeof(int) * 4 * (size_t)tcount,
+                                      GL_MAP_READ_BIT | GL_MAP_WRITE_BIT);
+    if (buf) {
+        for (int i = 0; i < tcount; i++) {
+            TriangleWall *w = (TriangleWall*)dynarray_get(s->walls, i);
+            if (w) buf[i * 4 + 3] = w->translucent ? 1 : 0;
+        }
+        glUnmapBuffer(GL_SHADER_STORAGE_BUFFER);
+    }
+    glBindBuffer(GL_SHADER_STORAGE_BUFFER, 0);
+}
+
 void simulator_sync_positions(Simulator *s) {
     if (!s || !s->use_gpu || !s->gpu_ctx) return;
     GPUContext *ctx = (GPUContext*)s->gpu_ctx;
@@ -2394,17 +2614,6 @@ void simulator_draw(Simulator *s, float cam_yaw, float cam_pitch) {
             glDisable(GL_LIGHTING);
             glDisable(GL_TEXTURE_2D);
 
-            /* --- Draw walls --- */
-            if (ctx->n_triangles > 0) {
-                glUseProgram(ctx->prog_draw_walls);
-                glUniformMatrix4fv(ctx->u_draw_wall_mvp, 1, GL_FALSE, mvp);
-                glBindBufferBase(GL_SHADER_STORAGE_BUFFER,  0, ctx->ssbo_positions);
-                glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 17, ctx->ssbo_wall_indices);
-                glBindVertexArray(ctx->vao_empty);
-                glDrawArrays(GL_TRIANGLES, 0, ctx->n_triangles * 3);
-                glBindVertexArray(0);
-            }
-
             /* --- Draw constraints --- */
             if (ctx->m_total > 0) {
                 glUseProgram(ctx->prog_draw_constraints);
@@ -2425,6 +2634,118 @@ void simulator_draw(Simulator *s, float cam_yaw, float cam_pitch) {
                 glBindVertexArray(ctx->vao_sphere);
                 glDrawElementsInstanced(GL_TRIANGLES, ctx->sphere_index_count,
                                         GL_UNSIGNED_SHORT, 0, ctx->node_count);
+                glBindVertexArray(0);
+            }
+
+            /* --- Draw particles (points, must be before walls for correct blending) --- */
+            if (s->particles) {
+                GLint vp[4]; glGetIntegerv(GL_VIEWPORT, vp);
+                float screen_h = (float)vp[3];
+                /* proj[5] = proj[1][1] in column-major = focal length Y */
+                particle_sim_draw(s->particles, mvp, proj[5], screen_h);
+
+                /* --- Draw producer/consumer modifier tiles (green/red quads) --- */
+                if (s->particles->n_modifiers > 0) {
+                    ParticleSim *_ps = s->particles;
+                    glUseProgram(0);
+                    glEnable(GL_BLEND);
+                    glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+                    glDisable(GL_CULL_FACE);
+                    glDepthMask(GL_FALSE);
+                    for (int _m = 0; _m < _ps->n_modifiers; _m++) {
+                        const ParticleModifier *_mod = &_ps->modifiers[_m];
+                        if (!_mod->enabled) continue;
+                        /* Recompute face axes from yaw + pitch */
+                        float _sy = sinf(_mod->yaw),  _cy = cosf(_mod->yaw);
+                        float _sp = sinf(_mod->pitch), _cp = cosf(_mod->pitch);
+                        /* tanU = (cos yaw, 0, -sin yaw) */
+                        float _ux = _cy,          _uy = 0.0f,  _uz = -_sy;
+                        /* tanV = cross(normal, tanU) = (-sp*sy, cp, -sp*cy) */
+                        float _vx = -_sp * _sy,   _vy = _cp,   _vz = -_sp * _cy;
+                        float _hw = _mod->width  * 0.5f;
+                        float _hl = _mod->length * 0.5f;
+                        float _px = _mod->pos[0], _py = _mod->pos[1], _pz = _mod->pos[2];
+                        /* Filled tile: green = producer (type 0), red = consumer (type 1) */
+                        if (_mod->type == 0) glColor4f(0.1f, 0.85f, 0.1f, 0.40f);
+                        else                 glColor4f(0.85f, 0.1f, 0.1f, 0.40f);
+                        glBegin(GL_QUADS);
+                        glVertex3f(_px - _ux*_hw - _vx*_hl, _py - _uy*_hw - _vy*_hl, _pz - _uz*_hw - _vz*_hl);
+                        glVertex3f(_px + _ux*_hw - _vx*_hl, _py + _uy*_hw - _vy*_hl, _pz + _uz*_hw - _vz*_hl);
+                        glVertex3f(_px + _ux*_hw + _vx*_hl, _py + _uy*_hw + _vy*_hl, _pz + _uz*_hw + _vz*_hl);
+                        glVertex3f(_px - _ux*_hw + _vx*_hl, _py - _uy*_hw + _vy*_hl, _pz - _uz*_hw + _vz*_hl);
+                        glEnd();
+                        /* Bright border outline */
+                        if (_mod->type == 0) glColor4f(0.2f, 1.0f, 0.2f, 0.90f);
+                        else                 glColor4f(1.0f, 0.2f, 0.2f, 0.90f);
+                        glLineWidth(2.0f);
+                        glBegin(GL_LINE_LOOP);
+                        glVertex3f(_px - _ux*_hw - _vx*_hl, _py - _uy*_hw - _vy*_hl, _pz - _uz*_hw - _vz*_hl);
+                        glVertex3f(_px + _ux*_hw - _vx*_hl, _py + _uy*_hw - _vy*_hl, _pz + _uz*_hw - _vz*_hl);
+                        glVertex3f(_px + _ux*_hw + _vx*_hl, _py + _uy*_hw + _vy*_hl, _pz + _uz*_hw + _vz*_hl);
+                        glVertex3f(_px - _ux*_hw + _vx*_hl, _py - _uy*_hw + _vy*_hl, _pz - _uz*_hw + _vz*_hl);
+                        glEnd();
+                        glLineWidth(1.0f);
+                    }
+                    glDepthMask(GL_TRUE);
+                    glDisable(GL_BLEND);
+                }
+
+                /* Restore bindings that particle draw may have clobbered */
+                glBindBufferBase(GL_SHADER_STORAGE_BUFFER,  0, ctx->ssbo_positions);
+                glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 17, ctx->ssbo_wall_indices);
+
+                /* --- Draw heater/cooler volumes as blue wireframe AABBs --- */
+                if (s->particles->n_heaters > 0) {
+                    ParticleSim *_ps = s->particles;
+                    glUseProgram(0);
+                    glEnable(GL_BLEND);
+                    glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+                    glDepthMask(GL_FALSE);
+                    glLineWidth(2.0f);
+                    for (int _h = 0; _h < _ps->n_heaters; _h++) {
+                        const HeaterCooler *_hc = &_ps->heaters[_h];
+                        if (!_hc->enabled) continue;
+                        float _cx = _hc->pos[0], _cy = _hc->pos[1], _cz = _hc->pos[2];
+                        float _ex = _hc->half_x, _ey = _hc->half_y, _ez = _hc->half_z;
+                        /* 8 corners of the AABB */
+                        float _x0 = _cx - _ex, _x1 = _cx + _ex;
+                        float _y0 = _cy - _ey, _y1 = _cy + _ey;
+                        float _z0 = _cz - _ez, _z1 = _cz + _ez;
+                        glColor4f(0.2f, 0.5f, 1.0f, 0.85f);
+                        glBegin(GL_LINE_LOOP); /* bottom face */
+                        glVertex3f(_x0,_y0,_z0); glVertex3f(_x1,_y0,_z0);
+                        glVertex3f(_x1,_y0,_z1); glVertex3f(_x0,_y0,_z1);
+                        glEnd();
+                        glBegin(GL_LINE_LOOP); /* top face */
+                        glVertex3f(_x0,_y1,_z0); glVertex3f(_x1,_y1,_z0);
+                        glVertex3f(_x1,_y1,_z1); glVertex3f(_x0,_y1,_z1);
+                        glEnd();
+                        glBegin(GL_LINES); /* 4 vertical pillars */
+                        glVertex3f(_x0,_y0,_z0); glVertex3f(_x0,_y1,_z0);
+                        glVertex3f(_x1,_y0,_z0); glVertex3f(_x1,_y1,_z0);
+                        glVertex3f(_x1,_y0,_z1); glVertex3f(_x1,_y1,_z1);
+                        glVertex3f(_x0,_y0,_z1); glVertex3f(_x0,_y1,_z1);
+                        glEnd();
+                    }
+                    glLineWidth(1.0f);
+                    glDepthMask(GL_TRUE);
+                    glDisable(GL_BLEND);
+                }
+            }
+
+            /* --- Draw walls LAST so translucent walls blend correctly over
+                   particles and nodes that have already been written to the
+                   depth buffer and framebuffer. --- */
+            if (ctx->n_triangles > 0) {
+                glUseProgram(ctx->prog_draw_walls);
+                glUniformMatrix4fv(ctx->u_draw_wall_mvp, 1, GL_FALSE, mvp);
+                glBindBufferBase(GL_SHADER_STORAGE_BUFFER,  0, ctx->ssbo_positions);
+                glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 17, ctx->ssbo_wall_indices);
+                glBindVertexArray(ctx->vao_empty);
+                glEnable(GL_BLEND);
+                glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+                glDrawArrays(GL_TRIANGLES, 0, ctx->n_triangles * 3);
+                glDisable(GL_BLEND);
                 glBindVertexArray(0);
             }
 

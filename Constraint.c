@@ -402,6 +402,7 @@ TriangleWall* trianglewall_create(Node *A, Node *B, Node *C, float restitution, 
     w->edges[0] = edge_AB;
     w->edges[1] = edge_BC;
     w->edges[2] = edge_CA;
+    w->translucent = 0;
     return w;
 }
 void trianglewall_free(TriangleWall *w) { free(w); }

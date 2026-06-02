@@ -56,3 +56,4 @@ void main() {
             atomicExchange(reduce_ctr, 0u);
         }
     }
+}

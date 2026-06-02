@@ -6,6 +6,7 @@
 #include "Constraint.h"
 #include "TriangleBVH.h"
 #include "EdgeBVH.h"
+#include "ParticleSim.h"
 
 typedef struct Simulator Simulator;
 
@@ -17,7 +18,6 @@ struct Simulator {
     float dt;
     int solver_iters;
     float damping;
-    float velocity_blend; // how much to blend projected velocity into previous velocity (0..1)
     TriangleBVH *triangle_bvh; // BVH for triangle walls
     EdgeBVH *edge_bvh;         // BVH for edges (constraints)
     // GPU integration toggle: when enabled the simulator will attempt to run
@@ -26,7 +26,34 @@ struct Simulator {
     int use_gpu;
     void *gpu_ctx; // opaque pointer to GPU resources (managed in Simulator.c)
     int gpu_debug; // when 1: also run CPU solver and print comparison each substep
+    ParticleSim *particles; // optional particle fluid sim coupled to constraint mesh
 };
+
+// ── Per-frame timing breakdown (updated each frame when use_gpu==1) ──────────
+// CPU times are wall-clock milliseconds measured around each dispatch group.
+// GPU times are elapsed nanoseconds from GL_TIME_ELAPSED queries (1-frame delayed
+// to avoid pipeline stalls); divide by 1e6 to get ms.
+typedef struct {
+    // CPU wall-clock (ms) for each major phase
+    double cpu_lbvh_ms;       // edge LBVH build (all substeps)
+    double cpu_wall_bvh_ms;   // wall LBVH rebuild (all substeps)
+    double cpu_collision_ms;  // sphere-tri + edge-edge (all substeps)
+    double cpu_cg_ms;         // full CG block (all substeps)
+    double cpu_apply_ms;      // apply_corr (all substeps)
+    double cpu_particles_ms;  // particle_sim_step (all substeps)
+    double cpu_total_ms;      // total simulator_gpu_step wall time
+    // GPU elapsed time (ms) for each phase — 1-frame delayed
+    double gpu_lbvh_ms;
+    double gpu_wall_bvh_ms;
+    double gpu_collision_ms;
+    double gpu_cg_ms;
+    double gpu_apply_ms;
+    double gpu_particles_ms;
+} SimTimings;
+
+// Returns a pointer to the most recently completed SimTimings (read-only).
+// Valid after the first call to simulator_gpu_step().
+const SimTimings* simulator_get_timings(const Simulator *s);
 
 Simulator* simulator_create(float dt);
 void simulator_free(Simulator *s);
@@ -74,6 +101,14 @@ void simulator_gpu_step(Simulator *s);
 
 // Sync GPU positions/velocities back to CPU Node structs (call once per render frame for UI)
 void simulator_sync_positions(Simulator *s);
+
+// Enable/disable dynamic wall BVH rebuild every substep (needed when wall nodes are mobile)
+void simulator_set_rebuild_wall_bvh(Simulator *s, int enable);
+void simulator_set_edge_edge(Simulator *s, int enable);
+
+// Re-upload only the translucency flags (widx[i*4+3]) of all walls to the GPU.
+// Call this whenever wall->translucent is changed at runtime.
+void simulator_upload_wall_flags(Simulator *s);
 
 
 // Query triangles overlapping an AABB (for node→face queries)
